@@ -21,7 +21,7 @@ from medpy.io import load
 import os
 import numpy as np
 import torch
-from scipy.ndimage import grey_opening
+from scipy.ndimage import grey_opening, grey_closing
 from skimage.morphology import ball
 
 
@@ -55,15 +55,17 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
         # normalize images
         image = (image - image.min()) / (image.max()-image.min())
 
-        # white top-hat residual (image - opening)
+        # top-hat (image - opening) and bottom-hat (closing - image)
         tophat = np.clip(image - grey_opening(image, footprint=ball(se_radius)), 0, None)
+        bottomhat = np.clip(grey_closing(image, footprint=ball(se_radius)) - image, 0, None)
         tophat = pad_nd_image(tophat, (tophat.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': 0.0})
+        bottomhat = pad_nd_image(bottomhat, (bottomhat.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': 0.0})
 
         image = pad_nd_image(image, (image.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': image.min()})
         label = pad_nd_image(label, (image.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': label.min()})
 
-        # channel order: 0=image, 1=tophat, 2=label
-        result = np.stack((image, tophat, label))
+        # channel order: 0=image, 1=tophat, 2=bottomhat, 3=label
+        result = np.stack((image, tophat, bottomhat, label))
 
         np.save(os.path.join(output_dir, f.split('.')[0]+'.npy'), result)
         print(f)

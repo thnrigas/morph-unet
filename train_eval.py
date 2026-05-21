@@ -44,12 +44,14 @@ def build_loaders(args):
     with open(os.path.join(args.split_dir, "splits.pkl"), "rb") as f:
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
-
-    # npy is always 3-channel (image, tophat, label); --tophat only
-    # decides whether the top-hat channel is fed to the network.
-    input_slice = (0, 1) if args.tophat else (0,)
-    label_slice = 2
-
+    # npy is 4-channel (image, tophat, bottomhat, label)
+    # the flags pick which morphological channels are fed to the network.
+    input_slice = (0,)
+    if args.tophat:
+        input_slice += (1,)
+    if args.bottomhat:
+        input_slice += (2,)
+    label_slice = 3
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
                   label_slice=label_slice, num_processes=args.num_workers)
     train = NumpyDataSet(args.data_dir, keys=tr, **common)
@@ -92,7 +94,6 @@ def evaluate_test(model, loader, device, json_path):
             for i, fname in enumerate(batch["fnames"]):
                 pred_dict[fname[0]].append(pred_argmax[i].numpy())
                 gt_dict[fname[0]].append(target[i].detach().cpu().numpy())
-
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
     scores = aggregate_scores(
         pairs, evaluator=Evaluator, labels=LABELS,
@@ -108,6 +109,7 @@ def main():
     p.add_argument("--split-dir", default="data/Task04_Hippocampus")
     p.add_argument("--tag", required=True)
     p.add_argument("--tophat", action="store_true")
+    p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
@@ -123,12 +125,13 @@ def main():
     set_seed(args.seed)
     device = pick_device()
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
-
     model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
+
     # Output stem encodes the fold so a 5-fold sweep with the same --tag
     # does not overwrite itself (<tag>_f<fold>_{best.pth,last.pth,scores.json})
     stem = f"{args.tag}_f{args.fold}"
-    mode = "tophat" if args.tophat else "baseline"
+    parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
+    mode = "+".join(parts) if parts else "baseline"
     print(f"[{stem}] device={device} mode={mode} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels}")
     dice_loss = SoftDiceLoss(batch_dice=True)
@@ -157,7 +160,6 @@ def main():
                       f"epochs (best val={best_val:.4f} @ ep "
                       f"{epoch - since_improved})")
                 break
-
     ckpt = best_path if os.path.exists(best_path) else f"{stem}_last.pth"
     if os.path.exists(ckpt):
         model.load_state_dict(torch.load(ckpt, map_location=device))
