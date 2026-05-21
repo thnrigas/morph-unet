@@ -16,6 +16,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from networks.UNET import UNet
+from networks.morph_block import MorphResidualUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
 from evaluation.evaluator import aggregate_scores, Evaluator
@@ -45,12 +46,16 @@ def build_loaders(args):
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
     # npy is 4-channel (image, tophat, bottomhat, label)
-    # the flags pick which morphological channels are fed to the network.
-    input_slice = (0,)
-    if args.tophat:
-        input_slice += (1,)
-    if args.bottomhat:
-        input_slice += (2,)
+    # --morph-block --tophat/--bottomhat learns the morphological SE
+    # otherwise the static --tophat/--bottomhat channels are selected
+    if args.morph_block:
+        input_slice = (0,)
+    else:
+        input_slice = (0,)
+        if args.tophat:
+            input_slice += (1,)
+        if args.bottomhat:
+            input_slice += (2,)
     label_slice = 3
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
                   label_slice=label_slice, num_processes=args.num_workers)
@@ -110,6 +115,9 @@ def main():
     p.add_argument("--tag", required=True)
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
+    p.add_argument("--morph-block", action="store_true")
+    p.add_argument("--morph-k", type=int, default=5)
+    p.add_argument("--morph-beta", type=float, default=10.0)
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
@@ -125,13 +133,26 @@ def main():
     set_seed(args.seed)
     device = pick_device()
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
-    model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
+    if args.morph_block:
+        # under --morph-block the --tophat/--bottomhat flags select the
+        # learnable residuals, default to top-hat if neither is given
+        use_th = args.tophat or not args.bottomhat
+        use_bh = args.bottomhat
+        base = UNet(num_classes=args.num_classes, in_channels=1 + use_th + use_bh)
+        model = MorphResidualUNet(base, k=args.morph_k, beta=args.morph_beta,
+                                  use_tophat=use_th, use_bottomhat=use_bh).to(device)
+    else:
+        model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
 
     # Output stem encodes the fold so a 5-fold sweep with the same --tag
     # does not overwrite itself (<tag>_f<fold>_{best.pth,last.pth,scores.json})
     stem = f"{args.tag}_f{args.fold}"
-    parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
-    mode = "+".join(parts) if parts else "baseline"
+    if args.morph_block:
+        res = "+".join((["tophat"] if use_th else []) + (["bottomhat"] if use_bh else []))
+        mode = f"morph-block({res},k={args.morph_k},beta={args.morph_beta})"
+    else:
+        parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
+        mode = "+".join(parts) if parts else "baseline"
     print(f"[{stem}] device={device} mode={mode} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels}")
     dice_loss = SoftDiceLoss(batch_dice=True)

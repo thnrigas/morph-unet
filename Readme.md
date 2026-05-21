@@ -1,10 +1,14 @@
 ﻿# Morphological U-Net
 
-The project investigates whether morphological variations of the U-Net improves segmentation over the unaltered baseline. This is done in the context of the Medical Segmentation Decathlon.
+The project investigates whether morphological variations of the U-Net improves segmentation over the unaltered baseline. This is done in the context of the Medical Segmentation Decathlon. Morphological variants include top and/or bottom hat (residuals) as additional input channels, either precomputed with a fixed structuring element or computed by a morphological block with a trainable structuring element.
 
 ## Attribution & License
 
-Derived from the MIC-DKFZ [`basic_unet_example`](https://github.com/MIC-DKFZ/basic_unet_example). Copyright © German Cancer Research Center (DKFZ), Division of Medical Image Computing (MIC). Licensed under the Apache License 2.0. This is a modified derivative work, original per-file copyright headers are retained. [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+Derived from the MIC-DKFZ [`basic_unet_example`](https://github.com/MIC-DKFZ/basic_unet_example). 
+
+Copyright © German Cancer Research Center (DKFZ), Division of Medical Image Computing (MIC). Licensed under the Apache License 2.0. 
+
+This is a modified derivative work, original per-file copyright headers are retained. [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ## Setup & Run
 
@@ -21,8 +25,20 @@ python3 run_preprocessing.py
 ```
 
 Train, test and evaluate :
+
+Baseline Model :
 ```
 python3 train_eval.py --tag baseline --fold 0
+```
+
+Static Residuals :
+```
+python3 train_eval.py --tag static --tophat --bottomhat --fold 0
+```
+
+Trainable Residuals :
+```
+python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat --fold 0
 ```
 
 Per run it writes (output stem `<tag>_f<fold>`) `<tag>_f<fold>_best.pth` / `_last.pth` (checkpoints) and `<tag>_f<fold>_scores.json` (per-label metrics).
