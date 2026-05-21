@@ -23,8 +23,6 @@ import os
 import numpy as np
 import torch
 
-from utilities.file_and_folder_operations import subfiles
-
 
 def preprocess_data(root_dir, y_shape=64, z_shape=64):
     image_dir = os.path.join(root_dir, 'imagesTr')
@@ -39,11 +37,10 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64):
     class_stats = defaultdict(int)
     total = 0
 
-    nii_files = subfiles(image_dir, suffix=".nii.gz", join=False)
-
-    for i in range(0, len(nii_files)):
-        if nii_files[i].startswith("._"):
-            nii_files[i] = nii_files[i][2:]
+    nii_files = [fn for fn in sorted(os.listdir(image_dir))
+                 if fn.endswith((".nii", ".nii.gz")) and not fn.startswith("._")]
+    if not nii_files:
+        raise FileNotFoundError(f"no .nii/.nii.gz images found in {image_dir}")
 
     for f in nii_files:
         image, _ = load(os.path.join(image_dir, f))

@@ -15,8 +15,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import random
+import numpy as np
+import torch
 from torch.utils.data import DataLoader, Dataset
-from trixi.util.pytorchutils import set_seed
+
+
+def set_seed(seed):
+    """Seed random/numpy/torch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 class WrappedDataset(Dataset):
@@ -86,5 +95,5 @@ class MultiThreadedDataLoader(object):
                 self.iter._shutdown_workers()
                 for p in self.iter.workers:
                     p.terminate()
-        except:
-            print("Could not kill Dataloader Iterator")
+        except Exception:
+            pass

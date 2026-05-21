@@ -40,10 +40,10 @@ def create_splits(output_dir, image_dir):
 
     splits = []
     sample_set = {sample[:-4] for sample in npy_files.copy()}  # Remove the file extension
-    test_samples = random.sample(sample_set, testset_size)  # IMO the Testset should be static for all splits
+    test_samples = random.sample(sorted(sample_set), testset_size)  # IMO the Testset should be static for all splits
 
     for split in range(0, 5):
-        train_samples = random.sample(sample_set - set(test_samples), trainset_size)
+        train_samples = random.sample(sorted(sample_set - set(test_samples)), trainset_size)
         val_samples = list(sample_set - set(train_samples) - set(test_samples))
 
         train_samples.sort()

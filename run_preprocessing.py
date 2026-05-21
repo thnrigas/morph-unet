@@ -15,19 +15,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
 import os
 
-from configs.Config_unet import get_config
-from datasets.example_dataset.create_splits import create_splits
-from datasets.utils import download_dataset
-from datasets.example_dataset.preprocessing import preprocess_data
+from datasets.preprocessing import preprocess_data
+from datasets.create_splits import create_splits
 
 if __name__ == "__main__":
-    c = get_config()
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", default="data/Task04_Hippocampus")
+    args = p.parse_args()
 
-    download_dataset(dest_path=c.data_root_dir, dataset=c.dataset_name, id=c.google_drive_id)
-
-    print('Preprocessing data. [STARTED]')
-    preprocess_data(root_dir=os.path.join(c.data_root_dir, c.dataset_name))
-    create_splits(output_dir=c.split_dir, image_dir=c.data_dir)
-    print('Preprocessing data. [DONE]')
+    preprocess_data(root_dir=args.root)
+    create_splits(output_dir=args.root, image_dir=os.path.join(args.root, "preprocessed"))
+    print("Preprocessing done.")
