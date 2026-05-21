@@ -45,8 +45,10 @@ def build_loaders(args):
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
 
-    input_slice = (0,)         # image only (baseline)
-    label_slice = 1            # label is channel 1 of the (image, label) npy
+    # npy is always 3-channel (image, tophat, label); --tophat only
+    # decides whether the top-hat channel is fed to the network.
+    input_slice = (0, 1) if args.tophat else (0,)
+    label_slice = 2
 
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
                   label_slice=label_slice, num_processes=args.num_workers)
@@ -105,6 +107,7 @@ def main():
     p.add_argument("--data-dir", default="data/Task04_Hippocampus/preprocessed")
     p.add_argument("--split-dir", default="data/Task04_Hippocampus")
     p.add_argument("--tag", required=True)
+    p.add_argument("--tophat", action="store_true")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
@@ -125,7 +128,8 @@ def main():
     # Output stem encodes the fold so a 5-fold sweep with the same --tag
     # does not overwrite itself (<tag>_f<fold>_{best.pth,last.pth,scores.json})
     stem = f"{args.tag}_f{args.fold}"
-    print(f"[{stem}] device={device} mode=baseline seed={args.seed} "
+    mode = "tophat" if args.tophat else "baseline"
+    print(f"[{stem}] device={device} mode={mode} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels}")
     dice_loss = SoftDiceLoss(batch_dice=True)
     ce_loss = torch.nn.CrossEntropyLoss()

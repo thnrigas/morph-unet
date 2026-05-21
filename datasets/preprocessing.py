@@ -16,15 +16,16 @@
 # limitations under the License.
 
 from collections import defaultdict
-
 from batchgenerators.augmentations.utils import pad_nd_image
 from medpy.io import load
 import os
 import numpy as np
 import torch
+from scipy.ndimage import grey_opening
+from skimage.morphology import ball
 
 
-def preprocess_data(root_dir, y_shape=64, z_shape=64):
+def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
     image_dir = os.path.join(root_dir, 'imagesTr')
     label_dir = os.path.join(root_dir, 'labelsTr')
     output_dir = os.path.join(root_dir, 'preprocessed')
@@ -45,7 +46,6 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64):
     for f in nii_files:
         image, _ = load(os.path.join(image_dir, f))
         label, _ = load(os.path.join(label_dir, f.replace('_0000', '')))
-
         print(f)
 
         for i in range(classes):
@@ -53,12 +53,17 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64):
             total += np.sum(label == i)
 
         # normalize images
-        image = (image - image.min())/(image.max()-image.min())
+        image = (image - image.min()) / (image.max()-image.min())
+
+        # white top-hat residual (image - opening)
+        tophat = np.clip(image - grey_opening(image, footprint=ball(se_radius)), 0, None)
+        tophat = pad_nd_image(tophat, (tophat.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': 0.0})
 
         image = pad_nd_image(image, (image.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': image.min()})
         label = pad_nd_image(label, (image.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': label.min()})
 
-        result = np.stack((image, label))
+        # channel order: 0=image, 1=tophat, 2=label
+        result = np.stack((image, tophat, label))
 
         np.save(os.path.join(output_dir, f.split('.')[0]+'.npy'), result)
         print(f)
@@ -71,9 +76,7 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64):
 def preprocess_single_file(image_file):
     image, image_header = load(image_file)
     image = (image - image.min()) / (image.max() - image.min())
-
     data = np.expand_dims(image, 1)
-
     return torch.from_numpy(data), image_header
 
 
@@ -81,5 +84,4 @@ def postprocess_single_image(image):
     # desired shape is [b w h]
     result_converted = image[::, 0, ::, ::]
     result_mapped = [i * 255 for i in result_converted]
-
     return result_mapped
