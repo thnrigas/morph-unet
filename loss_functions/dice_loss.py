@@ -39,9 +39,7 @@ def get_tp_fp_fn(net_output, gt, axes=None, mask=None):
             y_onehot = gt
         else:
             gt = gt.long()
-            y_onehot = torch.zeros(shp_x)
-            if net_output.device.type == "cuda":
-                y_onehot = y_onehot.cuda(net_output.device.index)
+            y_onehot = torch.zeros(shp_x, device=net_output.device)
             y_onehot.scatter_(1, gt, 1)
 
     tp = net_output * y_onehot
@@ -119,9 +117,7 @@ class SoftDiceLoss(nn.Module):
         if len(shp_x) != len(shp_y):
             y = y.view((shp_y[0], 1, *shp_y[1:]))
         # now x and y should have shape (B, C, X, Y(, Z))) and (B, 1, X, Y(, Z))), respectively
-        y_onehot = torch.zeros(shp_x)
-        if x.device.type == "cuda":
-            y_onehot = y_onehot.cuda(x.device.index)
+        y_onehot = torch.zeros(shp_x, device=x.device)
         y_onehot.scatter_(1, y, 1)
         if not self.do_bg:
             x = x[:, 1:]
@@ -141,10 +137,8 @@ def soft_dice_per_batch(net_output, gt, smooth=1., smooth_in_nom=1., background_
     axes = tuple([0] + list(range(2, len(net_output.size()))))
     intersect = sum_tensor(net_output * gt, axes, keepdim=False)
     denom = sum_tensor(net_output + gt, axes, keepdim=False)
-    weights = torch.ones(intersect.shape)
+    weights = torch.ones(intersect.shape, device=net_output.device)
     weights[0] = background_weight
-    if net_output.device.type == "cuda":
-        weights = weights.cuda(net_output.device.index)
     result = (- ((2 * intersect + smooth_in_nom) / (denom + smooth)) * weights).mean()
     return result
 
@@ -156,14 +150,10 @@ def soft_dice_per_batch_2(net_output, gt, smooth=1., smooth_in_nom=1., backgroun
     tp = sum_tensor(net_output * gt, axes, keepdim=False)
     fn = sum_tensor((1 - net_output) * gt, axes, keepdim=False)
     fp = sum_tensor(net_output * (1 - gt), axes, keepdim=False)
-    weights = torch.ones(tp.shape)
+    weights = torch.ones(tp.shape, device=net_output.device)
     weights[0] = background_weight
-    if net_output.device.type == "cuda":
-        weights = weights.cuda(net_output.device.index)
     if rebalance_weights is not None:
-        rebalance_weights = torch.from_numpy(rebalance_weights).float()
-        if net_output.device.type == "cuda":
-            rebalance_weights = rebalance_weights.cuda(net_output.device.index)
+        rebalance_weights = torch.from_numpy(rebalance_weights).float().to(net_output.device)
         tp = tp * rebalance_weights
         fn = fn * rebalance_weights
     result = (- ((2 * tp + smooth_in_nom) / (2 * tp + fp + fn + smooth)) * weights).mean()

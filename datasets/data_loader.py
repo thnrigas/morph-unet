@@ -16,6 +16,7 @@
 # limitations under the License.
 
 import random
+from functools import partial
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -26,6 +27,11 @@ def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _worker_init(worker_id, base_seed):
+    """Top-level worker initialiser."""
+    set_seed(worker_id + base_seed)
 
 
 class WrappedDataset(Dataset):
@@ -57,20 +63,17 @@ class MultiThreadedDataLoader(object):
         self.ds_wrapper = WrappedDataset(data_loader, transform)
 
         self.generator = DataLoader(self.ds_wrapper, batch_size=1, shuffle=False, sampler=None, batch_sampler=None,
-                                    num_workers=num_processes, pin_memory=True, drop_last=False,
+                                    num_workers=num_processes, pin_memory=torch.cuda.is_available(), drop_last=False,
+                                    persistent_workers=num_processes > 0,
                                     worker_init_fn=self.get_worker_init_fn())
 
         self.num_processes = num_processes
         self.iter = None
 
     def get_worker_init_fn(self):
-        def init_fn(worker_id):
-            set_seed(worker_id + self.cntr)
-
-        return init_fn
+        return partial(_worker_init, base_seed=self.cntr)
 
     def __iter__(self):
-        self.kill_iterator()
         self.iter = iter(self.generator)
         return self.iter
 
@@ -81,8 +84,6 @@ class MultiThreadedDataLoader(object):
 
     def renew(self):
         self.cntr += 1
-        self.kill_iterator()
-        self.generator.worker_init_fn = self.get_worker_init_fn()
         self.iter = iter(self.generator)
 
     def restart(self):
@@ -90,10 +91,14 @@ class MultiThreadedDataLoader(object):
         # self.iter = iter(self.generator)
 
     def kill_iterator(self):
+        if self.iter is None:
+            return
+
         try:
-            if self.iter is not None:
-                self.iter._shutdown_workers()
-                for p in self.iter.workers:
-                    p.terminate()
+            shutdown = getattr(self.iter, "_shutdown_workers", None)
+            if callable(shutdown):
+                shutdown()
         except Exception:
             pass
+        finally:
+            self.iter = None

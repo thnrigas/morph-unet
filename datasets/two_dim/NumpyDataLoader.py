@@ -156,7 +156,7 @@ class NumpyDataLoader(SlimDataLoaderBase):
         for slice in open_array:
             fn_name = self.files[slice[0]]
 
-            numpy_array = np.load(fn_name, mmap_mode="r")
+            numpy_array = np.load(fn_name)
 
             numpy_slice = numpy_array[:, slice[1], ]
             data.append(numpy_slice[list(self.input_slice)])   # 'None' keeps the dimension
