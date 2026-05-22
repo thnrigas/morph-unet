@@ -4,6 +4,8 @@ Train, Test and Eval for U-Net Segmentation.
 """
 
 import argparse
+import glob
+import json
 import os
 import pickle
 import random
@@ -108,11 +110,89 @@ def evaluate_test(model, loader, device, json_path):
     return scores
 
 
+def _run_name(path):
+    base = os.path.basename(path)
+    for suf in ("_scores.json", ".json"):
+        if base.endswith(suf):
+            return base[:-len(suf)]
+    return base
+
+
+def fold_mean(tag):
+    """Average each metric across all per-fold <tag>_f<fold>_scores.json."""
+    paths = sorted(glob.glob(f"{tag}_f*_scores.json"))
+    if not paths:
+        raise SystemExit(f"no files match {tag}_f*_scores.json")
+    per_fold = []
+    for p in paths:
+        with open(p) as f:
+            per_fold.append(json.load(f)["results"]["mean"])
+    print(f"{tag}: mean +/- std over {len(paths)} folds "
+          f"({', '.join(_run_name(p) for p in paths)})")
+    agg = {}
+    for label in per_fold[0]:
+        agg[label] = {}
+        for metric in ("Dice", "Avg. Symmetric Surface Distance"):
+            vals = [fold[label].get(metric) for fold in per_fold]
+            vals = [v for v in vals if v is not None]
+            if not vals:
+                continue
+            m, s = float(np.mean(vals)), float(np.std(vals))
+            agg[label][metric] = {"mean": m, "std": s, "n": len(vals)}
+            print(f"  label {label:>10} | {metric:<32} "
+                  f"{m:.4f} +/- {s:.4f}  (n={len(vals)})")
+    out = f"{tag}_mean_scores.json"
+    with open(out, "w") as f:
+        json.dump({"tag": tag, "folds": paths, "mean": agg}, f, indent=2)
+    print(f"written to {out}")
+    return agg
+
+
+def compare_runs(paths):
+    """Per-label Dice/ASSD deltas of each run vs the baseline."""
+    if len(paths) < 2:
+        raise SystemExit("--compare needs at least two JSON files")
+    baseline, others = paths[0], paths[1:]
+
+    def load_mean(p):
+        """Flat {label: {metric: float}}, accepting per-fold or fold-mean files."""
+        with open(p) as f:
+            d = json.load(f)
+        kind = "fold-mean" if "mean" in d else "per-fold"
+        raw = d["mean"] if kind == "fold-mean" else d["results"]["mean"]
+        # fold-mean files nest {"mean", "std", "n"}; flatten to the mean
+        flat = {label: {m: (v["mean"] if isinstance(v, dict) else v)
+                        for m, v in metrics.items()}
+                for label, metrics in raw.items()}
+        return kind, flat
+
+    kinds = {p: load_mean(p)[0] for p in paths}
+    if len(set(kinds.values())) > 1:
+        print("WARNING: mixing per-fold and fold-mean files in one compare")
+        for p, k in kinds.items():
+            print(f"  {k:<10} {_run_name(p)}")
+
+    base = load_mean(baseline)[1]
+    bname = _run_name(baseline)
+    print(f"baseline : {bname}")
+    for other in others:
+        o = load_mean(other)[1]
+        oname = _run_name(other)
+        print(f"\n{oname} vs {bname} (mean over test set)")
+        for label in base:
+            for metric in ("Dice", "Avg. Symmetric Surface Distance"):
+                bv, ov = base[label].get(metric), o[label].get(metric)
+                if bv is None or ov is None:
+                    continue
+                print(f"  label {label:>10} | {metric:<32} "
+                      f"{bv:.4f} -> {ov:.4f}   delta={ov - bv:+.4f}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--data-dir", default="data/Task04_Hippocampus/preprocessed")
     p.add_argument("--split-dir", default="data/Task04_Hippocampus")
-    p.add_argument("--tag", required=True)
+    p.add_argument("--tag")
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
@@ -128,7 +208,18 @@ def main():
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--num-classes", type=int, default=3)
     p.add_argument("--test-only", action="store_true")
+    p.add_argument("--compare", nargs="+", metavar="JSON")
+    p.add_argument("--fold-mean", metavar="TAG")
     args = p.parse_args()
+
+    if args.fold_mean:
+        fold_mean(args.fold_mean)
+        return
+    if args.compare:
+        compare_runs(args.compare)
+        return
+    if not args.tag:
+        p.error("--tag is required")
 
     set_seed(args.seed)
     device = pick_device()
@@ -182,13 +273,13 @@ def main():
                       f"{epoch - since_improved})")
                 break
     ckpt = best_path if os.path.exists(best_path) else f"{stem}_last.pth"
-    if os.path.exists(ckpt):
-        model.load_state_dict(torch.load(ckpt, map_location=device))
+    model.load_state_dict(torch.load(ckpt, map_location=device))
     json_path = f"{stem}_scores.json"
     scores = evaluate_test(model, test_loader, device, json_path)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
-        print(f"  label {label}: Dice={md.get('Dice')}")
+        print(f"  label {label}: Dice={md.get('Dice')} "
+              f"ASSD={md.get('Avg. Symmetric Surface Distance')}")
 
 
 if __name__ == "__main__":

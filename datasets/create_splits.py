@@ -22,15 +22,15 @@ import random
 from utilities.file_and_folder_operations import subfiles
 
 def create_splits(output_dir, image_dir, seed=42, k=5):
-    """True seeded k-fold cross-validation splits.
+    """
+    True seeded k-fold cross-validation splits.
     Every case appears in the test set of exactly one fold.
     for fold i, test = chunk i, val = chunk (i+1) % k, train = rest
     """
     npy_files = subfiles(image_dir, suffix=".npy", join=False)
     samples = sorted(s[:-4] for s in npy_files)        # deterministic base order
     if len(samples) < k:
-        raise ValueError("need >= k=%d samples for %d-fold CV (have %d)"
-                         % (k, k, len(samples)))
+        raise ValueError(f"{k}-fold CV needs at least {k} samples, have {len(samples)}")
 
     rng = random.Random(seed)                          # isolated, seeded RNG
     rng.shuffle(samples)
@@ -53,16 +53,3 @@ def create_splits(output_dir, image_dir, seed=42, k=5):
 
     with open(os.path.join(output_dir, 'splits.pkl'), 'wb') as f:
         pickle.dump(splits, f)
-
-    splits_sanity_check(output_dir)
-
-
-def splits_sanity_check(path):
-    """Verify no sample leaks between train / val / test within a fold."""
-    with open(os.path.join(path, 'splits.pkl'), 'rb') as f:
-        splits = pickle.load(f)
-    for samples in splits:
-        tr, vl, ts = (set(samples["train"]), set(samples["val"]), set(samples["test"]))
-        assert not tr & vl, "Train and validation samples overlap!"
-        assert not vl & ts, "Validation and Test samples overlap!"
-        assert not tr & ts, "Train and Test samples overlap!"

@@ -12,7 +12,7 @@ This is a modified derivative work, original per-file copyright headers are reta
 
 ## Setup & Run
 
-Data available in (http://medicaldecathlon.com).
+Data available in http://medicaldecathlon.com.
 
 Install requirements :
 ```
@@ -31,20 +31,42 @@ Baseline Model :
 python3 train_eval.py --tag baseline --fold 0
 ```
 
-Static Residuals :
+Static Residuals : (one or both)
 ```
 python3 train_eval.py --tag static --tophat --bottomhat --fold 0
 ```
 
-Trainable Residuals :
+Trainable Residuals : (one or both)
 ```
 python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat --fold 0
 ```
 
-Per run it writes (output stem `<tag>_f<fold>`) `<tag>_f<fold>_best.pth` / `_last.pth` (checkpoints) and `<tag>_f<fold>_scores.json` (per-label metrics).
+Compare Results :
+```
+python3 train_eval.py --compare baseline_f0_scores.json static_f0_scores.json trainable_f0_scores.json
+```
 
-A 5-fold cross-validated sweep is the same command looped over `--fold 0...4`.
-   
+5-fold cross-validated sweep :
+```
+for f in 0 1 2 3 4; do
+  python3 train_eval.py --tag baseline --fold $f
+  python3 train_eval.py --tag static --tophat --bottomhat --fold $f
+  python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat --fold $f
+done
+```
+
+Mean score over folds :
+```
+python3 train_eval.py --fold-mean baseline
+python3 train_eval.py --fold-mean static
+python3 train_eval.py --fold-mean trainable
+```
+
+Compare Results :
+```
+python3 train_eval.py --compare baseline_mean_scores.json static_mean_scores.json trainable_mean_scores.json
+```
+
 ## References
 
 [1] Antonelli, M., et al. "The Medical Segmentation Decathlon." Nature Communications, 2022.
