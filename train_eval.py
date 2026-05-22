@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from networks.UNET import UNet
 from networks.morph_block import MorphResidualUNet
 from loss_functions.dice_loss import SoftDiceLoss
+from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
 from evaluation.evaluator import aggregate_scores, Evaluator
 
@@ -68,7 +69,7 @@ def build_loaders(args):
     return train, val, test, in_channels
 
 
-def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None):
+def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_loss=None):
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
     losses = []
@@ -82,6 +83,8 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None):
             pred = model(data)
             pred_softmax = F.softmax(pred, dim=1)
             loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
+            if morph_loss is not None:
+                loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
                 optimizer.step()
@@ -198,6 +201,7 @@ def main():
     p.add_argument("--morph-block", action="store_true")
     p.add_argument("--morph-k", type=int, default=5)
     p.add_argument("--morph-beta", type=float, default=10.0)
+    p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--patience", type=int, default=15)
     p.add_argument("--seed", type=int, default=42)
@@ -244,10 +248,12 @@ def main():
     else:
         parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
         mode = "+".join(parts) if parts else "baseline"
-    print(f"[{stem}] device={device} mode={mode} seed={args.seed} "
+    loss_desc = "dice+ce" + ("+morph" if args.morph_loss else "")
+    print(f"[{stem}] device={device} mode={mode} loss={loss_desc} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels}")
     dice_loss = SoftDiceLoss(batch_dice=True)
     ce_loss = torch.nn.CrossEntropyLoss()
+    morph_loss = MorphConsistencyLoss().to(device) if args.morph_loss else None
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, "min")
 
@@ -256,8 +262,8 @@ def main():
         best_val = float("inf")
         since_improved = 0
         for epoch in range(1, args.epochs + 1):
-            tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer)
-            vl = run_epoch(model, val_loader, device, dice_loss, ce_loss)
+            tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
+            vl = run_epoch(model, val_loader, device, dice_loss, ce_loss, None, morph_loss)
             scheduler.step(vl)
             print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val={vl:.4f}")
             if vl < best_val:

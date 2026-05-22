@@ -1,6 +1,6 @@
 ﻿# Morphological U-Net
 
-The project investigates whether morphological variations of the U-Net improves segmentation over the unaltered baseline. This is done in the context of the Medical Segmentation Decathlon. Morphological variants include top and/or bottom hat (residuals) as additional input channels, either precomputed with a fixed structuring element or computed by a morphological block with a trainable structuring element.
+The project investigates whether morphological variations of the U-Net improves segmentation over the unaltered baseline. This is done in the context of the Medical Segmentation Decathlon. Morphological variants include top and/or bottom hat (residuals) as additional input channels, either precomputed with a fixed structuring element or computed by a morphological block with a trainable structuring element and a morphological loss function added to the preexisting.
 
 ## Attribution & License
 
@@ -12,7 +12,7 @@ This is a modified derivative work, original per-file copyright headers are reta
 
 ## Setup & Run
 
-Data available in http://medicaldecathlon.com.
+Data available in http://medicaldecathlon.com. Must be placed in `./data/`.
 
 Install requirements :
 ```
@@ -28,22 +28,27 @@ Train, test and evaluate :
 
 Baseline Model :
 ```
-python3 train_eval.py --tag baseline --fold 0
+python3 train_eval.py --tag baseline
 ```
 
 Static Residuals : (one or both)
 ```
-python3 train_eval.py --tag static --tophat --bottomhat --fold 0
+python3 train_eval.py --tag static --tophat --bottomhat
 ```
 
 Trainable Residuals : (one or both)
 ```
-python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat --fold 0
+python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat
+```
+
+Morph Loss Function : (could add residuals)
+```
+python3 train_eval.py --tag morphloss --morph-loss
 ```
 
 Compare Results :
 ```
-python3 train_eval.py --compare baseline_f0_scores.json static_f0_scores.json trainable_f0_scores.json
+python3 train_eval.py --compare baseline_f0_scores.json static_f0_scores.json trainable_f0_scores.json morphloss_f0_scores.json
 ```
 
 5-fold cross-validated sweep :
@@ -52,6 +57,7 @@ for f in 0 1 2 3 4; do
   python3 train_eval.py --tag baseline --fold $f
   python3 train_eval.py --tag static --tophat --bottomhat --fold $f
   python3 train_eval.py --tag trainable --morph-block --tophat --bottomhat --fold $f
+  python3 train_eval.py --tag morphloss --morph-loss --fold $f
 done
 ```
 
@@ -60,11 +66,12 @@ Mean score over folds :
 python3 train_eval.py --fold-mean baseline
 python3 train_eval.py --fold-mean static
 python3 train_eval.py --fold-mean trainable
+python3 train_eval.py --fold-mean morphloss
 ```
 
 Compare Results :
 ```
-python3 train_eval.py --compare baseline_mean_scores.json static_mean_scores.json trainable_mean_scores.json
+python3 train_eval.py --compare baseline_mean_scores.json static_mean_scores.json trainable_mean_scores.json morphloss_mean_scores.json
 ```
 
 ## References
