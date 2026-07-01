@@ -33,7 +33,6 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        print('Created' + output_dir + '...')
 
     class_stats = defaultdict(int)
     total = 0
@@ -46,7 +45,6 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
     for f in nii_files:
         image, _ = load(os.path.join(image_dir, f))
         label, _ = load(os.path.join(label_dir, f.replace('_0000', '')))
-        print(f)
 
         for i in range(classes):
             class_stats[i] += np.sum(label == i)
@@ -55,8 +53,9 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
         # normalize images
         image = (image - image.min()) / (image.max()-image.min())
 
-        # top-hat (image - opening) and bottom-hat (closing - image)
+        # x - opening(x) (top-hat)
         tophat = np.clip(image - grey_opening(image, footprint=ball(se_radius)), 0, None)
+        # closing(x) - x (bottom-hat)
         bottomhat = np.clip(grey_closing(image, footprint=ball(se_radius)) - image, 0, None)
         tophat = pad_nd_image(tophat, (tophat.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': 0.0})
         bottomhat = pad_nd_image(bottomhat, (bottomhat.shape[0], y_shape, z_shape), "constant", kwargs={'constant_values': 0.0})
@@ -66,13 +65,7 @@ def preprocess_data(root_dir, y_shape=64, z_shape=64, se_radius=2):
 
         # channel order: 0=image, 1=tophat, 2=bottomhat, 3=label
         result = np.stack((image, tophat, bottomhat, label))
-
         np.save(os.path.join(output_dir, f.split('.')[0]+'.npy'), result)
-        print(f)
-
-    print(total)
-    for i in range(classes):
-        print(class_stats[i], class_stats[i]/total)
 
 
 def preprocess_single_file(image_file):

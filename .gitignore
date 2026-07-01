@@ -1,11 +1,10 @@
 .idea
 *.pyc
 .DS_Store
-*.egg-info
-.pytest_cache/*
-
 data
-venv
 .venv
 *.pth
-documentation/
+docs
+papers
+**__init__.py
+results

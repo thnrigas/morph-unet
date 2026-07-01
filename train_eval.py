@@ -1,7 +1,6 @@
-#!/usr/bin/env python
-"""
-Train, Test and Eval for U-Net Segmentation.
-"""
+#
+# Train and Test for U-Net Segmentation
+#
 
 import argparse
 import glob
@@ -17,6 +16,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+import config
 from networks.UNET import UNet
 from networks.morph_block import MorphResidualUNet
 from loss_functions.dice_loss import SoftDiceLoss
@@ -26,9 +26,10 @@ from evaluation.evaluator import aggregate_scores, Evaluator
 
 LABELS = {1: "Anterior", 2: "Posterior"}   # Task04 Hippocampus
 
-
+#
+# fixed seed so runs share initialisation
+#
 def set_seed(seed):
-    """Fixed seed so runs share initialisation."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -43,14 +44,15 @@ def pick_device():
         return torch.device("mps")
     return torch.device("cpu")
 
-
+#
+# build loaders
+#
 def build_loaders(args):
-    with open(os.path.join(args.split_dir, "splits.pkl"), "rb") as f:
+    with open(config.SPLITS_FILE, "rb") as f:
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
+    data_dir = str(config.PREPROCESSED_DIR)
     # npy is 4-channel (image, tophat, bottomhat, label)
-    # --morph-block --tophat/--bottomhat learns the morphological SE
-    # otherwise the static --tophat/--bottomhat channels are selected
     if args.morph_block:
         input_slice = (0,)
     else:
@@ -62,13 +64,15 @@ def build_loaders(args):
     label_slice = 3
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
                   label_slice=label_slice, num_processes=args.num_workers)
-    train = NumpyDataSet(args.data_dir, keys=tr, **common)
-    val = NumpyDataSet(args.data_dir, keys=vl, mode="val",  do_reshuffle=False, **common)
-    test = NumpyDataSet(args.data_dir, keys=ts, mode="test", do_reshuffle=False, **common)
+    train = NumpyDataSet(data_dir, keys=tr, **common)
+    val = NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common)
+    test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False, **common)
     in_channels = len(input_slice)
     return train, val, test, in_channels
 
-
+#
+# run epoch
+#
 def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_loss=None):
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
@@ -91,7 +95,9 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
-
+#
+# test
+#
 def evaluate_test(model, loader, device, json_path):
     model.eval()
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
@@ -105,8 +111,7 @@ def evaluate_test(model, loader, device, json_path):
                 pred_dict[fname[0]].append(pred_argmax[i].numpy())
                 gt_dict[fname[0]].append(target[i].detach().cpu().numpy())
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
-    scores = aggregate_scores(
-        pairs, evaluator=Evaluator, labels=LABELS,
+    scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
         json_task="Task04_Hippocampus", advanced=True,
     )
@@ -120,12 +125,14 @@ def _run_name(path):
             return base[:-len(suf)]
     return base
 
-
+#
+# average each metric across all per-fold <tag>_f<fold>_scores.json
+#
 def fold_mean(tag):
-    """Average each metric across all per-fold <tag>_f<fold>_scores.json."""
-    paths = sorted(glob.glob(f"{tag}_f*_scores.json"))
+    results_dir = os.path.join(config.PROJECT_ROOT, "results")
+    paths = sorted(glob.glob(os.path.join(results_dir, f"{tag}_f*_scores.json")))
     if not paths:
-        raise SystemExit(f"no files match {tag}_f*_scores.json")
+        raise SystemExit(f"no files match {tag}_f*_scores.json in {results_dir}")
     per_fold = []
     for p in paths:
         with open(p) as f:
@@ -144,28 +151,35 @@ def fold_mean(tag):
             agg[label][metric] = {"mean": m, "std": s, "n": len(vals)}
             print(f"  label {label:>10} | {metric:<32} "
                   f"{m:.4f} +/- {s:.4f}  (n={len(vals)})")
-    out = f"{tag}_mean_scores.json"
+    os.makedirs(results_dir, exist_ok=True)
+    out = os.path.join(results_dir, f"{tag}_mean_scores.json")
     with open(out, "w") as f:
         json.dump({"tag": tag, "folds": paths, "mean": agg}, f, indent=2)
     print(f"written to {out}")
     return agg
 
-
+#
+# per-label Dice/ASSD deltas of each run vs the baseline
+#
 def compare_runs(paths):
-    """Per-label Dice/ASSD deltas of each run vs the baseline."""
     if len(paths) < 2:
         raise SystemExit("--compare needs at least two JSON files")
     baseline, others = paths[0], paths[1:]
 
     def load_mean(p):
         """Flat {label: {metric: float}}, accepting per-fold or fold-mean files."""
-        with open(p) as f:
+        actual_path = p
+        if not os.path.exists(actual_path):
+            results_dir = os.path.join(config.PROJECT_ROOT, "results")
+            alt_path = os.path.join(results_dir, p)
+            if os.path.exists(alt_path):
+                actual_path = alt_path
+        with open(actual_path) as f:
             d = json.load(f)
         kind = "fold-mean" if "mean" in d else "per-fold"
         raw = d["mean"] if kind == "fold-mean" else d["results"]["mean"]
         # fold-mean files nest {"mean", "std", "n"}; flatten to the mean
-        flat = {label: {m: (v["mean"] if isinstance(v, dict) else v)
-                        for m, v in metrics.items()}
+        flat = {label: {m: (v["mean"] if isinstance(v, dict) else v) for m, v in metrics.items()}
                 for label, metrics in raw.items()}
         return kind, flat
 
@@ -190,11 +204,11 @@ def compare_runs(paths):
                 print(f"  label {label:>10} | {metric:<32} "
                       f"{bv:.4f} -> {ov:.4f}   delta={ov - bv:+.4f}")
 
-
+#
+# main
+#
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", default="data/Task04_Hippocampus/preprocessed")
-    p.add_argument("--split-dir", default="data/Task04_Hippocampus")
     p.add_argument("--tag")
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
@@ -203,7 +217,7 @@ def main():
     p.add_argument("--morph-beta", type=float, default=10.0)
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--patience", type=int, default=12)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=64)
@@ -211,9 +225,9 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--num-classes", type=int, default=3)
-    p.add_argument("--test-only", action="store_true")
-    p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--fold-mean", metavar="TAG")
+    p.add_argument("--compare", nargs="+", metavar="JSON")
+    p.add_argument("--test-only", action="store_true")
     args = p.parse_args()
 
     if args.fold_mean:
@@ -228,6 +242,7 @@ def main():
     set_seed(args.seed)
     device = pick_device()
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
+
     if args.morph_block:
         # under --morph-block the --tophat/--bottomhat flags select the
         # learnable residuals, default to top-hat if neither is given
@@ -239,8 +254,7 @@ def main():
     else:
         model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
 
-    # Output stem encodes the fold so a 5-fold sweep with the same --tag
-    # does not overwrite itself (<tag>_f<fold>_{best.pth,last.pth,scores.json})
+    # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
     if args.morph_block:
         res = "+".join((["tophat"] if use_th else []) + (["bottomhat"] if use_bh else []))
@@ -251,13 +265,17 @@ def main():
     loss_desc = "dice+ce" + ("+morph" if args.morph_loss else "")
     print(f"[{stem}] device={device} mode={mode} loss={loss_desc} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels}")
+
     dice_loss = SoftDiceLoss(batch_dice=True)
     ce_loss = torch.nn.CrossEntropyLoss()
     morph_loss = MorphConsistencyLoss().to(device) if args.morph_loss else None
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, "min")
+    scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=6)
 
-    best_path = f"{stem}_best.pth"
+    results_dir = os.path.join(config.PROJECT_ROOT, "results")
+    os.makedirs(results_dir, exist_ok=True)
+    best_path = os.path.join(results_dir, f"{stem}_best.pth")
+    last_path = os.path.join(results_dir, f"{stem}_last.pth")
     if not args.test_only:
         best_val = float("inf")
         since_improved = 0
@@ -272,15 +290,16 @@ def main():
                 torch.save(model.state_dict(), best_path)
             else:
                 since_improved += 1
-            torch.save(model.state_dict(), f"{stem}_last.pth")
+                patience_str = f"/{args.patience}" if args.patience else ""
+                print(f"  val loss did not improve from {best_val:.4f} (patience: {since_improved}{patience_str})")
+            torch.save(model.state_dict(), last_path)
             if args.patience and since_improved >= args.patience:
                 print(f"early stop: no val improvement for {args.patience} "
-                      f"epochs (best val={best_val:.4f} @ ep "
-                      f"{epoch - since_improved})")
+                      f"epochs (best val={best_val:.4f} @ ep {epoch - since_improved})")
                 break
-    ckpt = best_path if os.path.exists(best_path) else f"{stem}_last.pth"
+    ckpt = best_path if os.path.exists(best_path) else last_path
     model.load_state_dict(torch.load(ckpt, map_location=device))
-    json_path = f"{stem}_scores.json"
+    json_path = os.path.join(results_dir, f"{stem}_scores.json")
     scores = evaluate_test(model, test_loader, device, json_path)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():

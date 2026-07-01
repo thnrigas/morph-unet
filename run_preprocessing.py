@@ -15,17 +15,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import argparse
-import os
-
+import config
 from datasets.preprocessing import preprocess_data
 from datasets.create_splits import create_splits
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--root", default="data/Task04_Hippocampus")
-    args = p.parse_args()
-
-    preprocess_data(root_dir=args.root)
-    create_splits(output_dir=args.root, image_dir=os.path.join(args.root, "preprocessed"))
+    preprocess_data(root_dir=str(config.DATA_DIR))
+    create_splits(output_dir=str(config.DATA_DIR), image_dir=str(config.PREPROCESSED_DIR))
     print("Preprocessing done.")
