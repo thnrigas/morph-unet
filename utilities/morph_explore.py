@@ -1,33 +1,28 @@
 #
 # Morphology Explorer
 #
-# extract images, apply morphological transformations (top-hat, bottom-hat)
-# visualise and quantify where the residual lands relative to ground truth
-# use to experiment and prune possible dead ends
+# one tool, two subcommands:
 #
-# two input modes
-# i. precomputed : 4-channel .npy (image, tophat, bottomhat, label), shows exactly what the network receives
-# ii. fresh : any single-channel image (.npy / .nii / .nii.gz), morphology computed on the fly with a configurable
-# structuring element, so we can sweep se_radius / mode / dimensionality
-#
-# works for 2D and 3D, and for any number of label classes
+#   explore  - single-case deep dive. 4-panel (image, top-hat, bottom-hat, image+label),
+#              2D or 3D, precomputed 4-channel .npy OR fresh morphology, with region stats.
+#   survey   - batch, per-dataset look to pick a task before training: modality-aware
+#              preprocessing (CT windowing / MRI normalisation), an SE-size sweep and
+#              granulometric bands, scored by a target-concentration ranking.
 #
 # examples
+#   # single preprocessed volume (what the network receives)
+#   python utilities/morph_explore.py explore data/Task04_Hippocampus/preprocessed/hippocampus_001.npy
+#   # a raw image + its label, fresh morphology at a chosen SE size
+#   python utilities/morph_explore.py explore img.nii.gz --label mask.nii.gz --fresh --se-radius 3
+#   # survey a dataset: sweep radii + bands over 8 cases, render the first 2, rank residuals
+#   python utilities/morph_explore.py survey data/Task08_HepaticVessel --n 8 --viz 2
+#   python utilities/morph_explore.py survey data/Task01_BrainTumour --channel 0   # FLAIR
 #
-# preprocessed volume
-# python utilities/morph_explore.py data/Task04_Hippocampus/preprocessed/hippocampus_001.npy
-#
-# a different SE size, computed fresh from the image channel
-# python utilities/morph_explore.py <img.npy> --fresh --se-radius 4
-#
-# a raw 2D image and its label, no precomputed channels
-# python utilities/morph_explore.py retina_01.png --label retina_01_mask.png --fresh --se-radius 3
-#
-# pick a slice explicitly instead of the max-foreground one, save without showing
-# python utilities/morph_explore.py vol.npy --slice 20 --no-show --out panel.png
+# (bare `morph_explore.py <path>` still works: it defaults to the explore subcommand.)
 #
 
 import argparse
+import json
 import os
 import numpy as np
 
@@ -35,91 +30,113 @@ import numpy as np
 #
 # IO
 #
-def _load_any(path):
+def load_any(path):
     """Load .npy / .nii(.gz) / common image formats -> float ndarray."""
     ext = path.lower()
     if ext.endswith(".npy"):
-        return np.load(path)
+        return np.load(path).astype(np.float64)
     if ext.endswith((".nii", ".nii.gz")):
-        from medpy.io import load                       # already a project dep
+        from medpy.io import load
         data, _ = load(path)
-        return data
-    from PIL import Image                                # png/jpg/tif ...
-    arr = np.asarray(Image.open(path))
-    return arr.mean(-1) if arr.ndim == 3 else arr        # collapse RGB to gray
+        return data.astype(np.float64)
+    from PIL import Image
+    arr = np.asarray(Image.open(path)).astype(np.float64)
+    return arr.mean(-1) if arr.ndim == 3 else arr
 
 
-def load_inputs(args):
+def load_meta(ds_dir):
+    with open(os.path.join(ds_dir, "dataset.json")) as f:
+        d = json.load(f)
+    return d.get("modality", {"0": "MRI"}), d.get("labels", {})
+
+
+def norm01(v):
+    rng = v.max() - v.min()
+    return (v - v.min()) / rng if rng > 0 else v * 0.0
+
+
+#
+# preprocessing (windowing / normalisation), modality-aware
+#
+def preprocess(vol, modality_str, channel=0, ct_center=40.0, ct_width=400.0,
+               p_lo=0.5, p_hi=99.5):
+    """Normalise to [0,1] matched to the modality.
+
+    CT  : clip to a Hounsfield window so soft tissue keeps contrast (vs air/bone).
+    MRI : robust percentile clip of the foreground, then min-max (intensity is relative).
     """
-    Return (image, tophat, bottomhat, label) as float arrays of identical shape.
-    label may be None. tophat/bottomhat are computed fresh when not available
-    (or when --fresh is given).
-    """
-    raw = _load_any(args.path).astype(np.float64)
-
-    # this project's stacked layout: (4, ...) with channels img/top/bot/label.
-    # --fresh still takes image+label from the stack, it only recomputes residuals.
-    stacked = raw.ndim >= 3 and raw.shape[0] == 4
-    if stacked:
-        image, label = raw[0], raw[3]
-        tophat, bottomhat = (None, None) if args.fresh else (raw[1], raw[2])
+    if vol.ndim == 4:                       # multi-modal: sequences on the last axis
+        vol = vol[..., channel]
+    v = vol.astype(np.float64)
+    if modality_str.upper().startswith("CT"):
+        lo, hi = ct_center - ct_width / 2.0, ct_center + ct_width / 2.0
+        v = np.clip(v, lo, hi)
     else:
-        # single image channel; drop a leading singleton axis if present
-        image = raw[0] if (raw.ndim >= 3 and raw.shape[0] == 1) else raw
-        label = _load_any(args.label).astype(np.float64) if args.label else None
-        tophat = bottomhat = None
-
-    # normalise image to [0,1] for display/computation stability
-    rng = image.max() - image.min()
-    image = (image - image.min()) / rng if rng > 0 else image
-
-    if tophat is None or bottomhat is None:
-        tophat, bottomhat = compute_residuals(image, args.se_radius)
-    return image, tophat, bottomhat, label
+        fg = v[v > v.min()]
+        lo, hi = np.percentile(fg, [p_lo, p_hi]) if fg.size else (v.min(), v.max())
+        v = np.clip(v, lo, hi)
+    return norm01(v)
 
 
 #
-# morphology
+# morphology (2D or 3D, chosen by ndim)
 #
-def compute_residuals(image, se_radius):
-    """White top-hat (x-opening) and black bottom-hat (closing-x). 2D or 3D."""
-    from scipy.ndimage import grey_opening, grey_closing
+def _footprint(ndim, r):
     from skimage.morphology import ball, disk
-    if image.ndim not in (2, 3):
-        raise ValueError(f"image must be 2D or 3D, got shape {image.shape}; "
-                         "check the input layout (expected a single image channel)")
-    fp = ball(se_radius) if image.ndim == 3 else disk(se_radius)
-    tophat = np.clip(image - grey_opening(image, footprint=fp), 0, None)
-    bottomhat = np.clip(grey_closing(image, footprint=fp) - image, 0, None)
-    return tophat, bottomhat
+    return ball(r) if ndim == 3 else disk(r)
+
+
+def opening_of(img, r):
+    from scipy.ndimage import grey_opening
+    return grey_opening(img, footprint=_footprint(img.ndim, r))
+
+
+def closing_of(img, r):
+    from scipy.ndimage import grey_closing
+    return grey_closing(img, footprint=_footprint(img.ndim, r))
+
+
+def tophat(img, r):
+    return np.clip(img - opening_of(img, r), 0, None)
+
+
+def bottomhat(img, r):
+    return np.clip(closing_of(img, r) - img, 0, None)
+
+
+def band(img, r_lo, r_hi):
+    """granulometric band: bright structure with scale in (r_lo, r_hi]."""
+    return np.clip(opening_of(img, r_lo) - opening_of(img, r_hi), 0, None)
 
 
 #
-# slice selection
+# slice selection: (axis, index) of the largest-target slice over all axes
 #
-def pick_slice(label, image, forced):
-    """Index of a representative 2D slice along axis 0 (3D), or None for 2D."""
-    if image.ndim == 2:
+def pick_slice(label, forced=None):
+    if label is None or label.ndim == 2 or not (label > 0).any():
         return None
     if forced is not None:
-        return forced
-    if label is not None and label.any():
-        return int((label > 0).sum(axis=tuple(range(1, label.ndim))).argmax())
-    return image.shape[0] // 2
+        return 0, forced
+    best = None
+    for ax in range(label.ndim):
+        counts = (label > 0).sum(axis=tuple(i for i in range(label.ndim) if i != ax))
+        idx, area = int(counts.argmax()), int(counts.max())
+        if best is None or area > best[2]:
+            best = (ax, idx, area)
+    return best[0], best[1]
 
 
-def _slice(a, z):
-    return a if (a is None or z is None) else a[z]
+def take(a, sel):
+    if a is None or sel is None:
+        return a
+    ax, idx = sel
+    return np.take(a, idx, axis=ax)
 
 
 #
-# quantitative
+# stats: where residual energy lands relative to the target
 #
 def region_stats(residual, label):
-    """
-    Enrichment of residual energy at the label boundary vs interior vs background.
-    Returns a dict; boundary is a 1-voxel ring around any foreground class.
-    """
     from scipy.ndimage import binary_erosion, binary_dilation
     fg = label > 0
     if not fg.any():
@@ -128,92 +145,198 @@ def region_stats(residual, label):
     boundary = binary_dilation(fg) & ~inside
     background = ~binary_dilation(fg)
     tot = residual.sum() + 1e-9
+    pct_on_target = 100 * residual[fg].sum() / tot
+    target_area_pct = 100 * fg.mean()
     return dict(
+        enrichment=(residual[boundary].mean() / (residual[background].mean() + 1e-9)),
         mean_boundary=residual[boundary].mean(),
         mean_inside=residual[inside].mean() if inside.any() else 0.0,
         mean_background=residual[background].mean(),
-        pct_energy_boundary=100 * residual[boundary].sum() / tot,
-        pct_energy_inside=100 * residual[inside].sum() / tot,
-        pct_energy_background=100 * residual[background].sum() / tot,
-        boundary_voxel_frac=100 * boundary.mean(),
-        enrichment=(residual[boundary].mean() / (residual[background].mean() + 1e-9)),
+        pct_on_target=pct_on_target,
+        target_area_pct=target_area_pct,
+        concentration=pct_on_target / (target_area_pct + 1e-9),
     )
-
-
-def print_stats(name, s):
-    if s is None:
-        print(f"  {name}: no label -> skipped")
-        return
-    print(f"  {name}: enrichment(boundary/background)={s['enrichment']:.1f}x  "
-          f"mean[bnd/in/bg]={s['mean_boundary']:.4f}/{s['mean_inside']:.4f}/{s['mean_background']:.4f}")
-    print(f"      %energy bnd/in/bg = {s['pct_energy_boundary']:.1f}/"
-          f"{s['pct_energy_inside']:.1f}/{s['pct_energy_background']:.1f}  "
-          f"(boundary = {s['boundary_voxel_frac']:.1f}% of voxels)")
 
 
 #
 # rendering
 #
-def render(image, tophat, bottomhat, label, z, out, show):
+def render_single(image, th, bh, label, out, show):
     import matplotlib.pyplot as plt
-    im = _slice(image, z)
-    tp = _slice(tophat, z)
-    bt = _slice(bottomhat, z)
-    lb = _slice(label, z)
-
     fig, ax = plt.subplots(1, 4, figsize=(16, 4.2))
-    ax[0].imshow(im, cmap="gray")
-    ax[0].set_title("image")
-    ax[1].imshow(tp, cmap="magma")
-    ax[1].set_title("top-hat")
-    ax[2].imshow(bt, cmap="magma")
-    ax[2].set_title("bottom-hat")
-    ax[3].imshow(im, cmap="gray")
-    ax[3].set_title("image + label contour")
-    if lb is not None:
-        # overlay each foreground class contour on image AND on the residuals
+    ax[0].imshow(image, cmap="gray"); ax[0].set_title("image")
+    ax[1].imshow(th, cmap="magma"); ax[1].set_title("top-hat")
+    ax[2].imshow(bh, cmap="magma"); ax[2].set_title("bottom-hat")
+    ax[3].imshow(image, cmap="gray"); ax[3].set_title("image + label contour")
+    if label is not None and label.max() > 0:
         for a in (ax[1], ax[2], ax[3]):
-            a.contour(lb, levels=np.arange(0.5, lb.max() + 1), colors="cyan", linewidths=0.7)
+            a.contour(label, levels=np.arange(0.5, label.max() + 1), colors="cyan", linewidths=0.7)
     for a in ax:
         a.axis("off")
-    title = "morphology explorer" + (f"  (z={z})" if z is not None else "  (2D)")
-    fig.suptitle(title)
     fig.tight_layout()
     if out:
-        fig.savefig(out, dpi=130, bbox_inches="tight")
-        print(f"saved figure -> {out}")
+        fig.savefig(out, dpi=130, bbox_inches="tight"); print(f"saved figure -> {out}")
     if show:
         plt.show()
     plt.close(fig)
 
 
+def render_grid(img2d, label2d, radii, bands, out):
+    import matplotlib.pyplot as plt
+    ncol = max(len(radii) + 1, len(bands) + 1)
+    fig, ax = plt.subplots(3, ncol, figsize=(3.0 * ncol, 9.2))
+    for a in ax.ravel():
+        a.axis("off")
+
+    def contour(a):
+        if label2d is not None and label2d.max() > 0:
+            a.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.6)
+
+    ax[0, 0].imshow(img2d, cmap="gray"); ax[0, 0].set_title("image (preprocessed)")
+    ax[1, 0].imshow(img2d, cmap="gray"); ax[1, 0].set_title("image + label"); contour(ax[1, 0])
+    ax[2, 0].imshow(img2d, cmap="gray"); ax[2, 0].set_title("image")
+    for j, r in enumerate(radii, start=1):
+        ax[0, j].imshow(tophat(img2d, r), cmap="magma"); ax[0, j].set_title(f"top-hat r={r}"); contour(ax[0, j])
+        ax[1, j].imshow(bottomhat(img2d, r), cmap="magma"); ax[1, j].set_title(f"bottom-hat r={r}"); contour(ax[1, j])
+    for j, (lo, hi) in enumerate(bands, start=1):
+        if j < ncol:
+            ax[2, j].imshow(band(img2d, lo, hi), cmap="magma"); ax[2, j].set_title(f"band γ{lo}-γ{hi}"); contour(ax[2, j])
+    fig.tight_layout()
+    fig.savefig(out, dpi=110, bbox_inches="tight")
+    plt.close(fig)
+
+
+#
+# subcommand: explore (single case)
+#
+def cmd_explore(args):
+    raw = load_any(args.path)
+    stacked = raw.ndim >= 3 and raw.shape[0] == 4      # (img, top, bot, label)
+    if stacked:
+        image, label = raw[0], raw[3]
+        th, bh = (None, None) if args.fresh else (raw[1], raw[2])
+    else:
+        image = raw[0] if (raw.ndim >= 3 and raw.shape[0] == 1) else raw
+        label = load_any(args.label) if args.label else None
+        th = bh = None
+
+    image = norm01(image)
+    if th is None or bh is None:
+        th, bh = tophat(image, args.se_radius), bottomhat(image, args.se_radius)
+
+    sel = pick_slice(label if label is not None else image, args.slice)
+    print(f"input: {os.path.basename(args.path)}  shape={image.shape}  "
+          f"se_radius={args.se_radius}  slice={sel}")
+    if label is not None:
+        for name, res in (("TOP-HAT", th), ("BOTTOM-HAT", bh)):
+            s = region_stats(res, label)
+            if s:
+                print(f"{name}: enrichment(bnd/bg)={s['enrichment']:.1f}x  "
+                      f"concentration(on-target/area)={s['concentration']:.2f}x  "
+                      f"%energy on target={s['pct_on_target']:.1f} (area {s['target_area_pct']:.1f}%)")
+
+    render_single(take(image, sel), take(th, sel), take(bh, sel),
+                  take(label, sel), args.out, show=not args.no_show)
+
+
+#
+# subcommand: survey (batch, ranking)
+#
+def cmd_survey(args):
+    modality, labels = load_meta(args.dataset_dir)
+    mod = modality[str(args.channel)] if str(args.channel) in modality else modality.get("0", "MRI")
+    task = os.path.basename(args.dataset_dir.rstrip("/"))
+    os.makedirs(args.out_dir, exist_ok=True)
+    bands = list(zip(args.bands[0::2], args.bands[1::2]))
+
+    img_dir = os.path.join(args.dataset_dir, "imagesTr")
+    lbl_dir = os.path.join(args.dataset_dir, "labelsTr")
+    cases = sorted(f for f in os.listdir(img_dir) if f.endswith(".nii.gz") and not f.startswith("."))[:args.n]
+
+    records = {}    # residual key -> list of (concentration, enrichment)
+    per_case = [f"# {task}  modality[{args.channel}]={mod}  labels={labels}",
+                f"# radii={args.radii}  bands={bands}  n={len(cases)}",
+                f"{'case':20s} {'residual':13s} {'enrich':>7s} {'%on-tgt':>8s} {'area%':>7s} {'conc':>6s}"]
+
+    def note(stem, key, res, lbl2d):
+        s = region_stats(res, lbl2d)
+        if not s:
+            return
+        records.setdefault(key, []).append((s["concentration"], s["enrichment"]))
+        per_case.append(f"{stem:20s} {key:13s} {s['enrichment']:7.2f} "
+                        f"{s['pct_on_target']:8.1f} {s['target_area_pct']:7.2f} {s['concentration']:6.2f}")
+
+    for i, fn in enumerate(cases):
+        img = preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel)
+        lbl = load_any(os.path.join(lbl_dir, fn))
+        if lbl.ndim == 4:
+            lbl = lbl[..., 0]
+        sel = pick_slice(lbl)
+        img2d, lbl2d = take(img, sel), take(lbl, sel)
+        if i < args.viz:
+            render_grid(img2d, lbl2d, args.radii, bands,
+                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"))
+        stem = fn.replace(".nii.gz", "")
+        for r in args.radii:
+            note(stem, f"tophat r={r}", tophat(img2d, r), lbl2d)
+            note(stem, f"bottomhat r={r}", bottomhat(img2d, r), lbl2d)
+        for lo, hi in bands:
+            note(stem, f"band {lo}-{hi}", band(img2d, lo, hi), lbl2d)
+        per_case.append("")
+
+    summ = sorted(((np.mean([v[0] for v in vals]), np.std([v[0] for v in vals]),
+                    np.mean([v[1] for v in vals]), key) for key, vals in records.items()),
+                  reverse=True)
+    head = [f"===== SUMMARY  {task}  (modality={mod}, n={len(cases)} cases) =====",
+            f"{'residual':13s} {'concentration(mean±sd)':>24s} {'enrich':>7s}"]
+    for cm, cs, em, key in summ:
+        head.append(f"{key:13s} {cm:10.2f} ± {cs:4.2f}          {em:6.2f}")
+    if summ:
+        head.append(f">>> {task}: best mean concentration = {summ[0][0]:.2f}x  ({summ[0][3]})")
+
+    print("\n".join(head))
+    with open(os.path.join(args.out_dir, f"{task}_stats.txt"), "w") as f:
+        f.write("\n".join(per_case) + "\n\n" + "\n".join(head) + "\n")
+    print(f"\n[written] {min(args.viz, len(cases))} panels + {task}_stats.txt in {args.out_dir}")
+
+
 #
 # main
 #
-def main():
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("path", help="4-channel .npy, or a single image (.npy/.nii/.png/...)")
-    p.add_argument("--label", help="separate label file (when not in a 4-channel stack)")
-    p.add_argument("--fresh", action="store_true", help="ignore any precomputed channels; recompute morphology")
-    p.add_argument("--se-radius", type=int, default=2, help="structuring-element radius")
-    p.add_argument("--slice", type=int, default=None, help="axis-0 slice (3D); default=max foreground")
-    p.add_argument("--out", default=None, help="path to save the figure (PNG)")
-    p.add_argument("--no-show", action="store_true", help="do not open an interactive window")
-    args = p.parse_args()
+    sub = p.add_subparsers(dest="cmd", required=True)
 
-    image, tophat, bottomhat, label = load_inputs(args)
-    z = pick_slice(label, image, args.slice)
+    pe = sub.add_parser("explore", help="single-case 4-panel + region stats")
+    pe.add_argument("path", help="4-channel .npy, or a single image (.npy/.nii/.png/...)")
+    pe.add_argument("--label", help="separate label file (when not a 4-channel stack)")
+    pe.add_argument("--fresh", action="store_true", help="ignore precomputed channels; recompute morphology")
+    pe.add_argument("--se-radius", type=int, default=2)
+    pe.add_argument("--slice", type=int, default=None, help="force axis-0 slice (3D)")
+    pe.add_argument("--out", default=None, help="save the figure (PNG)")
+    pe.add_argument("--no-show", action="store_true")
+    pe.set_defaults(func=cmd_explore)
 
-    print(f"input: {os.path.basename(args.path)}  shape={image.shape}  "
-          f"se_radius={args.se_radius}  slice={z}")
-    if label is not None:
-        print("TOP-HAT")
-        print_stats("tophat", region_stats(tophat, label))
-        print("BOTTOM-HAT")
-        print_stats("bottomhat", region_stats(bottomhat, label))
+    ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
+    ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
+    ps.add_argument("--n", type=int, default=8, help="cases to score")
+    ps.add_argument("--viz", type=int, default=3, help="render panels for the first N cases")
+    ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
+    ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
+    ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
+    ps.add_argument("--out-dir", default="results/morph_explore/survey")
+    ps.set_defaults(func=cmd_survey)
+    return p
 
-    render(image, tophat, bottomhat, label, z,
-           args.out, show=not args.no_show)
+
+def main():
+    import sys
+    argv = sys.argv[1:]
+    # backward-compat: `morph_explore.py <path> ...` -> `explore <path> ...`
+    if argv and argv[0] not in ("explore", "survey", "-h", "--help"):
+        argv = ["explore"] + argv
+    args = build_parser().parse_args(argv)
+    args.func(args)
 
 
 if __name__ == "__main__":
