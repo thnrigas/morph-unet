@@ -3,6 +3,7 @@
 #
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -24,7 +25,7 @@ from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
 from evaluation.evaluator import aggregate_scores, Evaluator
 
-LABELS = {1: "Anterior", 2: "Posterior"}   # Task04 Hippocampus
+LABELS = config.LABELS   # {class_id: name}, read from the task's dataset.json
 
 #
 # fixed seed so runs share initialisation
@@ -63,10 +64,13 @@ def build_loaders(args):
             input_slice += (2,)
     label_slice = 3
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
-                  label_slice=label_slice, num_processes=args.num_workers)
-    train = NumpyDataSet(data_dir, keys=tr, **common)
-    val = NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common)
-    test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False, **common)
+                  label_slice=label_slice, num_processes=args.num_workers, fg_fraction=args.fg_fraction)
+    cap = dict(num_batches=args.iters_per_epoch) if args.iters_per_epoch > 0 else {}
+    train = NumpyDataSet(data_dir, keys=tr, **common, **cap)
+    val = NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common, **cap)
+    # test: full-slice inference one at a time, all slices (uncapped)
+    test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False,
+                        **{**common, "batch_size": 1})
     in_channels = len(input_slice)
     return train, val, test, in_channels
 
@@ -77,18 +81,20 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
     losses = []
+    amp = device.type == "cuda"   # bf16 autocast on the L4 tensor cores (no-op off CUDA)
     ctx = torch.enable_grad() if train_mode else torch.no_grad()
     with ctx:
         for batch in loader:
-            data = batch["data"][0].float().to(device)       # [b, c, H, W]
-            target = batch["seg"][0].long().to(device)       # [b, 1, H, W]
+            data = batch["data"][0].float().to(device, non_blocking=True)   # [b, c, H, W]
+            target = batch["seg"][0].long().to(device, non_blocking=True)   # [b, 1, H, W]
             if train_mode:
                 optimizer.zero_grad()
-            pred = model(data)
-            pred_softmax = F.softmax(pred, dim=1)
-            loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
-            if morph_loss is not None:
-                loss = loss + morph_loss(pred_softmax)
+            with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
+                pred = model(data)
+                pred_softmax = F.softmax(pred, dim=1)
+                loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
+                if morph_loss is not None:
+                    loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
                 optimizer.step()
@@ -113,7 +119,7 @@ def evaluate_test(model, loader, device, json_path):
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        json_task="Task04_Hippocampus", advanced=True,
+        json_task=config.TASK, advanced=True,
     )
     return scores
 
@@ -216,18 +222,24 @@ def main():
     p.add_argument("--morph-k", type=int, default=5)
     p.add_argument("--morph-beta", type=float, default=10.0)
     p.add_argument("--morph-loss", action="store_true")
-    p.add_argument("--epochs", type=int, default=150)
-    p.add_argument("--patience", type=int, default=12)
+    p.add_argument("--epochs", type=int, default=config.HP["epochs"])
+    p.add_argument("--patience", type=int, default=config.HP["patience"])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--patch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
+    p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
+    p.add_argument("--num-workers", type=int, default=6)
+    p.add_argument("--lr", type=float, default=config.HP["lr"])
+    p.add_argument("--iters-per-epoch", type=int, default=config.HP["iters_per_epoch"],
+                   help="cap batches per (train/val) epoch; 0 = full pass over all slices")
+    p.add_argument("--fg-fraction", type=float, default=config.HP["fg_fraction"],
+                   help="fraction of train crops centred on a foreground voxel")
     p.add_argument("--fold", type=int, default=0)
-    p.add_argument("--num-classes", type=int, default=3)
+    p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--test-only", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="continue from <tag>_f<fold>_last.pth if it exists (survives interruption / spot preemption)")
     args = p.parse_args()
 
     if args.fold_mean:
@@ -241,6 +253,11 @@ def main():
 
     set_seed(args.seed)
     device = pick_device()
+    if device.type == "cuda":
+        # let Ada use TF32 matmuls and autotune convs for the fixed patch size
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
     if args.morph_block:
@@ -263,8 +280,11 @@ def main():
         parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
         mode = "+".join(parts) if parts else "baseline"
     loss_desc = "dice+ce" + ("+morph" if args.morph_loss else "")
+    epoch_len = args.iters_per_epoch if args.iters_per_epoch > 0 else len(train_loader)
     print(f"[{stem}] device={device} mode={mode} loss={loss_desc} seed={args.seed} "
-          f"fold={args.fold} loader_in_ch={in_channels}")
+          f"fold={args.fold} loader_in_ch={in_channels} patch={args.patch_size} "
+          f"iters/epoch={epoch_len} max-epochs={args.epochs} (<= {epoch_len * args.epochs} updates) "
+          f"fg={args.fg_fraction}")
 
     dice_loss = SoftDiceLoss(batch_dice=True)
     ce_loss = torch.nn.CrossEntropyLoss()
@@ -277,9 +297,18 @@ def main():
     best_path = os.path.join(results_dir, f"{stem}_best.pth")
     last_path = os.path.join(results_dir, f"{stem}_last.pth")
     if not args.test_only:
-        best_val = float("inf")
-        since_improved = 0
-        for epoch in range(1, args.epochs + 1):
+        start_epoch, best_val, since_improved = 1, float("inf"), 0
+        # resume from the full-state last.pth (model + optim + scheduler + counters)
+        if args.resume and os.path.exists(last_path):
+            ck = torch.load(last_path, map_location=device)
+            if isinstance(ck, dict) and "model" in ck:
+                model.load_state_dict(ck["model"])
+                optimizer.load_state_dict(ck["optimizer"])
+                scheduler.load_state_dict(ck["scheduler"])
+                start_epoch, best_val, since_improved = ck["epoch"] + 1, ck["best_val"], ck["since_improved"]
+                print(f"resumed from epoch {ck['epoch']} (best_val={best_val:.4f}, "
+                      f"patience {since_improved}/{args.patience})")
+        for epoch in range(start_epoch, args.epochs + 1):
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
             vl = run_epoch(model, val_loader, device, dice_loss, ce_loss, None, morph_loss)
             scheduler.step(vl)
@@ -287,18 +316,24 @@ def main():
             if vl < best_val:
                 best_val = vl
                 since_improved = 0
-                torch.save(model.state_dict(), best_path)
+                torch.save(model.state_dict(), best_path)   # best: weights only (for eval)
             else:
                 since_improved += 1
                 patience_str = f"/{args.patience}" if args.patience else ""
                 print(f"  val loss did not improve from {best_val:.4f} (patience: {since_improved}{patience_str})")
-            torch.save(model.state_dict(), last_path)
+            # last: full state so training can resume after an interruption
+            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(), "epoch": epoch,
+                        "best_val": best_val, "since_improved": since_improved}, last_path)
             if args.patience and since_improved >= args.patience:
                 print(f"early stop: no val improvement for {args.patience} "
                       f"epochs (best val={best_val:.4f} @ ep {epoch - since_improved})")
                 break
     ckpt = best_path if os.path.exists(best_path) else last_path
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+    state = torch.load(ckpt, map_location=device)
+    if isinstance(state, dict) and "model" in state:   # last.pth is a full-state dict
+        state = state["model"]
+    model.load_state_dict(state)
     json_path = os.path.join(results_dir, f"{stem}_scores.json")
     scores = evaluate_test(model, test_loader, device, json_path)
     print(f"[{stem}] mean scores written to {json_path}")
