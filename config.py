@@ -19,9 +19,11 @@ def resolve_dir(env_var: str, candidates: list[Path], default: Path) -> Path:
 DATA_DIR = resolve_dir(
     env_var="DATA_DIR",
     candidates=[
-        PROJECT_ROOT / "data" / "Task04_Hippocampus",
+        # PROJECT_ROOT / "data" / "Task04_Hippocampus",
+        PROJECT_ROOT / "data" / "Task08_HepaticVessel",
     ],
-    default=PROJECT_ROOT / "data" / "Task04_Hippocampus",
+    # default=PROJECT_ROOT / "data" / "Task04_Hippocampus",
+    default=PROJECT_ROOT / "data" / "Task08_HepaticVessel",
 )
 
 # set manually

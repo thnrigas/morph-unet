@@ -58,15 +58,18 @@ def norm01(v):
 #
 # preprocessing (windowing / normalisation), modality-aware
 #
-def preprocess(vol, modality_str, channel=0, ct_center=40.0, ct_width=400.0,
+def preprocess(vol, modality_str, channel=0, n_mod=1, ct_center=40.0, ct_width=400.0,
                p_lo=0.5, p_hi=99.5):
     """Normalise to [0,1] matched to the modality.
 
     CT  : clip to a Hounsfield window so soft tissue keeps contrast (vs air/bone).
     MRI : robust percentile clip of the foreground, then min-max (intensity is relative).
     """
-    if vol.ndim == 4:                       # multi-modal: sequences on the last axis
-        vol = vol[..., channel]
+    if vol.ndim == 4:                       # multi-modal: sequences stacked on one axis
+        # the modality axis is the one whose length equals the modality count
+        # (medpy may place it first or last), leaving 3 spatial axes to match the label
+        cand = [ax for ax in range(4) if vol.shape[ax] == n_mod]
+        vol = np.take(vol, channel, axis=cand[-1] if cand else 3)
     v = vol.astype(np.float64)
     if modality_str.upper().startswith("CT"):
         lo, hi = ct_center - ct_width / 2.0, ct_center + ct_width / 2.0
@@ -105,8 +108,13 @@ def bottomhat(img, r):
 
 
 def band(img, r_lo, r_hi):
-    """granulometric band: bright structure with scale in (r_lo, r_hi]."""
+    """granulometric band (opening γ): bright structure with scale in (r_lo, r_hi]."""
     return np.clip(opening_of(img, r_lo) - opening_of(img, r_hi), 0, None)
+
+
+def band_dark(img, r_lo, r_hi):
+    """anti-granulometric band (closing φ): dark structure with scale in (r_lo, r_hi]."""
+    return np.clip(closing_of(img, r_hi) - closing_of(img, r_lo), 0, None)
 
 
 #
@@ -131,6 +139,25 @@ def take(a, sel):
         return a
     ax, idx = sel
     return np.take(a, idx, axis=ax)
+
+
+def align_axes(img, label):
+    """Reorder img axes to match the label (medpy permutes the spatial axes of some
+    4-D volumes). When several permutations match the shape — e.g. two equal-length
+    axes — disambiguate by choosing the one whose label foreground sits on image
+    tissue (highest mean intensity), since a wrong swap lands the label on background."""
+    from itertools import permutations
+    if img.shape == label.shape:
+        return img
+    fg = label > 0
+    best, best_score = img, -1.0
+    for perm in permutations(range(img.ndim)):
+        if tuple(img.shape[p] for p in perm) == label.shape:
+            cand = img.transpose(perm)
+            score = float(cand[fg].mean()) if fg.any() else 0.0
+            if score > best_score:
+                best, best_score = cand, score
+    return best
 
 
 #
@@ -181,9 +208,9 @@ def render_single(image, th, bh, label, out, show):
     plt.close(fig)
 
 
-def render_grid(img2d, label2d, radii, bands, out):
+def render_grid(img2d, label2d, radii, bands, out, dark_bands=()):
     import matplotlib.pyplot as plt
-    ncol = max(len(radii) + 1, len(bands) + 1)
+    ncol = max(len(radii) + 1, len(bands) + len(dark_bands) + 1)
     fig, ax = plt.subplots(3, ncol, figsize=(3.0 * ncol, 9.2))
     for a in ax.ravel():
         a.axis("off")
@@ -198,9 +225,12 @@ def render_grid(img2d, label2d, radii, bands, out):
     for j, r in enumerate(radii, start=1):
         ax[0, j].imshow(tophat(img2d, r), cmap="magma"); ax[0, j].set_title(f"top-hat r={r}"); contour(ax[0, j])
         ax[1, j].imshow(bottomhat(img2d, r), cmap="magma"); ax[1, j].set_title(f"bottom-hat r={r}"); contour(ax[1, j])
-    for j, (lo, hi) in enumerate(bands, start=1):
+    # row 2: bright bands (opening γ) then dark bands (closing φ)
+    row2 = [(f"γ{lo}-γ{hi}", band(img2d, lo, hi)) for lo, hi in bands] \
+        + [(f"φ{lo}-φ{hi}", band_dark(img2d, lo, hi)) for lo, hi in dark_bands]
+    for j, (name, m) in enumerate(row2, start=1):
         if j < ncol:
-            ax[2, j].imshow(band(img2d, lo, hi), cmap="magma"); ax[2, j].set_title(f"band γ{lo}-γ{hi}"); contour(ax[2, j])
+            ax[2, j].imshow(m, cmap="magma"); ax[2, j].set_title(name); contour(ax[2, j])
     fig.tight_layout()
     fig.savefig(out, dpi=110, bbox_inches="tight")
     plt.close(fig)
@@ -267,21 +297,24 @@ def cmd_survey(args):
                         f"{s['pct_on_target']:8.1f} {s['target_area_pct']:7.2f} {s['concentration']:6.2f}")
 
     for i, fn in enumerate(cases):
-        img = preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel)
+        img = preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality))
         lbl = load_any(os.path.join(lbl_dir, fn))
         if lbl.ndim == 4:
             lbl = lbl[..., 0]
+        img = align_axes(img, lbl)           # fix medpy 4-D axis permutation
         sel = pick_slice(lbl)
         img2d, lbl2d = take(img, sel), take(lbl, sel)
         if i < args.viz:
             render_grid(img2d, lbl2d, args.radii, bands,
-                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"))
+                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"),
+                        dark_bands=bands)
         stem = fn.replace(".nii.gz", "")
         for r in args.radii:
             note(stem, f"tophat r={r}", tophat(img2d, r), lbl2d)
             note(stem, f"bottomhat r={r}", bottomhat(img2d, r), lbl2d)
         for lo, hi in bands:
-            note(stem, f"band {lo}-{hi}", band(img2d, lo, hi), lbl2d)
+            note(stem, f"gband {lo}-{hi}", band(img2d, lo, hi), lbl2d)
+            note(stem, f"fband {lo}-{hi}", band_dark(img2d, lo, hi), lbl2d)
         per_case.append("")
 
     summ = sorted(((np.mean([v[0] for v in vals]), np.std([v[0] for v in vals]),
@@ -324,7 +357,7 @@ def build_parser():
     ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
     ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
-    ps.add_argument("--out-dir", default="results/morph_explore/survey")
+    ps.add_argument("--out-dir", default="results/explore")
     ps.set_defaults(func=cmd_survey)
     return p
 

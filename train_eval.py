@@ -24,7 +24,8 @@ from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
 from evaluation.evaluator import aggregate_scores, Evaluator
 
-LABELS = {1: "Anterior", 2: "Posterior"}   # Task04 Hippocampus
+# LABELS = {1: "Anterior", 2: "Posterior"}   # Task04 Hippocampus
+LABELS = {1: "Vessel", 2: "Tumour"}   # Task08 HepaticVessel
 
 #
 # fixed seed so runs share initialisation
@@ -113,7 +114,8 @@ def evaluate_test(model, loader, device, json_path):
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        json_task="Task04_Hippocampus", advanced=True,
+        # json_task="Task04_Hippocampus", advanced=True,
+        json_task="Task08_HepaticVessel", advanced=True,
     )
     return scores
 
