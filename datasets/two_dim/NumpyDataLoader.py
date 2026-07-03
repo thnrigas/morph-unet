@@ -161,9 +161,11 @@ class NumpyDataLoader(SlimDataLoaderBase):
         for slice in open_array:
             fn_name = self.files[slice[0]]
 
-            numpy_array = np.load(fn_name)
+            # memory-map: read only this slice's bytes from disk, not the whole volume
+            # (huge win for large CT npy; the crop/pad below copies out, so no mmap lifetime issue)
+            numpy_array = np.load(fn_name, mmap_mode="r")
 
-            numpy_slice = numpy_array[:, slice[1], ]
+            numpy_slice = np.asarray(numpy_array[:, slice[1], ])   # materialise the one slice
             img = numpy_slice[list(self.input_slice)]                                     # (C_in, H, W)
             seg = numpy_slice[list(self.label_slice)] if self.label_slice is not None else None
 

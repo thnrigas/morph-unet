@@ -33,8 +33,3 @@ done
 
 # compare
 python3 train_eval.py --compare baseline_mean_scores.json tophat_mean_scores.json morphblock_mean_scores.json morphloss_mean_scores.json
-
-# baseline
-for f in 0 1 2 3 4; do
-    python3 train_eval.py --tag hepatic_base --fold $f
-done
