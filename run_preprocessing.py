@@ -20,6 +20,6 @@ from datasets.preprocessing import preprocess_data
 from datasets.create_splits import create_splits
 
 if __name__ == "__main__":
-    preprocess_data(root_dir=str(config.DATA_DIR))
+    preprocess_data(root_dir=str(config.DATA_DIR), modality=config.MODALITY, channel=config.CHANNEL)
     create_splits(output_dir=str(config.DATA_DIR), image_dir=str(config.PREPROCESSED_DIR))
     print("Preprocessing done.")

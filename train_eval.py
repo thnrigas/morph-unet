@@ -3,6 +3,7 @@
 #
 
 import argparse
+import contextlib
 import glob
 import json
 import os
@@ -24,8 +25,7 @@ from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
 from evaluation.evaluator import aggregate_scores, Evaluator
 
-# LABELS = {1: "Anterior", 2: "Posterior"}   # Task04 Hippocampus
-LABELS = {1: "Vessel", 2: "Tumour"}   # Task08 HepaticVessel
+LABELS = config.LABELS   # {class_id: name}, read from the task's dataset.json
 
 #
 # fixed seed so runs share initialisation
@@ -78,18 +78,20 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
     losses = []
+    amp = device.type == "cuda"   # bf16 autocast on the L4 tensor cores (no-op off CUDA)
     ctx = torch.enable_grad() if train_mode else torch.no_grad()
     with ctx:
         for batch in loader:
-            data = batch["data"][0].float().to(device)       # [b, c, H, W]
-            target = batch["seg"][0].long().to(device)       # [b, 1, H, W]
+            data = batch["data"][0].float().to(device, non_blocking=True)   # [b, c, H, W]
+            target = batch["seg"][0].long().to(device, non_blocking=True)   # [b, 1, H, W]
             if train_mode:
                 optimizer.zero_grad()
-            pred = model(data)
-            pred_softmax = F.softmax(pred, dim=1)
-            loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
-            if morph_loss is not None:
-                loss = loss + morph_loss(pred_softmax)
+            with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
+                pred = model(data)
+                pred_softmax = F.softmax(pred, dim=1)
+                loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
+                if morph_loss is not None:
+                    loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
                 optimizer.step()
@@ -114,8 +116,7 @@ def evaluate_test(model, loader, device, json_path):
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        # json_task="Task04_Hippocampus", advanced=True,
-        json_task="Task08_HepaticVessel", advanced=True,
+        json_task=config.TASK, advanced=True,
     )
     return scores
 
@@ -223,10 +224,10 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--fold", type=int, default=0)
-    p.add_argument("--num-classes", type=int, default=3)
+    p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--test-only", action="store_true")
@@ -243,6 +244,11 @@ def main():
 
     set_seed(args.seed)
     device = pick_device()
+    if device.type == "cuda":
+        # let Ada use TF32 matmuls and autotune convs for the fixed patch size
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
     if args.morph_block:
