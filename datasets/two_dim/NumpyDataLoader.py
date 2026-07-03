@@ -54,10 +54,10 @@ class NumpyDataSet(object):
     TODO
     """
     def __init__(self, base_dir, mode="train", batch_size=16, num_batches=10000000, num_processes=8, num_cached_per_queue=8 * 4, target_size=128,
-                 file_pattern='*.npy', label_slice=1, input_slice=(0,), do_reshuffle=True, keys=None):
+                 file_pattern='*.npy', label_slice=1, input_slice=(0,), do_reshuffle=True, keys=None, fg_fraction=0.33):
 
         data_loader = NumpyDataLoader(base_dir=base_dir, mode=mode, batch_size=batch_size, num_batches=num_batches, file_pattern=file_pattern,
-                                      input_slice=input_slice, label_slice=label_slice, keys=keys)
+                                      input_slice=input_slice, label_slice=label_slice, keys=keys, target_size=target_size, fg_fraction=fg_fraction)
 
         self.data_loader = data_loader
         self.batch_size = batch_size
@@ -85,12 +85,17 @@ class NumpyDataSet(object):
 
 class NumpyDataLoader(SlimDataLoaderBase):
     def __init__(self, base_dir, mode="train", batch_size=16, num_batches=10000000,
-                 file_pattern='*.npy', label_slice=1, input_slice=(0,), keys=None):
+                 file_pattern='*.npy', label_slice=1, input_slice=(0,), keys=None,
+                 target_size=64, fg_fraction=0.33, pad_factor=16):
 
         self.files, self.file_len, self.slices = load_dataset(base_dir=base_dir, pattern=file_pattern, slice_offset=0, keys=keys, )
         super(NumpyDataLoader, self).__init__(self.slices, batch_size, num_batches)
 
         self.batch_size = batch_size
+        self.mode = mode
+        self.target_size = target_size      # patch size for train/val crops
+        self.fg_fraction = fg_fraction      # fraction of train crops centred on foreground
+        self.pad_factor = pad_factor        # test full-slice pad multiple (U-Net pool factor)
 
         self.use_next = False
         if mode == "train":
@@ -159,11 +164,16 @@ class NumpyDataLoader(SlimDataLoaderBase):
             numpy_array = np.load(fn_name)
 
             numpy_slice = numpy_array[:, slice[1], ]
-            data.append(numpy_slice[list(self.input_slice)])   # 'None' keeps the dimension
+            img = numpy_slice[list(self.input_slice)]                                     # (C_in, H, W)
+            seg = numpy_slice[list(self.label_slice)] if self.label_slice is not None else None
 
-            if self.label_slice is not None:
-                labels.append(numpy_slice[list(self.label_slice)])   # 'None' keeps the dimension
+            # native-resolution patch (train/val) or full padded slice (test);
+            # all samples come out a fixed size, so batches are homogeneous by construction
+            img, seg = self._sample(img, seg)
 
+            data.append(img)
+            if seg is not None:
+                labels.append(seg)
             fnames.append(self.files[slice[0]])
             slice_idxs.append(slice[1])
 
@@ -172,3 +182,45 @@ class NumpyDataLoader(SlimDataLoaderBase):
             ret_dict['seg'] = np.asarray(labels)
 
         return ret_dict
+
+    def _pad_to(self, img, seg, ph, pw):
+        """Pad (C,H,W) up to at least (ph, pw), centred; image with its min, label with 0."""
+        _, h, w = img.shape
+        dh, dw = max(ph - h, 0), max(pw - w, 0)
+        if dh or dw:
+            t, l = dh // 2, dw // 2
+            width = ((0, 0), (t, dh - t), (l, dw - l))
+            img = np.pad(img, width, mode="constant", constant_values=img.min())
+            if seg is not None:
+                seg = np.pad(seg, width, mode="constant", constant_values=0)
+        return img, seg
+
+    def _sample(self, img, seg):
+        ps = self.target_size
+        if self.mode == "test":
+            # full slice at native resolution, padded up to a multiple of the U-Net factor
+            f = self.pad_factor
+            _, h, w = img.shape
+            return self._pad_to(img, seg, ((h + f - 1) // f) * f, ((w + f - 1) // f) * f)
+        # train / val: guarantee at least a patch, then crop ps x ps at native resolution
+        img, seg = self._pad_to(img, seg, ps, ps)
+        _, h, w = img.shape
+        if self.mode == "train":
+            top, left = self._crop_origin(seg, h, w, ps)
+        else:                                         # val: deterministic centre crop
+            top, left = (h - ps) // 2, (w - ps) // 2
+        img = img[:, top:top + ps, left:left + ps]
+        if seg is not None:
+            seg = seg[:, top:top + ps, left:left + ps]
+        return img, seg
+
+    def _crop_origin(self, seg, h, w, ps):
+        """Top-left of a ps x ps crop: foreground-centred for a fraction of samples, else random."""
+        if seg is not None and self.fg_fraction > 0 and random.random() < self.fg_fraction:
+            fg = np.argwhere(seg[0] > 0)
+            if len(fg):
+                cy, cx = fg[random.randint(0, len(fg) - 1)]
+                return int(np.clip(cy - ps // 2, 0, h - ps)), int(np.clip(cx - ps // 2, 0, w - ps))
+        top = random.randint(0, h - ps) if h > ps else 0
+        left = random.randint(0, w - ps) if w > ps else 0
+        return top, left
