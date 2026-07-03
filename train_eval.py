@@ -103,7 +103,10 @@ def build_loaders(args):
                   label_slice=label_slice, num_processes=args.num_workers, fg_fraction=args.fg_fraction)
     cap = dict(num_batches=args.iters_per_epoch) if args.iters_per_epoch > 0 else {}
     train = None if args.test_only else NumpyDataSet(data_dir, keys=tr, **common, **cap)
-    val = None if args.test_only else NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common, **cap)
+    # val: full-slice like test (batch 1, all slices) so model selection uses foreground Dice on the
+    # real distribution, not a background-dominated centre patch. Uncapped: every val slice each pass.
+    val = None if args.test_only else NumpyDataSet(data_dir, keys=vl, mode="test", do_reshuffle=False,
+                                                   **{**common, "batch_size": 1})
     # test: full-slice inference one at a time, all slices (uncapped)
     test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False,
                         **{**common, "batch_size": 1})
@@ -136,6 +139,34 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
+
+#
+# full-slice validation -> global foreground Dice (TP/FP/FN accumulated over the whole val set,
+# like nnU-Net's pseudo-Dice). Matches the test distribution and the reported metric, so it is a
+# faithful, low-variance model-selection signal -- unlike a background-dominated patch loss.
+#
+def run_val_dice(model, loader, device, num_classes):
+    model.eval()
+    n_fg = max(num_classes - 1, 1)
+    tp = torch.zeros(n_fg); fp = torch.zeros(n_fg); fn = torch.zeros(n_fg)
+    amp = device.type == "cuda"
+    with torch.no_grad():
+        for batch in loader:
+            data = batch["data"][0].float().to(device, non_blocking=True)   # [b, c, H, W]
+            target = batch["seg"][0].long().to(device)                      # [b, 1, H, W]
+            with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
+                pred = model(data)
+            pred_lab = pred.argmax(1)                                        # [b, H, W]
+            tgt = target[:, 0]
+            for c in range(1, num_classes):
+                p, t, i = (pred_lab == c), (tgt == c), c - 1
+                tp[i] += (p & t).sum().item()
+                fp[i] += (p & ~t).sum().item()
+                fn[i] += (~p & t).sum().item()
+    dice = (2 * tp) / (2 * tp + fp + fn + 1e-8)         # per-class global Dice
+    present = (tp + fn) > 0                              # classes actually present in the val set
+    mean = dice[present].mean().item() if present.any() else 0.0
+    return mean, dice.tolist()
 
 #
 # test
@@ -272,7 +303,10 @@ def main():
                    help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
-    p.add_argument("--patience", type=int, default=config.HP["patience"])
+    p.add_argument("--patience", type=int, default=config.HP["patience"],
+                   help="early stop after this many validations with no fg-Dice gain")
+    p.add_argument("--val-every", type=int, default=1,
+                   help="run full-slice foreground-Dice validation every K epochs (raise to speed up)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
@@ -359,7 +393,9 @@ def main():
           f"iters/epoch={epoch_len} max-epochs={args.epochs} (<= {epoch_len * args.epochs} updates) "
           f"fg={args.fg_fraction}")
 
-    dice_loss = SoftDiceLoss(batch_dice=True)
+    # foreground-only Dice (drop background channel): background is >99% of pixels and its Dice is
+    # ~constant, so including it dilutes the gradient on the sparse target. CE still sees all classes.
+    dice_loss = SoftDiceLoss(batch_dice=True, do_bg=False)
     ce_loss = torch.nn.CrossEntropyLoss()
     morph_loss = MorphConsistencyLoss().to(device) if args.morph_loss else None
     # give the morphological SE weights their own (higher) lr — few, geometrically
@@ -382,7 +418,8 @@ def main():
     best_path = os.path.join(results_dir, f"{stem}_best.pth")
     last_path = os.path.join(results_dir, f"{stem}_last.pth")
     if not args.test_only:
-        start_epoch, best_val, since_improved = 1, float("inf"), 0
+        # selection metric is foreground Dice now (higher is better); best_dice tracks the best so far
+        start_epoch, best_dice, best_epoch, since_improved = 1, -1.0, 0, 0
         # resume from the full-state last.pth (model + optim + scheduler + counters)
         if args.resume and os.path.exists(last_path):
             ck = torch.load(last_path, map_location=device)
@@ -390,15 +427,21 @@ def main():
                 model.load_state_dict(ck["model"])
                 optimizer.load_state_dict(ck["optimizer"])
                 scheduler.load_state_dict(ck["scheduler"])
-                start_epoch, best_val, since_improved = ck["epoch"] + 1, ck["best_val"], ck["since_improved"]
-                print(f"resumed from epoch {ck['epoch']} (best_val={best_val:.4f}, "
+                start_epoch = ck["epoch"] + 1
+                best_dice, best_epoch, since_improved = ck["best_val"], ck.get("best_epoch", 0), ck["since_improved"]
+                print(f"resumed from epoch {ck['epoch']} (best fg-Dice={best_dice:.4f} @ ep {best_epoch}, "
                       f"patience {since_improved}/{args.patience})")
         se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
         for epoch in range(start_epoch, args.epochs + 1):
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
-            vl = run_epoch(model, val_loader, device, dice_loss, ce_loss, None, morph_loss)
-            scheduler.step(vl)
-            print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val={vl:.4f}")
+            do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
+            if do_val:
+                vd, per_class = run_val_dice(model, val_loader, device, args.num_classes)
+                scheduler.step(-vd)    # scheduler minimises; we maximise Dice, so feed -Dice
+                print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val_fgDice={vd:.4f}  "
+                      f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]")
+            else:
+                print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  (val every {args.val_every})")
             if se_named:   # is the SE actually learning? |Δ| per block this epoch + |SE| magnitude
                 deltas, norms = [], []
                 for n, p in se_named:
@@ -407,21 +450,22 @@ def main():
                     se_prev[n] = p.detach().clone()
                 print("  SE |Δ|: " + " ".join(f"{d:.3f}" for d in deltas)
                       + "   |SE|: " + " ".join(f"{v:.3f}" for v in norms))
-            if vl < best_val:
-                best_val = vl
-                since_improved = 0
-                torch.save(model.state_dict(), best_path)   # best: weights only (for eval)
-            else:
-                since_improved += 1
-                patience_str = f"/{args.patience}" if args.patience else ""
-                print(f"  val loss did not improve from {best_val:.4f} (patience: {since_improved}{patience_str})")
+            if do_val:
+                if vd > best_dice:
+                    best_dice, best_epoch, since_improved = vd, epoch, 0
+                    torch.save(model.state_dict(), best_path)   # best: weights only (for eval)
+                else:
+                    since_improved += 1
+                    patience_str = f"/{args.patience}" if args.patience else ""
+                    print(f"  val fg-Dice did not improve from {best_dice:.4f} @ ep {best_epoch} "
+                          f"(patience: {since_improved}{patience_str})")
             # last: full state so training can resume after an interruption
             torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(), "epoch": epoch,
-                        "best_val": best_val, "since_improved": since_improved}, last_path)
-            if args.patience and since_improved >= args.patience:
-                print(f"early stop: no val improvement for {args.patience} "
-                      f"epochs (best val={best_val:.4f} @ ep {epoch - since_improved})")
+                        "scheduler": scheduler.state_dict(), "epoch": epoch, "best_val": best_dice,
+                        "best_epoch": best_epoch, "since_improved": since_improved}, last_path)
+            if do_val and args.patience and since_improved >= args.patience:
+                print(f"early stop: no val fg-Dice improvement for {args.patience} validations "
+                      f"(best fg-Dice={best_dice:.4f} @ ep {best_epoch})")
                 break
     ckpt = best_path if os.path.exists(best_path) else last_path
     state = torch.load(ckpt, map_location=device)

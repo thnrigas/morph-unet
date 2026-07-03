@@ -209,7 +209,7 @@ class NumpyDataLoader(SlimDataLoaderBase):
         _, h, w = img.shape
         if self.mode == "train":
             top, left = self._crop_origin(seg, h, w, ps)
-        else:                                         # val: deterministic centre crop
+        else:                                         # non-test patch mode: deterministic centre crop
             top, left = (h - ps) // 2, (w - ps) // 2
         img = img[:, top:top + ps, left:left + ps]
         if seg is not None:
