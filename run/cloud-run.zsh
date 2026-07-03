@@ -18,6 +18,11 @@ for f in 0 1 2 3 4; do
     python3 train_eval.py --tag hepatic_base --fold $f
 done
 
+gcloud auth login
+gcloud projects list
+gcloud config set project project-id
+gcloud compute ssh athnrigas@deeplearning-4-vm --zone=zone
+
 # download files from VM
 gcloud compute scp athnrigas@deeplearning-4-vm:~/repo/filename ./
 gcloud compute scp --recurse athnrigas@deeplearning-4-vm:~/repo/foldername ./

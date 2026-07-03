@@ -16,16 +16,34 @@ import torch.nn.functional as F
 #
 class SoftMorph2D(nn.Module):
 
-    def __init__(self, k=5, beta=10.0, mode="tophat"):
+    def __init__(self, k=5, beta=10.0, mode="tophat", init_radius=None, init_inside=0.5, init_outside=0.0):
         super().__init__()
         assert k % 2 == 1, "kernel size k must be odd"
-        assert mode in ("tophat", "bottomhat"), "mode must be 'tophat' or 'bottomhat'"
+        assert mode in ("tophat", "bottomhat", "gradient"), "mode must be tophat/bottomhat/gradient"
         self.k = k
         self.pad = k // 2
         self.mode = mode
-        # one weight per offset in the k x k window, zero init -> flat SE
-        self.se = nn.Parameter(torch.zeros(1, 1, k * k, 1, 1))
+        # SE = one weight per offset in the k x k window.
+        #   init_radius=None -> flat SE (zeros);
+        #   init_radius=r    -> `init_inside` in a radius-r disk, `init_outside` elsewhere.
+        # the block starts as a radius-r disk in a larger window; only the inside-outside gap
+        # matters (top-hat is shift-invariant), and a ~0.5 gap keeps the outside able to grow.
+        se0 = (torch.zeros(k * k) if init_radius is None
+               else self._disk_se(k, init_radius, init_inside, init_outside))
+        self.se = nn.Parameter(se0.view(1, 1, k * k, 1, 1))
         self.register_buffer("beta", torch.tensor(float(beta)))
+
+    @staticmethod
+    def _disk_se(k, radius, inside=0.5, outside=0.0):
+        """(k*k,) SE: `inside` in a centred radius-`radius` disk, `outside` elsewhere."""
+        r = k // 2
+        radius = min(radius, r)                       # disk must fit the window
+        offs = torch.arange(k) - r
+        dr, dc = torch.meshgrid(offs, offs, indexing="ij")
+        disk = (dr ** 2 + dc ** 2) <= radius ** 2
+        se = torch.full((k, k), float(outside))
+        se[disk] = float(inside)
+        return se.reshape(-1)
 
     def _neigh(self, x):
         # x: (B,1,H,W) -> (B,1,k*k,H,W) (local neighbourhoods)
@@ -48,6 +66,9 @@ class SoftMorph2D(nn.Module):
             # top-hat : x - opening(x), opening = dilation(erosion(x))
             opened = self.soft_dilation(self.soft_erosion(x))
             return torch.clamp(x - opened, min=0.0)
+        if self.mode == "gradient":
+            # morphological gradient : dilation(x) - erosion(x) (boundary-selective, >= 0)
+            return torch.clamp(self.soft_dilation(x) - self.soft_erosion(x), min=0.0)
         # bottom-hat : closing(x) - x, closing = erosion(dilation(x))
         closed = self.soft_erosion(self.soft_dilation(x))
         return torch.clamp(closed - x, min=0.0)
@@ -78,3 +99,45 @@ class MorphResidualUNet(nn.Module):
         if self.bottomhat is not None:
             chans.append(self.bottomhat(x))
         return self.unet(torch.cat(chans, dim=1))
+
+
+#
+# Morphological Bank U-Net
+# prepends a bank of trainable-SE residual channels, seeded from survey-picked
+# (polarity, radius) specs, then feeds image + bank to the U-Net.
+# every block shares a fixed k_max window; each SE is disk-initialised at its survey
+# radius (0 inside / init_outside elsewhere), so blocks start diverse and can still grow.
+# specs: list of (mode, radius), e.g. [("tophat", 3), ("bottomhat", 1)]
+#
+class MorphBankUNet(nn.Module):
+
+    def __init__(self, base_unet, specs, k_max=11, beta=10.0, init_inside=0.5, init_outside=0.0):
+        super().__init__()
+        assert specs, "need at least one (mode, radius) spec"
+        self.blocks = nn.ModuleList([
+            SoftMorph2D(k=k_max, beta=beta, mode=mode, init_radius=r,
+                        init_inside=init_inside, init_outside=init_outside)
+            for mode, r in specs])
+        self.unet = base_unet
+
+    def forward(self, x):
+        chans = [x] + [blk(x) for blk in self.blocks]
+        return self.unet(torch.cat(chans, dim=1))
+
+
+#
+# Matched control: a learned conv front-end producing the SAME number of extra
+# channels at matched parameter count (conv k*k weights ~ SE k*k weights), so a
+# comparison isolates morphology's rank/shape selectivity from "extra channels".
+#
+class ConvBankUNet(nn.Module):
+
+    def __init__(self, base_unet, n_extra, k=5):
+        super().__init__()
+        self.front = nn.Conv2d(1, n_extra, kernel_size=k, padding=k // 2)
+        self.act = nn.ReLU(inplace=True)
+        self.unet = base_unet
+
+    def forward(self, x):
+        extra = self.act(self.front(x))
+        return self.unet(torch.cat([x, extra], dim=1))

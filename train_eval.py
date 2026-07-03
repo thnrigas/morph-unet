@@ -9,6 +9,8 @@ import json
 import os
 import pickle
 import random
+import subprocess
+import sys
 from collections import defaultdict
 
 import numpy as np
@@ -19,7 +21,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import config
 from networks.UNET import UNet
-from networks.morph_block import MorphResidualUNet
+from networks.morph_block import MorphResidualUNet, MorphBankUNet, ConvBankUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
@@ -46,6 +48,47 @@ def pick_device():
     return torch.device("cpu")
 
 #
+# parse a morph-bank spec "tophat:3,bottomhat:1,..." -> [(mode, k), ...]
+# the integer is a disk RADIUS (survey vocabulary); SE window is k = 2r+1 (odd)
+#
+def parse_bank(spec):
+    # "tophat:3,bottomhat:1" -> [(mode, radius), ...]. radius = disk-init radius; the SE
+    # window is a shared k_max, so blocks share support but start at their own survey scale.
+    out = []
+    for tok in spec.split(","):
+        mode, r = tok.split(":")
+        out.append((mode.strip(), int(r)))
+    return out
+
+
+def _read_bank_spec(task, fold, root="results/explore"):
+    # the survey (morph_explore.py) writes results/explore/<task>_bank.json as {fold: "mode:r,..."}
+    # from that fold's TRAINING data only (no test leakage). Return the fold's spec, or None.
+    path = os.path.join(root, f"{task}_bank.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        bank = json.load(f)
+    return bank.get(str(fold))
+
+
+def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/explore"):
+    # resolve --morph-bank auto: reuse the cached fold spec if present, else run the survey once
+    # (which writes the cache) so `train_eval.py --morph-bank auto` is a single self-contained step.
+    spec = _read_bank_spec(task, fold, root)
+    if spec is None:
+        print(f"[morph-bank auto] no cached spec for {task} fold {fold}; running survey ...", flush=True)
+        subprocess.run([sys.executable, os.path.join("utilities", "morph_explore.py"), "survey",
+                        str(dataset_dir), "--fold", str(fold), "--top-k", str(top_k),
+                        "--workers", str(workers), "--out-dir", root], check=True)
+        spec = _read_bank_spec(task, fold, root)
+        if spec is None:
+            raise RuntimeError(f"survey produced no spec for fold {fold} (empty ranking?)")
+    print(f"[morph-bank auto] {task} fold {fold} -> \"{spec}\"", flush=True)
+    return spec
+
+
+#
 # build loaders
 #
 def build_loaders(args):
@@ -53,21 +96,14 @@ def build_loaders(args):
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
     data_dir = str(config.PREPROCESSED_DIR)
-    # npy is 4-channel (image, tophat, bottomhat, label)
-    if args.morph_block:
-        input_slice = (0,)
-    else:
-        input_slice = (0,)
-        if args.tophat:
-            input_slice += (1,)
-        if args.bottomhat:
-            input_slice += (2,)
-    label_slice = 3
+    # npy is 2-channel float16 (image, label); every variant computes its residuals on the fly
+    input_slice = (0,)
+    label_slice = 1
     common = dict(target_size=args.patch_size, batch_size=args.batch_size, input_slice=input_slice,
                   label_slice=label_slice, num_processes=args.num_workers, fg_fraction=args.fg_fraction)
     cap = dict(num_batches=args.iters_per_epoch) if args.iters_per_epoch > 0 else {}
-    train = NumpyDataSet(data_dir, keys=tr, **common, **cap)
-    val = NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common, **cap)
+    train = None if args.test_only else NumpyDataSet(data_dir, keys=tr, **common, **cap)
+    val = None if args.test_only else NumpyDataSet(data_dir, keys=vl, mode="val",  do_reshuffle=False, **common, **cap)
     # test: full-slice inference one at a time, all slices (uncapped)
     test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False,
                         **{**common, "batch_size": 1})
@@ -219,20 +255,35 @@ def main():
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
+    p.add_argument("--morph-bank", metavar="SPEC",
+                   help='trainable morph bank, e.g. "tophat:3,tophat:5,bottomhat:1,gradient:2" (radii); '
+                        'use "auto" to load this task/fold spec from the survey\'s results/explore/<TASK>_bank.json')
+    p.add_argument("--conv-control", action="store_true",
+                   help="matched conv front-end (same #channels) instead of the morph bank")
+    p.add_argument("--survey-top-k", type=int, default=5,
+                   help="--morph-bank auto: how many (mode,radius) the survey selects if it must run")
+    p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 8),
+                   help="--morph-bank auto: parallel workers for the survey if it must run")
     p.add_argument("--morph-k", type=int, default=5)
+    p.add_argument("--morph-k-max", type=int, default=11,
+                   help="shared SE window for the morph bank; disk-init radii sit inside it (room to grow)")
     p.add_argument("--morph-beta", type=float, default=10.0)
+    p.add_argument("--freeze-se", action="store_true",
+                   help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
     p.add_argument("--patience", type=int, default=config.HP["patience"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
-    p.add_argument("--num-workers", type=int, default=6)
+    p.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 6))
     p.add_argument("--lr", type=float, default=config.HP["lr"])
     p.add_argument("--iters-per-epoch", type=int, default=config.HP["iters_per_epoch"],
                    help="cap batches per (train/val) epoch; 0 = full pass over all slices")
     p.add_argument("--fg-fraction", type=float, default=config.HP["fg_fraction"],
                    help="fraction of train crops centred on a foreground voxel")
+    p.add_argument("--se-lr-mult", type=float, default=10.0,
+                   help="lr multiplier for the morphological SE weights (own param group)")
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--fold-mean", metavar="TAG")
@@ -260,20 +311,42 @@ def main():
         torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
-    if args.morph_block:
-        # under --morph-block the --tophat/--bottomhat flags select the
-        # learnable residuals, default to top-hat if neither is given
-        use_th = args.tophat or not args.bottomhat
+    if args.morph_bank:
+        # bank of trainable-SE residual channels (or a matched conv control)
+        if args.morph_bank == "auto":
+            args.morph_bank = ensure_bank_spec(config.TASK, args.fold, config.DATA_DIR,
+                                               args.survey_top_k, args.survey_workers)
+        specs = parse_bank(args.morph_bank)
+        n_extra = len(specs)
+        base = UNet(num_classes=args.num_classes, in_channels=1 + n_extra)
+        if args.conv_control:
+            model = ConvBankUNet(base, n_extra=n_extra, k=args.morph_k_max).to(device)
+        else:
+            model = MorphBankUNet(base, specs, k_max=args.morph_k_max, beta=args.morph_beta).to(device)
+    elif args.morph_block or args.tophat or args.bottomhat:
+        # trainable (--morph-block, learnable SE) or static (--tophat/--bottomhat, frozen SE)
+        # residuals, both computed on the fly. under --morph-block default to top-hat.
+        use_th = args.tophat or (args.morph_block and not args.bottomhat)
         use_bh = args.bottomhat
         base = UNet(num_classes=args.num_classes, in_channels=1 + use_th + use_bh)
         model = MorphResidualUNet(base, k=args.morph_k, beta=args.morph_beta,
                                   use_tophat=use_th, use_bottomhat=use_bh).to(device)
+        if not args.morph_block:            # static residual -> fixed (frozen) SE
+            args.freeze_se = True
     else:
         model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
 
+    if args.freeze_se:                      # static: SE is a fixed structuring element
+        for n, p in model.named_parameters():
+            if n.endswith(".se"):
+                p.requires_grad_(False)
+
     # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
-    if args.morph_block:
+    if args.morph_bank:
+        kind = "conv-control" if args.conv_control else "morph-bank"
+        mode = f"{kind}([{args.morph_bank}],beta={args.morph_beta})"
+    elif args.morph_block:
         res = "+".join((["tophat"] if use_th else []) + (["bottomhat"] if use_bh else []))
         mode = f"morph-block({res},k={args.morph_k},beta={args.morph_beta})"
     else:
@@ -289,7 +362,19 @@ def main():
     dice_loss = SoftDiceLoss(batch_dice=True)
     ce_loss = torch.nn.CrossEntropyLoss()
     morph_loss = MorphConsistencyLoss().to(device) if args.morph_loss else None
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # give the morphological SE weights their own (higher) lr — few, geometrically
+    # important params with sparse gradients, so a larger step helps them actually move.
+    # frozen SEs (static residual) are requires_grad=False -> excluded from the optimiser.
+    se_named = [(n, p) for n, p in model.named_parameters() if n.endswith(".se") and p.requires_grad]
+    if se_named:
+        se_ids = {id(p) for _, p in se_named}
+        other = [p for p in model.parameters() if p.requires_grad and id(p) not in se_ids]
+        optimizer = optim.Adam([{"params": other, "lr": args.lr},
+                                {"params": [p for _, p in se_named], "lr": args.lr * args.se_lr_mult}])
+        print(f"  SE param group: {len(se_named)} block(s) @ lr={args.lr * args.se_lr_mult:g} "
+              f"(x{args.se_lr_mult:g}); rest @ lr={args.lr:g}")
+    else:
+        optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=6)
 
     results_dir = os.path.join(config.PROJECT_ROOT, "results")
@@ -308,11 +393,20 @@ def main():
                 start_epoch, best_val, since_improved = ck["epoch"] + 1, ck["best_val"], ck["since_improved"]
                 print(f"resumed from epoch {ck['epoch']} (best_val={best_val:.4f}, "
                       f"patience {since_improved}/{args.patience})")
+        se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
         for epoch in range(start_epoch, args.epochs + 1):
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
             vl = run_epoch(model, val_loader, device, dice_loss, ce_loss, None, morph_loss)
             scheduler.step(vl)
             print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val={vl:.4f}")
+            if se_named:   # is the SE actually learning? |Δ| per block this epoch + |SE| magnitude
+                deltas, norms = [], []
+                for n, p in se_named:
+                    deltas.append((p.detach() - se_prev[n]).norm().item())
+                    norms.append(p.detach().norm().item())
+                    se_prev[n] = p.detach().clone()
+                print("  SE |Δ|: " + " ".join(f"{d:.3f}" for d in deltas)
+                      + "   |SE|: " + " ".join(f"{v:.3f}" for v in norms))
             if vl < best_val:
                 best_val = vl
                 since_improved = 0

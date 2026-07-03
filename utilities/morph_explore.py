@@ -24,6 +24,9 @@
 import argparse
 import json
 import os
+import pickle
+from functools import partial
+from multiprocessing import Pool
 import numpy as np
 
 
@@ -107,6 +110,52 @@ def bottomhat(img, r):
     return np.clip(closing_of(img, r) - img, 0, None)
 
 
+def gradient(img, r):
+    """morphological gradient = dilation - erosion (boundary-selective)."""
+    from scipy.ndimage import grey_dilation, grey_erosion
+    fp = _footprint(img.ndim, r)
+    return np.clip(grey_dilation(img, footprint=fp) - grey_erosion(img, footprint=fp), 0, None)
+
+
+def _line_footprint(length, angle):
+    """(L, L) binary line SE through the centre at `angle` radians (2-D only)."""
+    r = length // 2
+    fp = np.zeros((length, length), dtype=bool)
+    for t in range(-r, r + 1):
+        y = int(round(r - t * np.sin(angle)))
+        x = int(round(r + t * np.cos(angle)))
+        if 0 <= y < length and 0 <= x < length:
+            fp[y, x] = True
+    return fp
+
+
+def line_tophat(img, r, n_angles=4):
+    """orientation-invariant line top-hat: max over oriented line SEs of (img - opening),
+    so a tubular structure survives at whatever angle it runs. 2-D slices only; falls back
+    to the isotropic top-hat on 3-D input."""
+    from scipy.ndimage import grey_opening
+    if img.ndim != 2:
+        return tophat(img, r)
+    length, best = 2 * r + 1, None
+    for a in np.linspace(0, np.pi, n_angles, endpoint=False):
+        th = np.clip(img - grey_opening(img, footprint=_line_footprint(length, a)), 0, None)
+        best = th if best is None else np.maximum(best, th)
+    return best
+
+
+def line_bottomhat(img, r, n_angles=4):
+    """orientation-invariant line bottom-hat: max over oriented line SEs of (closing - img),
+    for dark tubular structures. 2-D slices only; falls back to the isotropic bottom-hat on 3-D."""
+    from scipy.ndimage import grey_closing
+    if img.ndim != 2:
+        return bottomhat(img, r)
+    length, best = 2 * r + 1, None
+    for a in np.linspace(0, np.pi, n_angles, endpoint=False):
+        bh = np.clip(grey_closing(img, footprint=_line_footprint(length, a)) - img, 0, None)
+        best = bh if best is None else np.maximum(best, bh)
+    return best
+
+
 def band(img, r_lo, r_hi):
     """granulometric band (opening γ): bright structure with scale in (r_lo, r_hi]."""
     return np.clip(opening_of(img, r_lo) - opening_of(img, r_hi), 0, None)
@@ -163,6 +212,23 @@ def align_axes(img, label):
 #
 # stats: where residual energy lands relative to the target
 #
+def _auc(pos, neg, max_n=20000):
+    """AUC = P(residual on a random fg pixel > a random bg pixel), via Mann-Whitney U.
+    Threshold-free discriminability: 0.5 = chance, 1.0 = perfectly separable. Background is
+    subsampled for speed."""
+    from scipy.stats import rankdata
+    pos = np.asarray(pos, np.float64).ravel()
+    neg = np.asarray(neg, np.float64).ravel()
+    if pos.size == 0 or neg.size == 0:
+        return 0.5
+    if neg.size > max_n:
+        neg = np.random.default_rng(0).choice(neg, max_n, replace=False)
+    ranks = rankdata(np.concatenate([pos, neg]))
+    n1 = pos.size
+    u = ranks[:n1].sum() - n1 * (n1 + 1) / 2.0
+    return float(u / (n1 * neg.size))
+
+
 def region_stats(residual, label):
     from scipy.ndimage import binary_erosion, binary_dilation
     fg = label > 0
@@ -174,6 +240,7 @@ def region_stats(residual, label):
     tot = residual.sum() + 1e-9
     pct_on_target = 100 * residual[fg].sum() / tot
     target_area_pct = 100 * fg.mean()
+    res_fg, res_bg = residual[fg], residual[background]
     return dict(
         enrichment=(residual[boundary].mean() / (residual[background].mean() + 1e-9)),
         mean_boundary=residual[boundary].mean(),
@@ -182,6 +249,9 @@ def region_stats(residual, label):
         pct_on_target=pct_on_target,
         target_area_pct=target_area_pct,
         concentration=pct_on_target / (target_area_pct + 1e-9),
+        # discriminability of the residual as an fg-vs-bg pixel score (complements concentration)
+        auc=_auc(res_fg, res_bg),
+        fisher=float((res_fg.mean() - res_bg.mean()) ** 2 / (res_fg.var() + res_bg.var() + 1e-9)),
     )
 
 
@@ -270,67 +340,159 @@ def cmd_explore(args):
 
 
 #
-# subcommand: survey (batch, ranking)
+# subcommand: survey (batch ranking) — parallel, optional train-split + all-slices,
+# with an auto-selector that emits the --morph-bank spec from the ranking
 #
+METRICS = ("concentration", "enrichment", "auc", "fisher")   # accumulated per residual
+
+
+def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, all_slices):
+    """Accumulate the per-residual metric sums over a case's foreground slices.
+    Slices spatial axis 0 to match the training loader (NumpyDataLoader always slices axis 0),
+    so selection is measured on the exact plane the network trains on. Module-level (picklable)."""
+    img = preprocess(load_any(os.path.join(image_dir, fn)), mod, channel, n_mod)
+    lbl = load_any(os.path.join(label_dir, fn))
+    if lbl.ndim == 4:
+        lbl = lbl[..., 0]
+    img = align_axes(img, lbl)
+    if lbl.ndim == 2 or not (lbl > 0).any():
+        axis, idxs = None, [None]
+    else:
+        axis = 0                                   # same plane the loader slices
+        counts = (lbl > 0).sum(axis=tuple(i for i in range(lbl.ndim) if i != axis))
+        idxs = [int(i) for i in np.where(counts > 0)[0]] if all_slices else [int(counts.argmax())]
+
+    acc = {}   # key -> [conc_sum, enrich_sum, auc_sum, fisher_sum, count]
+
+    def note(key, res, lbl2d):
+        s = region_stats(res, lbl2d)
+        if s:
+            a = acc.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0])
+            for i, m in enumerate(METRICS):
+                a[i] += s[m]
+            a[4] += 1
+
+    for idx in idxs:
+        img2d = img if idx is None else np.take(img, idx, axis=axis)
+        lbl2d = lbl if idx is None else np.take(lbl, idx, axis=axis)
+        for r in radii:
+            note(f"tophat r={r}", tophat(img2d, r), lbl2d)
+            note(f"bottomhat r={r}", bottomhat(img2d, r), lbl2d)
+            note(f"gradient r={r}", gradient(img2d, r), lbl2d)
+            note(f"ltophat r={r}", line_tophat(img2d, r), lbl2d)         # diagnostic (oriented, bright)
+            note(f"lbottomhat r={r}", line_bottomhat(img2d, r), lbl2d)   # diagnostic (oriented, dark)
+        for lo, hi in bands:
+            note(f"gband {lo}-{hi}", band(img2d, lo, hi), lbl2d)
+            note(f"fband {lo}-{hi}", band_dark(img2d, lo, hi), lbl2d)
+    return fn, acc, len(idxs)
+
+
+def _select_spec(rows, k):
+    """--morph-bank spec from the ranking: top-k distinct (mode, radius) among the modes that
+    have a trainable SoftMorph2D block (tophat/bottomhat/gradient). Bands and line top-hats are
+    diagnostic only — bands are redundant (the U-Net synthesises them) and oriented line SEs
+    aren't representable by the disk-initialised trainable block."""
+    picked = []
+    for row in rows:
+        key = row["key"]
+        for mode in ("tophat", "bottomhat", "gradient"):
+            if key.startswith(f"{mode} r=") and len(picked) < k:
+                r = int(key.split("r=")[1])
+                if (mode, r) not in picked:
+                    picked.append((mode, r))
+    return ",".join(f"{m}:{r}" for m, r in picked)
+
+
 def cmd_survey(args):
-    modality, labels = load_meta(args.dataset_dir)
+    modality, _ = load_meta(args.dataset_dir)
     mod = modality[str(args.channel)] if str(args.channel) in modality else modality.get("0", "MRI")
     task = os.path.basename(args.dataset_dir.rstrip("/"))
     os.makedirs(args.out_dir, exist_ok=True)
     bands = list(zip(args.bands[0::2], args.bands[1::2]))
-
     img_dir = os.path.join(args.dataset_dir, "imagesTr")
     lbl_dir = os.path.join(args.dataset_dir, "labelsTr")
-    cases = sorted(f for f in os.listdir(img_dir) if f.endswith(".nii.gz") and not f.startswith("."))[:args.n]
 
-    records = {}    # residual key -> list of (concentration, enrichment)
-    per_case = [f"# {task}  modality[{args.channel}]={mod}  labels={labels}",
-                f"# radii={args.radii}  bands={bands}  n={len(cases)}",
-                f"{'case':20s} {'residual':13s} {'enrich':>7s} {'%on-tgt':>8s} {'area%':>7s} {'conc':>6s}"]
+    cases = sorted(f for f in os.listdir(img_dir) if f.endswith(".nii.gz") and not f.startswith("."))
+    tag = "all"
+    if args.split == "train":                          # default: selection must use training data only
+        splits_path = os.path.join(args.dataset_dir, "splits.pkl")
+        if os.path.exists(splits_path):
+            with open(splits_path, "rb") as f:
+                keys = set(pickle.load(f)[args.fold]["train"])
+            cases = [fn for fn in cases if fn.replace(".nii.gz", "") in keys]
+            tag = f"train-f{args.fold}"
+        else:
+            print(f"[warn] no splits.pkl in {args.dataset_dir} (run run_preprocessing first for "
+                  f"train-only selection); falling back to ALL cases", flush=True)
+    if args.n > 0:
+        cases = cases[:args.n]
 
-    def note(stem, key, res, lbl2d):
-        s = region_stats(res, lbl2d)
-        if not s:
-            return
-        records.setdefault(key, []).append((s["concentration"], s["enrichment"]))
-        per_case.append(f"{stem:20s} {key:13s} {s['enrichment']:7.2f} "
-                        f"{s['pct_on_target']:8.1f} {s['target_area_pct']:7.2f} {s['concentration']:6.2f}")
-
-    for i, fn in enumerate(cases):
-        img = preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality))
-        lbl = load_any(os.path.join(lbl_dir, fn))
-        if lbl.ndim == 4:
-            lbl = lbl[..., 0]
-        img = align_axes(img, lbl)           # fix medpy 4-D axis permutation
+    # visual sanity: render the first --viz cases (one representative slice each)
+    for fn in cases[:args.viz]:
+        lbl = load_any(os.path.join(lbl_dir, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+        img = align_axes(preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality)), lbl)
         sel = pick_slice(lbl)
-        img2d, lbl2d = take(img, sel), take(lbl, sel)
-        if i < args.viz:
-            render_grid(img2d, lbl2d, args.radii, bands,
-                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"),
-                        dark_bands=bands)
-        stem = fn.replace(".nii.gz", "")
-        for r in args.radii:
-            note(stem, f"tophat r={r}", tophat(img2d, r), lbl2d)
-            note(stem, f"bottomhat r={r}", bottomhat(img2d, r), lbl2d)
-        for lo, hi in bands:
-            note(stem, f"gband {lo}-{hi}", band(img2d, lo, hi), lbl2d)
-            note(stem, f"fband {lo}-{hi}", band_dark(img2d, lo, hi), lbl2d)
-        per_case.append("")
+        render_grid(take(img, sel), take(lbl, sel), args.radii, bands,
+                    os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"), dark_bands=bands)
 
-    summ = sorted(((np.mean([v[0] for v in vals]), np.std([v[0] for v in vals]),
-                    np.mean([v[1] for v in vals]), key) for key, vals in records.items()),
-                  reverse=True)
-    head = [f"===== SUMMARY  {task}  (modality={mod}, n={len(cases)} cases) =====",
-            f"{'residual':13s} {'concentration(mean±sd)':>24s} {'enrich':>7s}"]
-    for cm, cs, em, key in summ:
-        head.append(f"{key:13s} {cm:10.2f} ± {cs:4.2f}          {em:6.2f}")
-    if summ:
-        head.append(f">>> {task}: best mean concentration = {summ[0][0]:.2f}x  ({summ[0][3]})")
+    # parallel per-case accumulation over all foreground slices (or one, per --all-slices)
+    worker = partial(_survey_case, image_dir=img_dir, label_dir=lbl_dir, mod=mod, channel=args.channel,
+                     n_mod=len(modality), radii=args.radii, bands=bands, all_slices=args.all_slices)
+    total, n_slices = {}, 0
+    print(f"surveying {len(cases)} cases ({tag}, all_slices={args.all_slices}, workers={args.workers}) ...", flush=True)
 
+    def consume(res):
+        nonlocal n_slices
+        fn, acc, nsl = res
+        n_slices += nsl
+        for key, vals in acc.items():
+            t = total.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0])
+            for i in range(5):
+                t[i] += vals[i]
+        print(f"  {fn}  ({nsl} slices)", flush=True)
+
+    if args.workers > 1:
+        with Pool(args.workers) as pool:
+            for res in pool.imap_unordered(worker, cases):
+                consume(res)
+    else:
+        for fn in cases:
+            consume(worker(fn))
+
+    # per-residual metric means, plus a combined selectivity x discriminability score
+    rows = []
+    for key, t in total.items():
+        if t[4] > 0:
+            row = {"key": key, **{m: t[i] / t[4] for i, m in enumerate(METRICS)}}
+            row["conc_auc"] = row["concentration"] * row["auc"]
+            rows.append(row)
+    rows.sort(key=lambda r: r[args.rank_by], reverse=True)
+    spec = _select_spec(rows, args.top_k)
+
+    cols = ["concentration", "enrichment", "auc", "fisher", "conc_auc"]
+    head = [f"===== SUMMARY  {task}  ({tag}, modality={mod}, {len(cases)} cases, {n_slices} slices, "
+            f"rank-by={args.rank_by}) =====",
+            f"{'residual':13s} " + " ".join(f"{c:>13s}" for c in cols)]
+    for row in rows:
+        head.append(f"{row['key']:13s} " + " ".join(f"{row[c]:13.3f}" for c in cols))
+    if rows:
+        head.append(f">>> best ({args.rank_by}) = {rows[0][args.rank_by]:.3f}  ({rows[0]['key']})")
+        head.append(f">>> selected --morph-bank \"{spec}\"")
     print("\n".join(head))
-    with open(os.path.join(args.out_dir, f"{task}_stats.txt"), "w") as f:
-        f.write("\n".join(per_case) + "\n\n" + "\n".join(head) + "\n")
-    print(f"\n[written] {min(args.viz, len(cases))} panels + {task}_stats.txt in {args.out_dir}")
+    out_path = os.path.join(args.out_dir, f"{task}_{tag}_stats.txt")
+    with open(out_path, "w") as f:
+        f.write("\n".join(head) + "\n")
+
+    # machine-readable handoff: fold -> spec, consumed by `train_eval.py --morph-bank auto`
+    bank_path = os.path.join(args.out_dir, f"{task}_bank.json")
+    bank = {}
+    if os.path.exists(bank_path):
+        with open(bank_path) as f:
+            bank = json.load(f)
+    bank[str(args.fold)] = spec
+    with open(bank_path, "w") as f:
+        json.dump(bank, f, indent=2)
+    print(f"\n[written] {out_path}\n[written] {bank_path}  (fold {args.fold} -> \"{spec}\")")
 
 
 #
@@ -352,11 +514,23 @@ def build_parser():
 
     ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
     ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
-    ps.add_argument("--n", type=int, default=8, help="cases to score")
+    ps.add_argument("--n", type=int, default=8, help="cases to score (0 = all)")
     ps.add_argument("--viz", type=int, default=3, help="render panels for the first N cases")
     ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
     ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
+    ps.add_argument("--split", choices=["all", "train"], default="train",
+                    help="'train' (default) = only --fold's training keys (needs splits.pkl), avoids "
+                         "test leakage in selection; 'all' = every case (exploration/cross-task ranking)")
+    ps.add_argument("--fold", type=int, default=0)
+    ps.add_argument("--all-slices", dest="all_slices", action="store_true", default=True,
+                    help="score every foreground slice (default)")
+    ps.add_argument("--one-slice", dest="all_slices", action="store_false",
+                    help="quick: score only the densest foreground slice per case")
+    ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
+                    default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
+    ps.add_argument("--workers", type=int, default=1, help="parallel worker processes")
+    ps.add_argument("--top-k", type=int, default=4, help="how many (mode,radius) to auto-select for --morph-bank")
     ps.add_argument("--out-dir", default="results/explore")
     ps.set_defaults(func=cmd_survey)
     return p
