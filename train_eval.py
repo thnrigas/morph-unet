@@ -81,7 +81,7 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
         print(f"[morph-bank auto] no cached spec for {task} fold {fold}; running survey ...", flush=True)
         subprocess.run([sys.executable, os.path.join("utilities", "morph_explore.py"), "survey",
                         str(dataset_dir), "--fold", str(fold), "--top-k", str(top_k),
-                        "--workers", str(workers), "--out-dir", root], check=True)
+                        "--workers", str(workers), "--out-dir", root, "--viz", "0"], check=True)
         spec = _read_bank_spec(task, fold, root)
         if spec is None:
             raise RuntimeError(f"survey produced no spec for fold {fold} (empty ranking?)")
@@ -196,17 +196,18 @@ def run_val_dice(model, loader, device, num_classes):
 #
 def evaluate_test(model, loader, device, json_path):
     model.eval()
+    # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
+    # targets for the whole full-slice test set blew up CPU RAM and got the process OOM-killed.
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
     with torch.no_grad():
         for batch in loader:
             data = batch["data"][0].float().to(device)
-            target = batch["seg"][0].float().to(device)
-            pred = model(data)
-            pred_argmax = torch.argmax(pred.data.cpu(), dim=1, keepdim=True)
+            target = batch["seg"][0][:, 0].to(torch.uint8).numpy()           # [b, H, W]
+            pred = model(data).argmax(1).to(torch.uint8).cpu().numpy()       # [b, H, W]
             for i, fname in enumerate(batch["fnames"]):
-                pred_dict[fname[0]].append(pred_argmax[i].numpy())
-                gt_dict[fname[0]].append(target[i].detach().cpu().numpy())
-    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
+                pred_dict[fname[0]].append(pred[i])
+                gt_dict[fname[0]].append(target[i])
+    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
         json_task=config.TASK, advanced=True,
