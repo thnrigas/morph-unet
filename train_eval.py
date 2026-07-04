@@ -140,9 +140,9 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
                     loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
-                # clip grad-norm (nnU-Net uses 12) so one foreground-sparse batch with a sharp
-                # Dice gradient can't spike the whole epoch
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 12.0)
+                # clip grad-norm so one foreground-sparse batch with a sharp Dice gradient can't
+                # spike/destabilise the epoch (tightened to 5 after residual spikes at norm 12)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")

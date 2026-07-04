@@ -114,6 +114,32 @@ class NumpyDataLoader(SlimDataLoaderBase):
 
         self.np_data = np.asarray(self.slices)
 
+        # slice-level class-balanced oversampling (train only): class -> slice-indices containing it
+        self.class_slices, self.fg_classes = {}, []
+        if mode == "train":
+            self._build_class_index()
+
+    def _build_class_index(self):
+        """Map each foreground class -> indices (into self.slices) of slices that contain it, so a
+        training batch can oversample rare classes (e.g. tumour) to parity, not by frequency. Each
+        volume's label channel is read once via mmap to keep startup cheap."""
+        from collections import defaultdict
+        by_case = defaultdict(list)
+        for idx, (ci, z) in enumerate(self.slices):
+            by_case[int(ci)].append((idx, int(z)))
+        lc = self.label_slice[0]
+        cls = defaultdict(list)
+        for ci, items in by_case.items():
+            lbl = np.load(self.files[ci], mmap_mode="r")[lc]          # label volume (D0, D1, D2)
+            for idx, z in items:
+                for c in np.unique(lbl[z]):
+                    if c > 0:
+                        cls[int(c)].append(idx)
+        self.class_slices = {c: v for c, v in cls.items() if v}
+        self.fg_classes = list(self.class_slices.keys())
+        print("class-balanced sampling -> " +
+              ", ".join(f"class {c}: {len(v)} slices" for c, v in sorted(self.class_slices.items())), flush=True)
+
     def reshuffle(self):
         print("Reshuffle...")
         random.shuffle(self.slice_idxs)
@@ -159,6 +185,15 @@ class NumpyDataLoader(SlimDataLoaderBase):
         labels = []
 
         for slice in open_array:
+            # class-balanced foreground oversampling (nnU-Net style): for a fraction of TRAIN samples
+            # draw a random foreground class and a slice that CONTAINS it, then centre the crop on it.
+            # Choosing class -> slice -> location samples rare classes (tumour) to parity, at both the
+            # slice and pixel level; the rest use the uniformly-drawn slice with a random crop.
+            force_class = None
+            if self.mode == "train" and self.class_slices and random.random() < self.fg_fraction:
+                force_class = random.choice(self.fg_classes)
+                slice = self.slices[random.choice(self.class_slices[force_class])]
+
             fn_name = self.files[slice[0]]
 
             # memory-map: read only this slice's bytes from disk, not the whole volume
@@ -171,7 +206,7 @@ class NumpyDataLoader(SlimDataLoaderBase):
 
             # native-resolution patch (train/val) or full padded slice (test);
             # all samples come out a fixed size, so batches are homogeneous by construction
-            img, seg = self._sample(img, seg)
+            img, seg = self._sample(img, seg, force_class)
 
             data.append(img)
             if seg is not None:
@@ -212,7 +247,7 @@ class NumpyDataLoader(SlimDataLoaderBase):
                 seg = np.pad(seg, width, mode="constant", constant_values=0)
         return img, seg
 
-    def _sample(self, img, seg):
+    def _sample(self, img, seg, force_class=None):
         ps = self.target_size
         if self.mode == "test":
             # full slice at native resolution, padded up to a multiple of the U-Net factor
@@ -223,7 +258,7 @@ class NumpyDataLoader(SlimDataLoaderBase):
         img, seg = self._pad_to(img, seg, ps, ps)
         _, h, w = img.shape
         if self.mode == "train":
-            top, left = self._crop_origin(seg, h, w, ps)
+            top, left = self._crop_origin(seg, h, w, ps, force_class)
         else:                                         # non-test patch mode: deterministic centre crop
             top, left = (h - ps) // 2, (w - ps) // 2
         img = img[:, top:top + ps, left:left + ps]
@@ -231,17 +266,13 @@ class NumpyDataLoader(SlimDataLoaderBase):
             seg = seg[:, top:top + ps, left:left + ps]
         return img, seg
 
-    def _crop_origin(self, seg, h, w, ps):
-        """Top-left of a ps x ps crop: for a fraction of samples centre on a foreground pixel of a
-        RANDOMLY CHOSEN present class, else a random crop. Picking the class first (not a random fg
-        pixel) oversamples rare classes (e.g. tumour) to parity with common ones (e.g. vessel), so
-        the model actually sees the rare class instead of ~always landing on the abundant one."""
-        if seg is not None and self.fg_fraction > 0 and random.random() < self.fg_fraction:
-            classes = np.unique(seg[0])
-            classes = classes[classes > 0]
-            if len(classes):
-                c = classes[random.randint(0, len(classes) - 1)]      # class-balanced pick
-                px = np.argwhere(seg[0] == c)
+    def _crop_origin(self, seg, h, w, ps, force_class=None):
+        """Top-left of a ps x ps crop. If force_class is given (foreground-oversampled sample) centre
+        on a pixel of that class; otherwise a plain random crop. The foreground draw + class choice
+        happen once, at the slice level in get_data_from_array, so there is no second draw here."""
+        if force_class is not None and seg is not None:
+            px = np.argwhere(seg[0] == force_class)
+            if len(px):
                 cy, cx = px[random.randint(0, len(px) - 1)]
                 return int(np.clip(cy - ps // 2, 0, h - ps)), int(np.clip(cx - ps // 2, 0, w - ps))
         top = random.randint(0, h - ps) if h > ps else 0
