@@ -232,11 +232,17 @@ class NumpyDataLoader(SlimDataLoaderBase):
         return img, seg
 
     def _crop_origin(self, seg, h, w, ps):
-        """Top-left of a ps x ps crop: foreground-centred for a fraction of samples, else random."""
+        """Top-left of a ps x ps crop: for a fraction of samples centre on a foreground pixel of a
+        RANDOMLY CHOSEN present class, else a random crop. Picking the class first (not a random fg
+        pixel) oversamples rare classes (e.g. tumour) to parity with common ones (e.g. vessel), so
+        the model actually sees the rare class instead of ~always landing on the abundant one."""
         if seg is not None and self.fg_fraction > 0 and random.random() < self.fg_fraction:
-            fg = np.argwhere(seg[0] > 0)
-            if len(fg):
-                cy, cx = fg[random.randint(0, len(fg) - 1)]
+            classes = np.unique(seg[0])
+            classes = classes[classes > 0]
+            if len(classes):
+                c = classes[random.randint(0, len(classes) - 1)]      # class-balanced pick
+                px = np.argwhere(seg[0] == c)
+                cy, cx = px[random.randint(0, len(px) - 1)]
                 return int(np.clip(cy - ps // 2, 0, h - ps)), int(np.clip(cx - ps // 2, 0, w - ps))
         top = random.randint(0, h - ps) if h > ps else 0
         left = random.randint(0, w - ps) if w > ps else 0
