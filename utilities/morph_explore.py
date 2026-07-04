@@ -427,13 +427,18 @@ def cmd_survey(args):
     if args.n > 0:
         cases = cases[:args.n]
 
-    # visual sanity: render the first --viz cases (one representative slice each)
+    # visual sanity: render the first --viz cases (one representative slice each). Optional — the
+    # ranking/spec never needs it, so a missing matplotlib (or any plotting error) must not abort.
     for fn in cases[:args.viz]:
-        lbl = load_any(os.path.join(lbl_dir, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
-        img = align_axes(preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality)), lbl)
-        sel = pick_slice(lbl)
-        render_grid(take(img, sel), take(lbl, sel), args.radii, bands,
-                    os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"), dark_bands=bands)
+        try:
+            lbl = load_any(os.path.join(lbl_dir, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+            img = align_axes(preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality)), lbl)
+            sel = pick_slice(lbl)
+            render_grid(take(img, sel), take(lbl, sel), args.radii, bands,
+                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"), dark_bands=bands)
+        except Exception as e:
+            print(f"[warn] viz skipped ({type(e).__name__}: {e})", flush=True)
+            break
 
     # parallel per-case accumulation over all foreground slices (or one, per --all-slices)
     worker = partial(_survey_case, image_dir=img_dir, label_dir=lbl_dir, mod=mod, channel=args.channel,

@@ -21,7 +21,7 @@ done
 gcloud auth login
 gcloud projects list
 gcloud config set project project-id
-gcloud compute ssh athnrigas@deeplearning-4-vm --zone=zone
+gcloud compute ssh athnrigas@deeplearning-4-vm
 
 # download files from VM
 gcloud compute scp athnrigas@deeplearning-4-vm:~/repo/filename ./

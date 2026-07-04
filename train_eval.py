@@ -11,6 +11,7 @@ import pickle
 import random
 import subprocess
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -80,7 +81,7 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
         print(f"[morph-bank auto] no cached spec for {task} fold {fold}; running survey ...", flush=True)
         subprocess.run([sys.executable, os.path.join("utilities", "morph_explore.py"), "survey",
                         str(dataset_dir), "--fold", str(fold), "--top-k", str(top_k),
-                        "--workers", str(workers), "--out-dir", root], check=True)
+                        "--workers", str(workers), "--out-dir", root, "--viz", "0"], check=True)
         spec = _read_bank_spec(task, fold, root)
         if spec is None:
             raise RuntimeError(f"survey produced no spec for fold {fold} (empty ranking?)")
@@ -140,6 +141,9 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
                     loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
+                # clip grad-norm so one foreground-sparse batch with a sharp Dice gradient can't
+                # spike/destabilise the epoch (tightened to 5 after residual spikes at norm 12)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
@@ -192,17 +196,18 @@ def run_val_dice(model, loader, device, num_classes):
 #
 def evaluate_test(model, loader, device, json_path):
     model.eval()
+    # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
+    # targets for the whole full-slice test set blew up CPU RAM and got the process OOM-killed.
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
     with torch.no_grad():
         for batch in loader:
             data = batch["data"][0].float().to(device)
-            target = batch["seg"][0].float().to(device)
-            pred = model(data)
-            pred_argmax = torch.argmax(pred.data.cpu(), dim=1, keepdim=True)
+            target = batch["seg"][0][:, 0].to(torch.uint8).numpy()           # [b, H, W]
+            pred = model(data).argmax(1).to(torch.uint8).cpu().numpy()       # [b, H, W]
             for i, fname in enumerate(batch["fnames"]):
-                pred_dict[fname[0]].append(pred_argmax[i].numpy())
-                gt_dict[fname[0]].append(target[i].detach().cpu().numpy())
-    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
+                pred_dict[fname[0]].append(pred[i])
+                gt_dict[fname[0]].append(target[i])
+    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
         json_task=config.TASK, advanced=True,
@@ -328,8 +333,9 @@ def main():
                    help="run full-slice foreground-Dice validation every K epochs (raise to speed up)")
     p.add_argument("--val-batch", type=int, default=12,
                    help="full slices per validation forward pass; packs the GPU, auto-halves on CUDA OOM")
-    p.add_argument("--val-cases", type=int, default=0,
-                   help="if >0, validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper)")
+    p.add_argument("--val-cases", type=int, default=15,
+                   help="validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper); "
+                        "0 = all. Falls back to all if the val set is smaller.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
@@ -443,6 +449,7 @@ def main():
     if not args.test_only:
         # selection metric is foreground Dice now (higher is better); best_dice tracks the best so far
         start_epoch, best_dice, best_epoch = 1, -1.0, 0
+        t0, val_curve = time.time(), []   # wall-clock + (epoch, fg_dice) learning curve for the summary
         # resume from the full-state last.pth (model + optim + scheduler + counters)
         if args.resume and os.path.exists(last_path):
             ck = torch.load(last_path, map_location=device)
@@ -463,6 +470,7 @@ def main():
                 scheduler.step(-vd)    # scheduler minimises; we maximise Dice, so feed -Dice
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val_fgDice={vd:.4f}  "
                       f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]")
+                val_curve.append([epoch, round(vd, 5)])
             else:
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  (val every {args.val_every})")
             if se_named:   # is the SE actually learning? |Δ| per block this epoch + |SE| magnitude
@@ -490,6 +498,27 @@ def main():
                 print(f"early stop: no val fg-Dice improvement for {epoch - best_epoch} epochs "
                       f"(best fg-Dice={best_dice:.4f} @ ep {best_epoch})")
                 break
+
+        # per-run training summary: convergence + cost (lets --compare show whether an arm, e.g.
+        # the morph bank, reaches the same Dice in fewer epochs / less time / fewer params)
+        elapsed = time.time() - t0
+        front = sum(p.numel() for n, p in model.named_parameters()
+                    if n.startswith(("blocks.", "front.", "tophat.", "bottomhat.")))
+        total = sum(p.numel() for p in model.parameters())
+        # epochs to first reach 90% of the best fg-Dice — a threshold-based convergence-speed metric
+        thr = 0.9 * best_dice
+        ep_to_thr = next((e for e, d in val_curve if d >= thr), best_epoch)
+        summary = {"best_fg_dice": round(best_dice, 5), "best_epoch": best_epoch,
+                   "epochs_to_90pct_best": ep_to_thr, "stopped_epoch": epoch, "max_epochs": args.epochs,
+                   "seconds": round(elapsed, 1),
+                   "sec_per_epoch": round(elapsed / max(epoch - start_epoch + 1, 1), 2),
+                   "updates": epoch * epoch_len, "patches": epoch * epoch_len * args.batch_size,
+                   "params_total": total, "params_frontend": front, "val_curve": val_curve}
+        with open(os.path.join(results_dir, f"{stem}_train.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[{stem}] trained {epoch} ep in {elapsed / 60:.1f} min "
+              f"({summary['sec_per_epoch']:.1f}s/ep) | best fg-Dice {best_dice:.4f} @ ep{best_epoch} "
+              f"(90% @ ep{ep_to_thr}) | {total / 1e6:.2f}M params (front-end {front})")
     ckpt = best_path if os.path.exists(best_path) else last_path
     state = torch.load(ckpt, map_location=device)
     if isinstance(state, dict) and "model" in state:   # last.pth is a full-state dict
