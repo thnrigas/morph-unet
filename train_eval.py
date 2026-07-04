@@ -103,10 +103,14 @@ def build_loaders(args):
                   label_slice=label_slice, num_processes=args.num_workers, fg_fraction=args.fg_fraction)
     cap = dict(num_batches=args.iters_per_epoch) if args.iters_per_epoch > 0 else {}
     train = None if args.test_only else NumpyDataSet(data_dir, keys=tr, **common, **cap)
-    # val: full-slice like test (batch 1, all slices) so model selection uses foreground Dice on the
-    # real distribution, not a background-dominated centre patch. Uncapped: every val slice each pass.
-    val = None if args.test_only else NumpyDataSet(data_dir, keys=vl, mode="test", do_reshuffle=False,
-                                                   **{**common, "batch_size": 1})
+    # val: full-slice like test so model selection uses foreground Dice on the real distribution,
+    # not a background-dominated centre patch. --val-cases caps to a fixed (seeded) subset of volumes
+    # (unbiased, cheaper); --val-batch packs full slices per forward pass to use the GPU.
+    val_keys = list(vl)
+    if args.val_cases and 0 < args.val_cases < len(val_keys):
+        val_keys = sorted(random.Random(args.seed).sample(val_keys, args.val_cases))
+    val = None if args.test_only else NumpyDataSet(data_dir, keys=val_keys, mode="test", do_reshuffle=False,
+                                                   **{**common, "batch_size": args.val_batch})
     # test: full-slice inference one at a time, all slices (uncapped)
     test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False,
                         **{**common, "batch_size": 1})
@@ -150,19 +154,34 @@ def run_val_dice(model, loader, device, num_classes):
     n_fg = max(num_classes - 1, 1)
     tp = torch.zeros(n_fg); fp = torch.zeros(n_fg); fn = torch.zeros(n_fg)
     amp = device.type == "cuda"
+    chunk = [0]   # GPU sub-batch cap; 0 = whole loader-batch, drops (halving) after a CUDA OOM
+
+    def _count(x, t):
+        with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
+            pred_lab = model(x).argmax(1)                                    # [b, H, W]
+        for c in range(1, num_classes):
+            p, tt, i = (pred_lab == c), (t == c), c - 1
+            tp[i] += (p & tt).sum().item()
+            fp[i] += (p & ~tt).sum().item()
+            fn[i] += (~p & tt).sum().item()
+
     with torch.no_grad():
         for batch in loader:
-            data = batch["data"][0].float().to(device, non_blocking=True)   # [b, c, H, W]
-            target = batch["seg"][0].long().to(device)                      # [b, 1, H, W]
-            with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
-                pred = model(data)
-            pred_lab = pred.argmax(1)                                        # [b, H, W]
-            tgt = target[:, 0]
-            for c in range(1, num_classes):
-                p, t, i = (pred_lab == c), (tgt == c), c - 1
-                tp[i] += (p & t).sum().item()
-                fp[i] += (p & ~t).sum().item()
-                fn[i] += (~p & t).sum().item()
+            data = batch["data"][0].float()                                 # [b, c, H, W] (cpu)
+            target = batch["seg"][0][:, 0].long()                           # [b, H, W]
+            b, i = data.shape[0], 0
+            while i < b:                                                     # forward in OOM-safe chunks
+                step = min(chunk[0] or b, b - i)
+                try:
+                    _count(data[i:i + step].to(device, non_blocking=True),
+                           target[i:i + step].to(device, non_blocking=True))
+                    i += step
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower() or step == 1:
+                        raise
+                    torch.cuda.empty_cache()
+                    chunk[0] = max(step // 2, 1)
+                    print(f"[val] CUDA OOM at chunk {step} -> retry at {chunk[0]}", flush=True)
     dice = (2 * tp) / (2 * tp + fp + fn + 1e-8)         # per-class global Dice
     present = (tp + fn) > 0                              # classes actually present in the val set
     mean = dice[present].mean().item() if present.any() else 0.0
@@ -304,9 +323,13 @@ def main():
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
     p.add_argument("--patience", type=int, default=config.HP["patience"],
-                   help="early stop after this many validations with no fg-Dice gain")
-    p.add_argument("--val-every", type=int, default=1,
+                   help="early stop after this many EPOCHS with no fg-Dice gain (independent of --val-every)")
+    p.add_argument("--val-every", type=int, default=3,
                    help="run full-slice foreground-Dice validation every K epochs (raise to speed up)")
+    p.add_argument("--val-batch", type=int, default=12,
+                   help="full slices per validation forward pass; packs the GPU, auto-halves on CUDA OOM")
+    p.add_argument("--val-cases", type=int, default=0,
+                   help="if >0, validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
@@ -419,7 +442,7 @@ def main():
     last_path = os.path.join(results_dir, f"{stem}_last.pth")
     if not args.test_only:
         # selection metric is foreground Dice now (higher is better); best_dice tracks the best so far
-        start_epoch, best_dice, best_epoch, since_improved = 1, -1.0, 0, 0
+        start_epoch, best_dice, best_epoch = 1, -1.0, 0
         # resume from the full-state last.pth (model + optim + scheduler + counters)
         if args.resume and os.path.exists(last_path):
             ck = torch.load(last_path, map_location=device)
@@ -428,9 +451,9 @@ def main():
                 optimizer.load_state_dict(ck["optimizer"])
                 scheduler.load_state_dict(ck["scheduler"])
                 start_epoch = ck["epoch"] + 1
-                best_dice, best_epoch, since_improved = ck["best_val"], ck.get("best_epoch", 0), ck["since_improved"]
+                best_dice, best_epoch = ck["best_val"], ck.get("best_epoch", 0)
                 print(f"resumed from epoch {ck['epoch']} (best fg-Dice={best_dice:.4f} @ ep {best_epoch}, "
-                      f"patience {since_improved}/{args.patience})")
+                      f"{start_epoch - 1 - best_epoch}/{args.patience} epochs stale)")
         se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
         for epoch in range(start_epoch, args.epochs + 1):
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
@@ -452,19 +475,19 @@ def main():
                       + "   |SE|: " + " ".join(f"{v:.3f}" for v in norms))
             if do_val:
                 if vd > best_dice:
-                    best_dice, best_epoch, since_improved = vd, epoch, 0
+                    best_dice, best_epoch = vd, epoch
                     torch.save(model.state_dict(), best_path)   # best: weights only (for eval)
                 else:
-                    since_improved += 1
                     patience_str = f"/{args.patience}" if args.patience else ""
                     print(f"  val fg-Dice did not improve from {best_dice:.4f} @ ep {best_epoch} "
-                          f"(patience: {since_improved}{patience_str})")
+                          f"(stale {epoch - best_epoch}{patience_str} epochs)")
             # last: full state so training can resume after an interruption
             torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(), "epoch": epoch, "best_val": best_dice,
-                        "best_epoch": best_epoch, "since_improved": since_improved}, last_path)
-            if do_val and args.patience and since_improved >= args.patience:
-                print(f"early stop: no val fg-Dice improvement for {args.patience} validations "
+                        "best_epoch": best_epoch}, last_path)
+            # early stop on epochs since last improvement (independent of --val-every)
+            if args.patience and (epoch - best_epoch) >= args.patience:
+                print(f"early stop: no val fg-Dice improvement for {epoch - best_epoch} epochs "
                       f"(best fg-Dice={best_dice:.4f} @ ep {best_epoch})")
                 break
     ckpt = best_path if os.path.exists(best_path) else last_path

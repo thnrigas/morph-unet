@@ -179,6 +179,21 @@ class NumpyDataLoader(SlimDataLoaderBase):
             fnames.append(self.files[slice[0]])
             slice_idxs.append(slice[1])
 
+        # full-slice batches (val/test with batch>1) can hold volumes of different H,W; pad each
+        # up to the batch-max so they stack (image with its min, label with 0). No-op when uniform.
+        if len(data) > 1:
+            hmax = max(d.shape[-2] for d in data)
+            wmax = max(d.shape[-1] for d in data)
+            if any((d.shape[-2], d.shape[-1]) != (hmax, wmax) for d in data):
+                def _pad(a, cval):
+                    _, h, w = a.shape
+                    dh, dw = hmax - h, wmax - w
+                    t, l = dh // 2, dw // 2
+                    return np.pad(a, ((0, 0), (t, dh - t), (l, dw - l)), constant_values=cval)
+                data = [_pad(d, d.min()) for d in data]
+                if labels:
+                    labels = [_pad(s, 0) for s in labels]
+
         ret_dict = {'data': np.asarray(data), 'fnames': fnames, 'slice_idxs': slice_idxs}
         if self.label_slice is not None:
             ret_dict['seg'] = np.asarray(labels)
