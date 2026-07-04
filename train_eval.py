@@ -333,8 +333,9 @@ def main():
                    help="run full-slice foreground-Dice validation every K epochs (raise to speed up)")
     p.add_argument("--val-batch", type=int, default=12,
                    help="full slices per validation forward pass; packs the GPU, auto-halves on CUDA OOM")
-    p.add_argument("--val-cases", type=int, default=0,
-                   help="if >0, validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper)")
+    p.add_argument("--val-cases", type=int, default=15,
+                   help="validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper); "
+                        "0 = all. Falls back to all if the val set is smaller.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
