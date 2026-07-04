@@ -25,7 +25,7 @@ _HP = {
     "Task05_Prostate": dict(epochs=300, patience=30, iters_per_epoch=250, fg_fraction=0.33),
     "Task06_Lung": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.66),
     "Task07_Pancreas": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.50),
-    "Task08_HepaticVessel": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.50),
+    "Task08_HepaticVessel": dict(epochs=400, patience=40, iters_per_epoch=250, patch_size=128, fg_fraction=0.33),
     "Task09_Spleen": dict(epochs=300, patience=30, iters_per_epoch=250, fg_fraction=0.33),
     "Task10_Colon": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.66),
 }
