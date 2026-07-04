@@ -286,6 +286,24 @@ class NiftiEvaluator(Evaluator):
         return super(NiftiEvaluator, self).evaluate(test, reference, **metric_kwargs)
 
 
+def _eval_one(args):
+    """Evaluate a single (test, ref) pair \u2014 module-level for Pool pickling."""
+    test, ref, evaluator_cls, labels, metric_kwargs = args
+    ev = evaluator_cls()
+    if labels is not None:
+        ev.set_labels(labels)
+    ev.set_test(test)
+    ev.set_reference(ref)
+    if ev.labels is None:
+        ev.construct_labels()
+    scores = ev.evaluate(**metric_kwargs)
+    if isinstance(test, str):
+        scores["test"] = test
+    if isinstance(ref, str):
+        scores["reference"] = ref
+    return scores
+
+
 def aggregate_scores(test_ref_pairs,
                      evaluator=NiftiEvaluator,
                      labels=None,
@@ -295,6 +313,7 @@ def aggregate_scores(test_ref_pairs,
                      json_description="",
                      json_author="Fabian",
                      json_task="",
+                     num_workers=1,
                      **metric_kwargs):
     """
     test = predicted image
@@ -311,28 +330,23 @@ def aggregate_scores(test_ref_pairs,
     :return:
     """
 
-    if type(evaluator) == type:
-        evaluator = evaluator()
-
-    if labels is not None:
-        evaluator.set_labels(labels)
+    evaluator_cls = evaluator if isinstance(evaluator, type) else type(evaluator)
 
     all_scores = {}
     all_scores["all"] = []
     all_scores["mean"] = {}
 
-    for i, (test, ref) in enumerate(test_ref_pairs):
+    # evaluate all cases (parallel when num_workers > 1)
+    tasks = [(test, ref, evaluator_cls, labels, metric_kwargs)
+             for test, ref in test_ref_pairs]
+    if num_workers > 1 and len(tasks) > 1:
+        from multiprocessing import Pool
+        with Pool(min(num_workers, len(tasks))) as pool:
+            case_scores = list(pool.imap(_eval_one, tasks))
+    else:
+        case_scores = [_eval_one(t) for t in tasks]
 
-        # evaluate
-        evaluator.set_test(test)
-        evaluator.set_reference(ref)
-        if evaluator.labels is None:
-            evaluator.construct_labels()
-        current_scores = evaluator.evaluate(**metric_kwargs)
-        if type(test) == str:
-            current_scores["test"] = test
-        if type(ref) == str:
-            current_scores["reference"] = ref
+    for current_scores in case_scores:
         all_scores["all"].append(current_scores)
 
         # append score list for mean
