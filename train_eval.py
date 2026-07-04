@@ -23,6 +23,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import config
 from networks.UNET import UNet
 from networks.morph_block import MorphResidualUNet, MorphBankUNet, ConvBankUNet
+from networks.morph_unet import MorphUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
@@ -310,6 +311,8 @@ def main():
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
+    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck"],
+                   help="replace conv stages with morphological-separable blocks (networks/morph_unet.py)")
     p.add_argument("--morph-bank", metavar="SPEC",
                    help='trainable morph bank, e.g. "tophat:3,tophat:5,bottomhat:1,gradient:2" (radii); '
                         'use "auto" to load this task/fold spec from the survey\'s results/explore/<TASK>_bank.json')
@@ -374,7 +377,13 @@ def main():
         torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
-    if args.morph_bank:
+    if args.morph_unet:
+        # morphological-separable U-Net: conv stages replaced by depthwise soft morphology
+        # + 1x1 projection, per the chosen config. Its SEs end in ".se", so they pick up the
+        # boosted SE lr and --freeze-se just like the bank/residual variants.
+        model = MorphUNet(num_classes=args.num_classes, in_channels=in_channels,
+                          k=args.morph_k, beta=args.morph_beta, config=args.morph_unet).to(device)
+    elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
         if args.morph_bank == "auto":
             args.morph_bank = ensure_bank_spec(config.TASK, args.fold, config.DATA_DIR,
@@ -406,7 +415,9 @@ def main():
 
     # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
-    if args.morph_bank:
+    if args.morph_unet:
+        mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta})"
+    elif args.morph_bank:
         kind = "conv-control" if args.conv_control else "morph-bank"
         mode = f"{kind}([{args.morph_bank}],beta={args.morph_beta})"
     elif args.morph_block:
