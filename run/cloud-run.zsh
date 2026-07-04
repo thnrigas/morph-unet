@@ -18,6 +18,21 @@ for f in 0 1 2 3 4; do
     python3 train_eval.py --tag hepatic_base --fold $f
 done
 
+# morphological-separable U-Net sweep (3 configs x 5 folds)
+# on CUDA leave --num-workers at its default (the 0 was a mac/MPS-only workaround)
+for cfg in bottleneck balanced heavy; do
+    for f in 0 1 2 3 4; do
+        python3 train_eval.py --tag morphunet_$cfg --morph-unet $cfg --morph-k 3 --fold $f
+    done
+done
+
+# fold means + comparison vs baseline (Dice / ASSD deltas per label)
+for t in hepatic_base morphunet_bottleneck morphunet_balanced morphunet_heavy; do
+    python3 train_eval.py --fold-mean $t
+done
+python3 train_eval.py --compare hepatic_base_mean_scores.json \
+    morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json morphunet_heavy_mean_scores.json
+
 gcloud auth login
 gcloud projects list
 gcloud config set project project-id
