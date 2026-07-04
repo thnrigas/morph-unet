@@ -11,6 +11,7 @@ import pickle
 import random
 import subprocess
 import sys
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -446,6 +447,7 @@ def main():
     if not args.test_only:
         # selection metric is foreground Dice now (higher is better); best_dice tracks the best so far
         start_epoch, best_dice, best_epoch = 1, -1.0, 0
+        t0, val_curve = time.time(), []   # wall-clock + (epoch, fg_dice) learning curve for the summary
         # resume from the full-state last.pth (model + optim + scheduler + counters)
         if args.resume and os.path.exists(last_path):
             ck = torch.load(last_path, map_location=device)
@@ -466,6 +468,7 @@ def main():
                 scheduler.step(-vd)    # scheduler minimises; we maximise Dice, so feed -Dice
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val_fgDice={vd:.4f}  "
                       f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]")
+                val_curve.append([epoch, round(vd, 5)])
             else:
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  (val every {args.val_every})")
             if se_named:   # is the SE actually learning? |Δ| per block this epoch + |SE| magnitude
@@ -493,6 +496,27 @@ def main():
                 print(f"early stop: no val fg-Dice improvement for {epoch - best_epoch} epochs "
                       f"(best fg-Dice={best_dice:.4f} @ ep {best_epoch})")
                 break
+
+        # per-run training summary: convergence + cost (lets --compare show whether an arm, e.g.
+        # the morph bank, reaches the same Dice in fewer epochs / less time / fewer params)
+        elapsed = time.time() - t0
+        front = sum(p.numel() for n, p in model.named_parameters()
+                    if n.startswith(("blocks.", "front.", "tophat.", "bottomhat.")))
+        total = sum(p.numel() for p in model.parameters())
+        # epochs to first reach 90% of the best fg-Dice — a threshold-based convergence-speed metric
+        thr = 0.9 * best_dice
+        ep_to_thr = next((e for e, d in val_curve if d >= thr), best_epoch)
+        summary = {"best_fg_dice": round(best_dice, 5), "best_epoch": best_epoch,
+                   "epochs_to_90pct_best": ep_to_thr, "stopped_epoch": epoch, "max_epochs": args.epochs,
+                   "seconds": round(elapsed, 1),
+                   "sec_per_epoch": round(elapsed / max(epoch - start_epoch + 1, 1), 2),
+                   "updates": epoch * epoch_len, "patches": epoch * epoch_len * args.batch_size,
+                   "params_total": total, "params_frontend": front, "val_curve": val_curve}
+        with open(os.path.join(results_dir, f"{stem}_train.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[{stem}] trained {epoch} ep in {elapsed / 60:.1f} min "
+              f"({summary['sec_per_epoch']:.1f}s/ep) | best fg-Dice {best_dice:.4f} @ ep{best_epoch} "
+              f"(90% @ ep{ep_to_thr}) | {total / 1e6:.2f}M params (front-end {front})")
     ckpt = best_path if os.path.exists(best_path) else last_path
     state = torch.load(ckpt, map_location=device)
     if isinstance(state, dict) and "model" in state:   # last.pth is a full-state dict
