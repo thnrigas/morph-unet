@@ -195,7 +195,7 @@ def run_val_dice(model, loader, device, num_classes):
 #
 # test
 #
-def evaluate_test(model, loader, device, json_path):
+def evaluate_test(model, loader, device, json_path, num_workers=1):
     model.eval()
     # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
     # targets for the whole full-slice test set blew up CPU RAM and got the process OOM-killed.
@@ -211,7 +211,7 @@ def evaluate_test(model, loader, device, json_path):
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        json_task=config.TASK, advanced=True,
+        json_task=config.TASK, num_workers=num_workers, advanced=True,
     )
     return scores
 
@@ -536,7 +536,7 @@ def main():
         state = state["model"]
     model.load_state_dict(state)
     json_path = os.path.join(results_dir, f"{stem}_scores.json")
-    scores = evaluate_test(model, test_loader, device, json_path)
+    scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
         print(f"  label {label}: Dice={md.get('Dice')} "
