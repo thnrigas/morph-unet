@@ -223,11 +223,48 @@ def _run_name(path):
             return base[:-len(suf)]
     return base
 
+
 #
-# average each metric across all per-fold <tag>_f<fold>_scores.json
+# all per-run artefacts (checkpoints, scores, train summaries) live under
+# results/<TASK>/ so runs for different MSD tasks don't collide in one flat folder.
+# task_results_dir() is the WRITE target (created on demand); read_results_dir() is the
+# READ source and falls back to the flat results/ for the legacy (pre-subdir) layout.
+#
+def task_results_dir():
+    d = os.path.join(config.PROJECT_ROOT, "results", config.TASK)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def read_results_dir():
+    d = os.path.join(config.PROJECT_ROOT, "results", config.TASK)
+    return d if os.path.isdir(d) else os.path.join(config.PROJECT_ROOT, "results")
+
+# segmentation metrics reported by fold_mean / compare. Dice + ASSD are the MSD primaries;
+# HD95 is a robust boundary metric (unlike outlier-prone raw Hausdorff); Precision/Recall
+# explain *why* Dice moves (e.g. trading precision for recall). Jaccard (monotone with Dice)
+# and the background-dominated rates (Accuracy/FPR/TNR/NPV) are omitted as uninformative.
+SCORE_METRICS = ("Dice", "Avg. Symmetric Surface Distance", "Hausdorff Distance 95",
+                 "Precision", "Recall")
+# per-run training-cost / convergence stats worth averaging across folds (from <run>_train.json).
+# params_* are ~constant across folds; the rest capture "does this arm cost more to reach its Dice".
+TRAIN_STATS = ("best_fg_dice", "best_epoch", "epochs_to_90pct_best", "sec_per_epoch",
+               "params_total", "params_frontend")
+
+
+def _mean_std(vals):
+    """{mean, std, n} over the non-None values, or None if there are none."""
+    vals = [v for v in vals if v is not None]
+    if not vals:
+        return None
+    return {"mean": float(np.mean(vals)), "std": float(np.std(vals)), "n": len(vals)}
+
+
+#
+# average each metric (and the training stats) across all per-fold <tag>_f<fold>_scores.json
 #
 def fold_mean(tag):
-    results_dir = os.path.join(config.PROJECT_ROOT, "results")
+    results_dir = read_results_dir()   # task subdir, or flat results/ (legacy) as a fallback
     paths = sorted(glob.glob(os.path.join(results_dir, f"{tag}_f*_scores.json")))
     if not paths:
         raise SystemExit(f"no files match {tag}_f*_scores.json in {results_dir}")
@@ -240,39 +277,53 @@ def fold_mean(tag):
     agg = {}
     for label in per_fold[0]:
         agg[label] = {}
-        for metric in ("Dice", "Avg. Symmetric Surface Distance"):
-            vals = [fold[label].get(metric) for fold in per_fold]
-            vals = [v for v in vals if v is not None]
-            if not vals:
+        for metric in SCORE_METRICS:
+            ms = _mean_std([fold[label].get(metric) for fold in per_fold])
+            if ms is None:
                 continue
-            m, s = float(np.mean(vals)), float(np.std(vals))
-            agg[label][metric] = {"mean": m, "std": s, "n": len(vals)}
+            agg[label][metric] = ms
             print(f"  label {label:>10} | {metric:<32} "
-                  f"{m:.4f} +/- {s:.4f}  (n={len(vals)})")
-    os.makedirs(results_dir, exist_ok=True)
+                  f"{ms['mean']:.4f} +/- {ms['std']:.4f}  (n={ms['n']})")
+    # training-cost / convergence summary, averaged over the same folds (sibling <run>_train.json)
+    train_per_fold = []
+    for p in paths:
+        tpath = p.replace("_scores.json", "_train.json")
+        if os.path.exists(tpath):
+            with open(tpath) as f:
+                train_per_fold.append(json.load(f))
+    train_agg = {}
+    if train_per_fold:
+        print(f"  -- train stats ({len(train_per_fold)}/{len(paths)} folds) --")
+        for stat in TRAIN_STATS:
+            ms = _mean_std([t.get(stat) for t in train_per_fold])
+            if ms is None:
+                continue
+            train_agg[stat] = ms
+            print(f"  {stat:<32} {ms['mean']:.4f} +/- {ms['std']:.4f}  (n={ms['n']})")
     out = os.path.join(results_dir, f"{tag}_mean_scores.json")
     with open(out, "w") as f:
-        json.dump({"tag": tag, "folds": paths, "mean": agg}, f, indent=2)
+        json.dump({"tag": tag, "folds": paths, "mean": agg, "train": train_agg}, f, indent=2)
     print(f"written to {out}")
     return agg
 
 #
-# per-label Dice/ASSD deltas of each run vs the baseline
+# per-label metric deltas (+ training-stat deltas) of each run vs the baseline
 #
 def compare_runs(paths):
     if len(paths) < 2:
         raise SystemExit("--compare needs at least two JSON files")
     baseline, others = paths[0], paths[1:]
 
+    def resolve(p):
+        """Path as given, else the same name under results/<TASK>/ (or flat results/ legacy)."""
+        if os.path.exists(p):
+            return p
+        alt = os.path.join(read_results_dir(), p)
+        return alt if os.path.exists(alt) else p
+
     def load_mean(p):
         """Flat {label: {metric: float}}, accepting per-fold or fold-mean files."""
-        actual_path = p
-        if not os.path.exists(actual_path):
-            results_dir = os.path.join(config.PROJECT_ROOT, "results")
-            alt_path = os.path.join(results_dir, p)
-            if os.path.exists(alt_path):
-                actual_path = alt_path
-        with open(actual_path) as f:
+        with open(resolve(p)) as f:
             d = json.load(f)
         kind = "fold-mean" if "mean" in d else "per-fold"
         raw = d["mean"] if kind == "fold-mean" else d["results"]["mean"]
@@ -281,6 +332,21 @@ def compare_runs(paths):
                 for label, metrics in raw.items()}
         return kind, flat
 
+    def load_train(p):
+        """Flat {stat: float} training summary, or {} if unavailable.
+        fold-mean files carry an aggregated "train" block; per-fold files have a
+        sibling <run>_train.json."""
+        path = resolve(p)
+        with open(path) as f:
+            d = json.load(f)
+        if "train" in d:   # fold-mean: {stat: {mean, std, n}}
+            return {k: (v["mean"] if isinstance(v, dict) else v) for k, v in d["train"].items()}
+        tpath = path.replace("_scores.json", "_train.json")   # per-fold sibling
+        if tpath != path and os.path.exists(tpath):
+            with open(tpath) as f:
+                return json.load(f)
+        return {}
+
     kinds = {p: load_mean(p)[0] for p in paths}
     if len(set(kinds.values())) > 1:
         print("WARNING: mixing per-fold and fold-mean files in one compare")
@@ -288,6 +354,7 @@ def compare_runs(paths):
             print(f"  {k:<10} {_run_name(p)}")
 
     base = load_mean(baseline)[1]
+    base_train = load_train(baseline)
     bname = _run_name(baseline)
     print(f"baseline : {bname}")
     for other in others:
@@ -295,12 +362,21 @@ def compare_runs(paths):
         oname = _run_name(other)
         print(f"\n{oname} vs {bname} (mean over test set)")
         for label in base:
-            for metric in ("Dice", "Avg. Symmetric Surface Distance"):
+            for metric in SCORE_METRICS:
                 bv, ov = base[label].get(metric), o[label].get(metric)
                 if bv is None or ov is None:
                     continue
                 print(f"  label {label:>10} | {metric:<32} "
                       f"{bv:.4f} -> {ov:.4f}   delta={ov - bv:+.4f}")
+        # training cost / convergence deltas (needs a train summary on both sides)
+        o_train = load_train(other)
+        if base_train and o_train:
+            print("  -- train --")
+            for stat in TRAIN_STATS:
+                bv, ov = base_train.get(stat), o_train.get(stat)
+                if bv is None or ov is None:
+                    continue
+                print(f"  {stat:>32}   {bv:>12.4f} -> {ov:>12.4f}   delta={ov - bv:+.4f}")
 
 #
 # main
@@ -453,8 +529,7 @@ def main():
         optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=6)
 
-    results_dir = os.path.join(config.PROJECT_ROOT, "results")
-    os.makedirs(results_dir, exist_ok=True)
+    results_dir = task_results_dir()
     best_path = os.path.join(results_dir, f"{stem}_best.pth")
     last_path = os.path.join(results_dir, f"{stem}_last.pth")
     if not args.test_only:
