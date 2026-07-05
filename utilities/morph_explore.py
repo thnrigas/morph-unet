@@ -748,10 +748,20 @@ def cmd_gallery(args):
     import matplotlib.pyplot as plt
     cols = [("image+label", None),
             ("top-hat r=1", lambda im: tophat(im, 1)),
+            ("bottom-hat r=1", lambda im: bottomhat(im, 1)),
+            ("gradient r=1", lambda im: gradient(im, 1)),
             ("recon-tophat", lambda im: recon_tophat(im, 1)),
+            ("line-tophat r=1", lambda im: line_tophat(im, 1)),
+            ("line-bottomhat r=1", lambda im: line_bottomhat(im, 1)),
+            ("asf-tophat r=1", lambda im: asf_tophat(im, 1)),
+            ("leveling r=1", lambda im: leveling(im, 1)),
+            ("leveling-tophat r=1", lambda im: leveling_tophat(im, 1)),
             ("h-dome 0.2", lambda im: hdome(im, 0.2)),
             ("vol-dome 0.2/50", lambda im: volume_dome(im, 0.2, 50)),
-            ("leveling", lambda im: leveling(im, 1))]
+            ("area-open 50", lambda im: area_open(im, 50)),
+            ("area-close 50", lambda im: area_close(im, 50)),
+            ("gband 1-2", lambda im: band(im, 1, 2)),
+            ("fband 1-2", lambda im: band_dark(im, 1, 2))]
     dsets = args.datasets
     fig, ax = plt.subplots(len(dsets), len(cols), figsize=(2.6 * len(cols), 2.6 * len(dsets)), squeeze=False)
     for r, ddir in enumerate(dsets):
@@ -819,7 +829,7 @@ def build_parser():
 
     ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
     ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
-    ps.add_argument("--n", type=int, default=0, help="cases to score (0 = all, the default = full survey)")
+    ps.add_argument("--n", type=int, default=25, help="cases to score (0 = all, the default = quick 25-case survey)")
     ps.add_argument("--viz", type=int, default=3, help="render panels for the first N cases")
     ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
@@ -832,10 +842,10 @@ def build_parser():
                     help="'train' (default) = only --fold's training keys (needs splits.pkl), avoids "
                          "test leakage in selection; 'all' = every case (exploration/cross-task ranking)")
     ps.add_argument("--fold", type=int, default=0)
-    ps.add_argument("--all-slices", dest="all_slices", action="store_true", default=True,
-                    help="score every foreground slice (default)")
-    ps.add_argument("--one-slice", dest="all_slices", action="store_false",
-                    help="quick: score only the densest foreground slice per case")
+    ps.add_argument("--all-slices", dest="all_slices", action="store_true",
+                    help="score every foreground slice")
+    ps.add_argument("--one-slice", dest="all_slices", action="store_false", default=False,
+                    help="quick: score only the densest foreground slice per case (default)")
     ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
                     default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
     ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 8),
