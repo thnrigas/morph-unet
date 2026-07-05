@@ -102,11 +102,14 @@ class MorphResidualUNet(nn.Module):
                 blk.set_beta(beta)
 
     def forward(self, x):
-        chans = [x]
+        # morph residuals are computed from the image channel only (ch 0); static filter
+        # channels pass through to the UNet unchanged alongside the morph outputs
+        img = x[:, :1]                    # (B, 1, H, W) — the image
+        chans = [x]                       # all input channels (image + any static filters)
         if self.tophat is not None:
-            chans.append(self.tophat(x))
+            chans.append(self.tophat(img))
         if self.bottomhat is not None:
-            chans.append(self.bottomhat(x))
+            chans.append(self.bottomhat(img))
         return self.unet(torch.cat(chans, dim=1))
 
 
@@ -134,7 +137,9 @@ class MorphBankUNet(nn.Module):
             blk.set_beta(beta)
 
     def forward(self, x):
-        chans = [x] + [blk(x) for blk in self.blocks]
+        # morph bank residuals from image channel only (ch 0); static channels pass through
+        img = x[:, :1]
+        chans = [x] + [blk(img) for blk in self.blocks]
         return self.unet(torch.cat(chans, dim=1))
 
 
@@ -145,12 +150,13 @@ class MorphBankUNet(nn.Module):
 #
 class ConvBankUNet(nn.Module):
 
-    def __init__(self, base_unet, n_extra, k=5):
+    def __init__(self, base_unet, n_extra, k=5, in_channels=1):
         super().__init__()
-        self.front = nn.Conv2d(1, n_extra, kernel_size=k, padding=k // 2)
+        self.front = nn.Conv2d(in_channels, n_extra, kernel_size=k, padding=k // 2)
         self.act = nn.ReLU(inplace=True)
         self.unet = base_unet
 
     def forward(self, x):
+        # conv front-end reads all input channels; output is cat'd alongside x
         extra = self.act(self.front(x))
         return self.unet(torch.cat([x, extra], dim=1))
