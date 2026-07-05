@@ -25,6 +25,8 @@ import argparse
 import json
 import os
 import pickle
+import subprocess
+import sys
 from functools import partial
 from multiprocessing import Pool
 import numpy as np
@@ -115,6 +117,89 @@ def gradient(img, r):
     from scipy.ndimage import grey_dilation, grey_erosion
     fp = _footprint(img.ndim, r)
     return np.clip(grey_dilation(img, footprint=fp) - grey_erosion(img, footprint=fp), 0, None)
+
+
+def recon_tophat(img, r):
+    """reconstruction top-hat = img - opening-by-reconstruction. Marker = erosion(img, disk_r)
+    kills thin/small bright structures; geodesic reconstruction under `img` regrows the SURVIVORS
+    to their exact original shape (no corner rounding, unlike the plain disk top-hat), so the
+    residual is a boundary-faithful map of the removed thin structures. Non-differentiable
+    (iterative reconstruction) -> static channel only, not a trainable SE block."""
+    from scipy.ndimage import grey_erosion
+    from skimage.morphology import reconstruction
+    marker = grey_erosion(img, footprint=_footprint(img.ndim, r))
+    opened = reconstruction(marker, img, method="dilation")
+    return np.clip(img - opened, 0, None)
+
+
+def hdome(img, h):
+    """h-dome = img - reconstruction(img - h, img). Extracts every bright peak/ridge that rises
+    more than height `h` above its local surroundings, size- and shape-agnostically (no radius
+    to pick), robust to the exact `h`. Non-differentiable (iterative) -> static channel only."""
+    from skimage.morphology import reconstruction
+    rec = reconstruction(img - float(h), img, method="dilation")
+    return np.clip(img - rec, 0, None)
+
+
+def area_open(img, area):
+    """area opening: drop bright connected components smaller than `area` pixels, keeping the rest
+    at their exact shape. A denoiser -- thin long vessels (large area) survive, small bright blobs
+    don't. Use as a cleaned input channel (precision), not as a residual. Static."""
+    from skimage.morphology import area_opening
+    return area_opening(img.astype(np.float32), area_threshold=int(area))
+
+
+def area_close(img, area):
+    """area closing (dual of area_open): fill dark components smaller than `area` -- bridges small
+    dark gaps in the bright vessel tree (recall). Static."""
+    from skimage.morphology import area_closing
+    return area_closing(img.astype(np.float32), area_threshold=int(area))
+
+
+def volume_dome(img, h, area):
+    """area-gated h-dome (cv18 'volume' marker): keep only bright domes that are BOTH high-contrast
+    (rise > h) AND large enough (>= `area` px). Vessels are high-contrast and large-area, so this
+    isolates them better than contrast or size alone. Static (non-differentiable)."""
+    return area_open(hdome(img, h), area)
+
+
+def asf(img, r):
+    """alternating sequential filter: cascade opening-then-closing at radii 1..r (multiscale,
+    edge-respecting simplification / denoise). Static."""
+    from scipy.ndimage import grey_opening, grey_closing
+    out = img
+    for rr in range(1, int(r) + 1):
+        fp = _footprint(out.ndim, rr)
+        out = grey_closing(grey_opening(out, footprint=fp), footprint=fp)
+    return out
+
+
+def asf_tophat(img, r):
+    """img - ASF: the bright detail the ASF removed (multiscale top-hat). Cleaner thin-structure
+    highlighter than a single-scale opening. Static."""
+    return np.clip(img - asf(img, r), 0, None)
+
+
+def leveling(img, r, iters=30):
+    """morphological leveling toward a Gaussian marker (sigma=r): edge-preserving simplification --
+    flattens small fluctuations WITHOUT blurring or shifting strong contours. Iterate the marker
+    g <- (f wedge dilate(g)) vee erode(g) to (near) idempotence. Static."""
+    from scipy.ndimage import gaussian_filter, grey_dilation, grey_erosion
+    f = img.astype(np.float32)
+    g = gaussian_filter(f, sigma=float(r))
+    fp = _footprint(f.ndim, 1)
+    for _ in range(int(iters)):
+        g_new = np.maximum(np.minimum(f, grey_dilation(g, footprint=fp)), grey_erosion(g, footprint=fp))
+        if np.abs(g_new - g).max() < 1e-5:
+            g = g_new
+            break
+        g = g_new
+    return g
+
+
+def leveling_tophat(img, r):
+    """img - leveling: fine bright detail the leveling simplified away. Static."""
+    return np.clip(img - leveling(img, r), 0, None)
 
 
 def _line_footprint(length, angle):
@@ -306,37 +391,92 @@ def render_grid(img2d, label2d, radii, bands, out, dark_bands=()):
     plt.close(fig)
 
 
+def render_all(img2d, label2d, r, h, area, out, show):
+    """Grid of EVERY filter in the library at the given radius / h / area, with the label contour
+    overlaid, so a single case shows the full vocabulary (trainable + static) side by side."""
+    import matplotlib.pyplot as plt
+    lo = max(r - 1, 1)
+    panels = [
+        ("image", img2d, "gray", False),
+        ("image + label", img2d, "gray", True),
+        (f"top-hat r={r}", tophat(img2d, r), "magma", True),
+        (f"bottom-hat r={r}", bottomhat(img2d, r), "magma", True),
+        (f"gradient r={r}", gradient(img2d, r), "magma", True),
+        (f"recon-tophat r={r}", recon_tophat(img2d, r), "magma", True),
+        (f"line-tophat r={r}", line_tophat(img2d, r), "magma", True),
+        (f"line-bottomhat r={r}", line_bottomhat(img2d, r), "magma", True),
+        (f"asf-tophat r={r}", asf_tophat(img2d, r), "magma", True),
+        (f"leveling r={r}", leveling(img2d, r), "gray", True),
+        (f"leveling-tophat r={r}", leveling_tophat(img2d, r), "magma", True),
+        (f"h-dome h={h}", hdome(img2d, h), "magma", True),
+        (f"volume-dome h={h} a={area}", volume_dome(img2d, h, area), "magma", True),
+        (f"area-open a={area} (denoise)", area_open(img2d, area), "gray", True),
+        (f"area-close a={area} (bridge)", area_close(img2d, area), "gray", True),
+        (f"gband {lo}-{r}", band(img2d, lo, r), "magma", True),
+        (f"fband {lo}-{r}", band_dark(img2d, lo, r), "magma", True),
+    ]
+    ncol = 5
+    nrow = (len(panels) + ncol - 1) // ncol
+    fig, ax = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 3.0 * nrow))
+    axf = ax.ravel()
+    has_lbl = label2d is not None and label2d.max() > 0
+    for a, (title, m, cmap, cont) in zip(axf, panels):
+        a.imshow(m, cmap=cmap); a.set_title(title, fontsize=8)
+        if cont and has_lbl:
+            a.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.5)
+    for a in axf:
+        a.axis("off")
+    fig.tight_layout()
+    if out:
+        fig.savefig(out, dpi=120, bbox_inches="tight"); print(f"saved grid -> {out}")
+        # also save one PNG per filter next to the grid: <stem>_<filter>.png
+        stem, ext = os.path.splitext(out)
+        ext = ext or ".png"
+        for title, m, cmap, cont in panels:
+            f2, a2 = plt.subplots(figsize=(4, 4))
+            a2.imshow(m, cmap=cmap); a2.set_title(title, fontsize=10); a2.axis("off")
+            if cont and has_lbl:
+                a2.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.7)
+            safe = title.replace(" ", "_").replace("=", "").replace("/", "-")
+            f2.savefig(f"{stem}_{safe}{ext}", dpi=120, bbox_inches="tight"); plt.close(f2)
+        print(f"saved {len(panels)} per-filter PNGs -> {stem}_<filter>{ext}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 #
 # subcommand: explore (single case)
 #
 def cmd_explore(args):
     raw = load_any(args.path)
-    stacked = raw.ndim >= 3 and raw.shape[0] == 4      # (img, top, bot, label)
-    if stacked:
+    label = None
+    if raw.ndim >= 3 and raw.shape[0] == 4:            # legacy stack (img, top, bot, label)
         image, label = raw[0], raw[3]
-        th, bh = (None, None) if args.fresh else (raw[1], raw[2])
+    elif raw.ndim >= 3 and raw.shape[0] == 2:          # current stack (img, label)
+        image, label = raw[0], raw[1]
     else:
         image = raw[0] if (raw.ndim >= 3 and raw.shape[0] == 1) else raw
-        label = load_any(args.label) if args.label else None
-        th = bh = None
+    if args.label:
+        label = load_any(args.label)
 
     image = norm01(image)
-    if th is None or bh is None:
-        th, bh = tophat(image, args.se_radius), bottomhat(image, args.se_radius)
-
     sel = pick_slice(label if label is not None else image, args.slice)
+    img2d = take(image, sel)
+    lbl2d = take(label, sel) if label is not None else None
     print(f"input: {os.path.basename(args.path)}  shape={image.shape}  "
-          f"se_radius={args.se_radius}  slice={sel}")
-    if label is not None:
-        for name, res in (("TOP-HAT", th), ("BOTTOM-HAT", bh)):
-            s = region_stats(res, label)
+          f"se_radius={args.se_radius} h={args.h} area={args.area}  slice={sel}")
+    if lbl2d is not None:
+        for name, res in (("top-hat", tophat(img2d, args.se_radius)),
+                          ("recon-tophat", recon_tophat(img2d, args.se_radius)),
+                          ("h-dome", hdome(img2d, args.h)),
+                          ("volume-dome", volume_dome(img2d, args.h, args.area))):
+            s = region_stats(res, lbl2d)
             if s:
-                print(f"{name}: enrichment(bnd/bg)={s['enrichment']:.1f}x  "
-                      f"concentration(on-target/area)={s['concentration']:.2f}x  "
-                      f"%energy on target={s['pct_on_target']:.1f} (area {s['target_area_pct']:.1f}%)")
+                print(f"  {name:13s} concentration={s['concentration']:.2f}x  "
+                      f"enrichment={s['enrichment']:.1f}x  %energy-on-target={s['pct_on_target']:.1f}")
 
-    render_single(take(image, sel), take(th, sel), take(bh, sel),
-                  take(label, sel), args.out, show=not args.no_show)
+    render_all(img2d, lbl2d, args.se_radius, args.h, args.area, args.out, show=not args.no_show)
 
 
 #
@@ -346,10 +486,12 @@ def cmd_explore(args):
 METRICS = ("concentration", "enrichment", "auc", "fisher")   # accumulated per residual
 
 
-def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, all_slices):
-    """Accumulate the per-residual metric sums over a case's foreground slices.
+def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, all_slices,
+                 h_values=(), areas=(), classes=()):
+    """Accumulate the per-(residual, class) metric sums over a case's foreground slices.
     Slices spatial axis 0 to match the training loader (NumpyDataLoader always slices axis 0),
-    so selection is measured on the exact plane the network trains on. Module-level (picklable)."""
+    so selection is measured on the exact plane the network trains on. Scores each labelled class
+    separately (plus the pooled 'all') so e.g. Vessel and Tumour rank independently. Picklable."""
     img = preprocess(load_any(os.path.join(image_dir, fn)), mod, channel, n_mod)
     lbl = load_any(os.path.join(label_dir, fn))
     if lbl.ndim == 4:
@@ -362,15 +504,21 @@ def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, al
         counts = (lbl > 0).sum(axis=tuple(i for i in range(lbl.ndim) if i != axis))
         idxs = [int(i) for i in np.where(counts > 0)[0]] if all_slices else [int(counts.argmax())]
 
-    acc = {}   # key -> [conc_sum, enrich_sum, auc_sum, fisher_sum, count]
+    acc = {}   # (key, class) -> [conc_sum, enrich_sum, auc_sum, fisher_sum, count]
+    # score against the pooled foreground ("all") and each labelled class independently
+    targets = [(None, "all")] + list(classes)
 
     def note(key, res, lbl2d):
-        s = region_stats(res, lbl2d)
-        if s:
-            a = acc.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0])
-            for i, m in enumerate(METRICS):
-                a[i] += s[m]
-            a[4] += 1
+        for cid, cname in targets:
+            mask = (lbl2d > 0) if cid is None else (lbl2d == cid)
+            if not mask.any():
+                continue
+            s = region_stats(res, mask)
+            if s:
+                a = acc.setdefault((key, cname), [0.0, 0.0, 0.0, 0.0, 0])
+                for i, m in enumerate(METRICS):
+                    a[i] += s[m]
+                a[4] += 1
 
     for idx in idxs:
         img2d = img if idx is None else np.take(img, idx, axis=axis)
@@ -379,8 +527,15 @@ def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, al
             note(f"tophat r={r}", tophat(img2d, r), lbl2d)
             note(f"bottomhat r={r}", bottomhat(img2d, r), lbl2d)
             note(f"gradient r={r}", gradient(img2d, r), lbl2d)
-            note(f"ltophat r={r}", line_tophat(img2d, r), lbl2d)         # diagnostic (oriented, bright)
-            note(f"lbottomhat r={r}", line_bottomhat(img2d, r), lbl2d)   # diagnostic (oriented, dark)
+            note(f"ltophat r={r}", line_tophat(img2d, r), lbl2d)          # diagnostic (oriented, bright)
+            note(f"lbottomhat r={r}", line_bottomhat(img2d, r), lbl2d)    # diagnostic (oriented, dark)
+            note(f"recontophat r={r}", recon_tophat(img2d, r), lbl2d)     # static (connected, boundary-faithful)
+            note(f"asftophat r={r}", asf_tophat(img2d, r), lbl2d)         # static (multiscale simplification residual)
+            note(f"leveltophat r={r}", leveling_tophat(img2d, r), lbl2d)  # static (leveling residual, edge-preserving)
+        for h in h_values:
+            note(f"hdome h={h}", hdome(img2d, h), lbl2d)                  # static (connected, contrast, radius-free)
+            for area in areas:
+                note(f"vdome h={h} a={area}", volume_dome(img2d, h, area), lbl2d)   # static (cv18 volume: contrast+area)
         for lo, hi in bands:
             note(f"gband {lo}-{hi}", band(img2d, lo, hi), lbl2d)
             note(f"fband {lo}-{hi}", band_dark(img2d, lo, hi), lbl2d)
@@ -389,9 +544,10 @@ def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, al
 
 def _select_spec(rows, k):
     """--morph-bank spec from the ranking: top-k distinct (mode, radius) among the modes that
-    have a trainable SoftMorph2D block (tophat/bottomhat/gradient). Bands and line top-hats are
-    diagnostic only — bands are redundant (the U-Net synthesises them) and oriented line SEs
-    aren't representable by the disk-initialised trainable block."""
+    have a trainable SoftMorph2D block (tophat/bottomhat/gradient). Bands, line top-hats and the
+    connected operators (recontophat/hdome) are diagnostic only — bands are redundant (the U-Net
+    synthesises them), oriented line SEs aren't representable by the disk-initialised trainable
+    block, and the connected operators are non-differentiable (usable only as STATIC channels)."""
     picked = []
     for row in rows:
         key = row["key"]
@@ -403,8 +559,42 @@ def _select_spec(rows, k):
     return ",".join(f"{m}:{r}" for m, r in picked)
 
 
+# mapping from survey key prefix → augment_channels.py filter spec
+_STATIC_KEY_MAP = {
+    "recontophat r=": lambda key: f"recontophat:{key.split('r=')[1]}",
+    "asftophat r=":   lambda key: f"asftophat:{key.split('r=')[1]}",
+    "leveltophat r=": lambda key: f"leveltophat:{key.split('r=')[1]}",
+    "hdome h=":       lambda key: f"hdome:{key.split('h=')[1]}",
+    "vdome h=":       lambda key: _vdome_spec(key),
+}
+
+def _vdome_spec(key):
+    # "vdome h=0.1 a=50" → "vdome:0.1:50"
+    parts = key.split()
+    h = parts[1].split("=")[1]
+    a = parts[2].split("=")[1]
+    return f"vdome:{h}:{a}"
+
+
+def _select_static(rows, k):
+    """Top-k static (non-differentiable) filters from the ranking, formatted as
+    augment_channels.py --filters specs. These are the connected/oriented operators
+    that can't be trainable SE blocks and must be pre-computed as static input channels."""
+    picked = []
+    for row in rows:
+        key = row["key"]
+        for prefix, to_spec in _STATIC_KEY_MAP.items():
+            if key.startswith(prefix) and len(picked) < k:
+                spec = to_spec(key)
+                if spec not in picked:
+                    picked.append(spec)
+                break
+    return picked
+
+
 def cmd_survey(args):
-    modality, _ = load_meta(args.dataset_dir)
+    modality, labels = load_meta(args.dataset_dir)
+    classes = [(int(k), v) for k, v in labels.items() if int(k) != 0]   # foreground classes for per-class scoring
     mod = modality[str(args.channel)] if str(args.channel) in modality else modality.get("0", "MRI")
     task = os.path.basename(args.dataset_dir.rstrip("/"))
     os.makedirs(args.out_dir, exist_ok=True)
@@ -442,7 +632,8 @@ def cmd_survey(args):
 
     # parallel per-case accumulation over all foreground slices (or one, per --all-slices)
     worker = partial(_survey_case, image_dir=img_dir, label_dir=lbl_dir, mod=mod, channel=args.channel,
-                     n_mod=len(modality), radii=args.radii, bands=bands, all_slices=args.all_slices)
+                     n_mod=len(modality), radii=args.radii, bands=bands, all_slices=args.all_slices,
+                     h_values=args.h_values, areas=args.areas, classes=classes)
     total, n_slices = {}, 0
     print(f"surveying {len(cases)} cases ({tag}, all_slices={args.all_slices}, workers={args.workers}) ...", flush=True)
 
@@ -464,25 +655,40 @@ def cmd_survey(args):
         for fn in cases:
             consume(worker(fn))
 
-    # per-residual metric means, plus a combined selectivity x discriminability score
+    # per-(residual, class) metric means, plus a combined selectivity x discriminability score
     rows = []
-    for key, t in total.items():
+    for (key, cls), t in total.items():
         if t[4] > 0:
-            row = {"key": key, **{m: t[i] / t[4] for i, m in enumerate(METRICS)}}
+            row = {"key": key, "class": cls, **{m: t[i] / t[4] for i, m in enumerate(METRICS)}}
             row["conc_auc"] = row["concentration"] * row["auc"]
             rows.append(row)
     rows.sort(key=lambda r: r[args.rank_by], reverse=True)
-    spec = _select_spec(rows, args.top_k)
+    # the trainable-bank / static specs are selected from the pooled 'all' ranking (train pipeline
+    # consumes one spec per fold); the per-class tables below are diagnostic
+    pooled = [r for r in rows if r["class"] == "all"]
+    spec = _select_spec(pooled, args.top_k)
+    static_specs = _select_static(pooled, args.top_k)
 
     cols = ["concentration", "enrichment", "auc", "fisher", "conc_auc"]
+    order = ["all"] + [cn for _, cn in classes]
+    classes_present = [c for c in order if any(r["class"] == c for r in rows)]
     head = [f"===== SUMMARY  {task}  ({tag}, modality={mod}, {len(cases)} cases, {n_slices} slices, "
-            f"rank-by={args.rank_by}) =====",
-            f"{'residual':13s} " + " ".join(f"{c:>13s}" for c in cols)]
-    for row in rows:
-        head.append(f"{row['key']:13s} " + " ".join(f"{row[c]:13.3f}" for c in cols))
-    if rows:
-        head.append(f">>> best ({args.rank_by}) = {rows[0][args.rank_by]:.3f}  ({rows[0]['key']})")
-        head.append(f">>> selected --morph-bank \"{spec}\"")
+            f"rank-by={args.rank_by}) ====="]
+    for cls in classes_present:
+        crows = sorted((r for r in rows if r["class"] == cls), key=lambda r: r[args.rank_by], reverse=True)
+        head.append(f"\n--- class: {cls} ---")
+        head.append(f"{'residual':13s} " + " ".join(f"{c:>13s}" for c in cols))
+        for row in crows:
+            head.append(f"{row['key']:13s} " + " ".join(f"{row[c]:13.3f}" for c in cols))
+        if crows:
+            head.append(f">>> best {cls} ({args.rank_by}) = {crows[0][args.rank_by]:.3f}  ({crows[0]['key']})")
+    head.append("")
+    if pooled:
+        head.append(f">>> selected --morph-bank \"{spec}\"  (from pooled 'all')")
+        if static_specs:
+            head.append(f">>> selected --filters {' '.join(static_specs)}")
+            head.append(f">>>   augment_channels.py --filters {' '.join(static_specs)}")
+            head.append(f">>>   train_eval.py --static-channels {len(static_specs)}")
     print("\n".join(head))
     out_path = os.path.join(args.out_dir, f"{task}_{tag}_stats.txt")
     with open(out_path, "w") as f:
@@ -497,7 +703,103 @@ def cmd_survey(args):
     bank[str(args.fold)] = spec
     with open(bank_path, "w") as f:
         json.dump(bank, f, indent=2)
-    print(f"\n[written] {out_path}\n[written] {bank_path}  (fold {args.fold} -> \"{spec}\")")
+
+    # machine-readable static handoff: fold -> list of filter specs for augment_channels.py
+    static_path = os.path.join(args.out_dir, f"{task}_static.json")
+    static_bank = {}
+    if os.path.exists(static_path):
+        with open(static_path) as f:
+            static_bank = json.load(f)
+    static_bank[str(args.fold)] = static_specs
+    with open(static_path, "w") as f:
+        json.dump(static_bank, f, indent=2)
+
+    print(f"\n[written] {out_path}")
+    print(f"[written] {bank_path}  (fold {args.fold} -> \"{spec}\")")
+    if static_specs:
+        print(f"[written] {static_path}  (fold {args.fold} -> {static_specs})")
+
+    # --augment: precompute the selected static filters into a per-fold augmented dir, so the whole
+    # static pipeline (survey -> select top-k -> precompute) is one command. train_eval just consumes
+    # the printed --static-dir / --static-channels; no survey/augment logic lives in the trainer.
+    if args.augment and static_specs:
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # project root
+        aug = os.path.join(root_dir, "augment_channels.py")
+        src = os.path.join(args.dataset_dir, "preprocessed")
+        out = os.path.join(args.dataset_dir, f"preprocessed_static_f{args.fold}")
+        if not os.path.isdir(src):
+            print(f"[augment] SKIPPED: preprocessed dir not found ({src}). Run run_preprocessing.py first.")
+        else:
+            print(f"\n[augment] precomputing {len(static_specs)} static channels -> {out}", flush=True)
+            subprocess.run([sys.executable, aug, "--filters", *static_specs,
+                            "--src", src, "--out", out, "--workers", str(args.workers)], check=True)
+            print(f">>> ready. train with:\n>>>   python train_eval.py --tag static_cv18 "
+                  f"--static-dir {out} --static-channels {len(static_specs)} --fold {args.fold}")
+
+
+#
+# subcommand: gallery (cross-dataset montage) — one row per MSD task dir, key filters as columns,
+# with modality-aware preprocessing (CT windowing / MRI norm) so raw NIfTI is faithful, unlike
+# explore's plain norm01. Picks each dataset's densest-foreground slice automatically.
+#
+def cmd_gallery(args):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    cols = [("image+label", None),
+            ("top-hat r=1", lambda im: tophat(im, 1)),
+            ("bottom-hat r=1", lambda im: bottomhat(im, 1)),
+            ("gradient r=1", lambda im: gradient(im, 1)),
+            ("recon-tophat", lambda im: recon_tophat(im, 1)),
+            ("line-tophat r=1", lambda im: line_tophat(im, 1)),
+            ("line-bottomhat r=1", lambda im: line_bottomhat(im, 1)),
+            ("asf-tophat r=1", lambda im: asf_tophat(im, 1)),
+            ("leveling r=1", lambda im: leveling(im, 1)),
+            ("leveling-tophat r=1", lambda im: leveling_tophat(im, 1)),
+            ("h-dome 0.2", lambda im: hdome(im, 0.2)),
+            ("vol-dome 0.2/50", lambda im: volume_dome(im, 0.2, 50)),
+            ("area-open 50", lambda im: area_open(im, 50)),
+            ("area-close 50", lambda im: area_close(im, 50)),
+            ("gband 1-2", lambda im: band(im, 1, 2)),
+            ("fband 1-2", lambda im: band_dark(im, 1, 2))]
+    dsets = args.datasets
+    fig, ax = plt.subplots(len(dsets), len(cols), figsize=(2.6 * len(cols), 2.6 * len(dsets)), squeeze=False)
+    for r, ddir in enumerate(dsets):
+        try:
+            modality, _ = load_meta(ddir)
+            mod = modality.get("0", "MRI")
+            ig, lg = os.path.join(ddir, "imagesTr"), os.path.join(ddir, "labelsTr")
+            cases = sorted(f for f in os.listdir(ig) if f.endswith(".nii.gz") and not f.startswith("."))
+            best = None
+            for fn in cases[:args.scan]:                 # pick the densest-foreground case
+                lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+                fgv = (lbl > 0).sum()
+                if best is None or fgv > best[1]:
+                    best = (fn, fgv)
+            fn = best[0]
+            img = preprocess(load_any(os.path.join(ig, fn)), mod, 0, len(modality))
+            lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+            img = align_axes(img, lbl); sel = pick_slice(lbl)
+            i2, l2 = take(img, sel), take(lbl, sel)
+            for c, (name, fnf) in enumerate(cols):
+                a = ax[r][c]
+                a.imshow(i2 if fnf is None else fnf(i2), cmap="gray" if fnf is None else "magma")
+                if l2 is not None and l2.max() > 0:
+                    a.contour(l2, levels=np.arange(0.5, l2.max() + 1), colors="cyan", linewidths=0.4)
+                if r == 0:
+                    a.set_title(name, fontsize=9)
+                if c == 0:
+                    a.set_ylabel(f"{os.path.basename(ddir.rstrip('/'))}\n({mod})", fontsize=7)
+                a.set_xticks([]); a.set_yticks([])
+            print(f"{os.path.basename(ddir)}: {fn}", flush=True)
+        except Exception as e:
+            print(f"{ddir}: FAILED {type(e).__name__}: {e}", flush=True)
+            for c in range(len(cols)):
+                ax[r][c].axis("off")
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    fig.savefig(args.out, dpi=100, bbox_inches="tight"); plt.close(fig)
+    print(f"[written] {args.out}")
 
 
 #
@@ -512,18 +814,30 @@ def build_parser():
     pe.add_argument("--label", help="separate label file (when not a 4-channel stack)")
     pe.add_argument("--fresh", action="store_true", help="ignore precomputed channels; recompute morphology")
     pe.add_argument("--se-radius", type=int, default=2)
+    pe.add_argument("--h", type=float, default=0.1, help="h-dome / volume-dome height (normalised intensity)")
+    pe.add_argument("--area", type=int, default=100, help="area threshold (px) for volume-dome / area ops")
     pe.add_argument("--slice", type=int, default=None, help="force axis-0 slice (3D)")
     pe.add_argument("--out", default=None, help="save the figure (PNG)")
     pe.add_argument("--no-show", action="store_true")
     pe.set_defaults(func=cmd_explore)
 
+    pg = sub.add_parser("gallery", help="cross-dataset filter montage (modality-aware, faithful)")
+    pg.add_argument("datasets", nargs="+", help="one or more MSD task dirs (data/TaskXX ...)")
+    pg.add_argument("--out", default="results/explore/gallery.png", help="output PNG")
+    pg.add_argument("--scan", type=int, default=6, help="cases scanned per dataset to pick the densest")
+    pg.set_defaults(func=cmd_gallery)
+
     ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
     ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
-    ps.add_argument("--n", type=int, default=8, help="cases to score (0 = all)")
+    ps.add_argument("--n", type=int, default=25, help="cases to score (0 = all, the default = quick 25-case survey)")
     ps.add_argument("--viz", type=int, default=3, help="render panels for the first N cases")
     ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
     ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
+    ps.add_argument("--h-values", dest="h_values", type=float, nargs="+", default=[0.05, 0.1, 0.2],
+                    help="h-dome heights in normalised intensity units (static connected operator)")
+    ps.add_argument("--areas", type=int, nargs="+", default=[50, 150],
+                    help="area thresholds (px) for the area-gated volume-domes (static)")
     ps.add_argument("--split", choices=["all", "train"], default="train",
                     help="'train' (default) = only --fold's training keys (needs splits.pkl), avoids "
                          "test leakage in selection; 'all' = every case (exploration/cross-task ranking)")
@@ -534,9 +848,13 @@ def build_parser():
                     help="quick: score only the densest foreground slice per case")
     ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
                     default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
-    ps.add_argument("--workers", type=int, default=1, help="parallel worker processes")
-    ps.add_argument("--top-k", type=int, default=4, help="how many (mode,radius) to auto-select for --morph-bank")
+    ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 8),
+                    help="parallel worker processes (default: cpu count capped at 8, min 1)")
+    ps.add_argument("--top-k", type=int, default=5, help="how many trainable + static filters to auto-select")
     ps.add_argument("--out-dir", default="results/explore")
+    ps.add_argument("--augment", action="store_true",
+                    help="after selecting top-k static filters, precompute them into "
+                         "<data>/preprocessed_static_f<fold>/ (survey -> select -> preprocess, one command)")
     ps.set_defaults(func=cmd_survey)
     return p
 
@@ -545,7 +863,7 @@ def main():
     import sys
     argv = sys.argv[1:]
     # backward-compat: `morph_explore.py <path> ...` -> `explore <path> ...`
-    if argv and argv[0] not in ("explore", "survey", "-h", "--help"):
+    if argv and argv[0] not in ("explore", "survey", "gallery", "-h", "--help"):
         argv = ["explore"] + argv
     args = build_parser().parse_args(argv)
     args.func(args)
