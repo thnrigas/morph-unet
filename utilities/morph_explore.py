@@ -842,10 +842,10 @@ def build_parser():
                     help="'train' (default) = only --fold's training keys (needs splits.pkl), avoids "
                          "test leakage in selection; 'all' = every case (exploration/cross-task ranking)")
     ps.add_argument("--fold", type=int, default=0)
-    ps.add_argument("--all-slices", dest="all_slices", action="store_true",
-                    help="score every foreground slice")
-    ps.add_argument("--one-slice", dest="all_slices", action="store_false", default=False,
-                    help="quick: score only the densest foreground slice per case (default)")
+    ps.add_argument("--all-slices", dest="all_slices", action="store_true", default=True,
+                    help="score every foreground slice (default)")
+    ps.add_argument("--one-slice", dest="all_slices", action="store_false",
+                    help="quick: score only the densest foreground slice per case")
     ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
                     default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
     ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 8),

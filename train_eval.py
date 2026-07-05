@@ -84,10 +84,10 @@ def _read_static_spec(task, fold, root="results/explore"):
     return bank.get(str(fold))
 
 
-def _run_survey(task, fold, dataset_dir, top_k, workers, root, n=0):
-    """Run the FULL morphology survey once (all-slices, train-split, n cases; n=0 = all cases),
+def _run_survey(task, fold, dataset_dir, top_k, workers, root, n=25):
+    """Run the morphology survey once (all-slices, train-split, n cases; n=0 = all cases),
     writing both _bank.json and _static.json for this fold."""
-    print(f"[auto] no cached spec for {task} fold {fold}; running full survey "
+    print(f"[auto] no cached spec for {task} fold {fold}; running survey "
           f"(n={'all' if n == 0 else n} cases, all slices, train split) ...", flush=True)
     subprocess.run([sys.executable, os.path.join("utilities", "morph_explore.py"), "survey",
                     str(dataset_dir), "--fold", str(fold), "--top-k", str(top_k),
@@ -453,8 +453,8 @@ def main():
     p.add_argument("--morph-beta-final", type=float, default=30.0)
     p.add_argument("--survey-top-k", type=int, default=5)
     p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 8))
-    p.add_argument("--survey-n", type=int, default=0,
-                   help="cases the auto survey scores (0 = all = full survey); all-slices, train split")
+    p.add_argument("--survey-n", type=int, default=25,
+                   help="cases the auto survey scores (0 = all); all-slices, train split")
     p.add_argument("--freeze-se", action="store_true")
     # training parameters
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
