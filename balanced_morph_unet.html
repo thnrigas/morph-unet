@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+</head><body>
+<title>Balanced Morph-U-Net</title>
+<style>
+  :root{
+    --bg:#eef1f5; --surface:#ffffff; --surface-2:#f6f8fb;
+    --ink:#182430; --muted:#5d6b7a; --line:#d6dde6;
+    --conv:#35618e; --conv-ink:#ffffff;
+    --morph:#b56a17; --morph-ink:#ffffff;
+    --accent:#b56a17;
+    --flow:#3b4a5a; --skip:#94a3b4;
+    --chip:#eef2f7; --chip-ink:#2b3a49;
+    --shadow:0 1px 2px rgba(20,34,48,.06),0 6px 20px rgba(20,34,48,.07);
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0e141b; --surface:#161f29; --surface-2:#111923;
+      --ink:#e7eef4; --muted:#93a3b3; --line:#273441;
+      --conv:#4a79ad; --conv-ink:#f2f7fc;
+      --morph:#dd9236; --morph-ink:#1a1206;
+      --accent:#dd9236;
+      --flow:#7d8ea0; --skip:#5a6b7c;
+      --chip:#1d2833; --chip-ink:#c6d3df;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#eef1f5; --surface:#ffffff; --surface-2:#f6f8fb;
+    --ink:#182430; --muted:#5d6b7a; --line:#d6dde6;
+    --conv:#35618e; --conv-ink:#ffffff; --morph:#b56a17; --morph-ink:#ffffff;
+    --accent:#b56a17; --flow:#3b4a5a; --skip:#94a3b4;
+    --chip:#eef2f7; --chip-ink:#2b3a49;
+    --shadow:0 1px 2px rgba(20,34,48,.06),0 6px 20px rgba(20,34,48,.07);
+  }
+  :root[data-theme="dark"]{
+    --bg:#0e141b; --surface:#161f29; --surface-2:#111923;
+    --ink:#e7eef4; --muted:#93a3b3; --line:#273441;
+    --conv:#4a79ad; --conv-ink:#f2f7fc; --morph:#dd9236; --morph-ink:#1a1206;
+    --accent:#dd9236; --flow:#7d8ea0; --skip:#5a6b7c;
+    --chip:#1d2833; --chip-ink:#c6d3df;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.35);
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--ink);font-family:var(--sans);
+    line-height:1.55;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:1000px;margin:0 auto;padding:clamp(20px,4vw,52px) clamp(16px,4vw,32px);}
+
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--accent);margin:0 0 10px;font-weight:600;}
+  h1{font-size:clamp(26px,4.4vw,40px);line-height:1.08;margin:0 0 12px;font-weight:700;
+    letter-spacing:-.02em;text-wrap:balance;}
+  .lede{font-size:clamp(15px,1.7vw,17px);color:var(--muted);margin:0;max-width:64ch;}
+
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:16px;
+    box-shadow:var(--shadow);}
+  .diagram{margin:30px 0 18px;padding:18px 14px 8px;overflow-x:auto;}
+  .diagram svg{display:block;width:100%;min-width:640px;height:auto;}
+
+  /* SVG element styling via tokens */
+  .box-conv rect{fill:var(--conv);}
+  .box-morph rect{fill:var(--morph);}
+  .box rect{rx:11;stroke:rgba(0,0,0,.10);stroke-width:1;}
+  .b-name{font-family:var(--sans);font-weight:600;font-size:13px;}
+  .b-ch{font-family:var(--mono);font-weight:700;font-size:17px;}
+  .b-res{font-family:var(--mono);font-size:11px;}
+  .box-conv text{fill:var(--conv-ink);} .box-morph text{fill:var(--morph-ink);}
+  .box-conv .b-res,.box-morph .b-res{opacity:.72;}
+  .flow{stroke:var(--flow);stroke-width:2.4;fill:none;}
+  .skip{stroke:var(--skip);stroke-width:2;fill:none;stroke-dasharray:6 5;}
+  .io rect{fill:none;stroke:var(--line);stroke-width:1.4;rx:8;}
+  .io-t{font-family:var(--mono);font-size:11.5px;fill:var(--muted);}
+  .edge-lbl{font-family:var(--mono);font-size:10.5px;fill:var(--muted);}
+
+  .legend{display:flex;flex-wrap:wrap;gap:8px 18px;padding:2px 6px 4px;font-size:12.5px;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:7px;}
+  .sw{width:14px;height:14px;border-radius:4px;display:inline-block;}
+  .sw.conv{background:var(--conv);} .sw.morph{background:var(--morph);}
+  .sw.skip{height:0;width:18px;border-top:2px dashed var(--skip);border-radius:0;}
+  .sw.flow{height:0;width:18px;border-top:2.4px solid var(--flow);border-radius:0;}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:22px;}
+  @media (max-width:720px){.grid2{grid-template-columns:1fr;}}
+  .panel{padding:20px 22px;}
+  .panel h2{font-size:15px;margin:0 0 4px;letter-spacing:-.01em;}
+  .panel .sub{font-family:var(--mono);font-size:11px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.08em;margin:0 0 16px;}
+
+  .pipe{display:flex;flex-direction:column;gap:10px;}
+  .stagebar{font-family:var(--mono);font-size:11.5px;color:var(--muted);}
+  .flowrow{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;}
+  .step{background:var(--surface-2);border:1px solid var(--line);border-radius:10px;
+    padding:9px 11px;font-size:12.5px;line-height:1.3;flex:1 1 auto;min-width:0;}
+  .step b{display:block;font-size:12.5px;}
+  .step small{color:var(--muted);font-family:var(--mono);font-size:10.5px;}
+  .step.morph{border-color:color-mix(in srgb,var(--morph) 55%,var(--line));
+    background:color-mix(in srgb,var(--morph) 12%,var(--surface));}
+  .arrow{align-self:center;color:var(--muted);font-weight:700;flex:0 0 auto;}
+  .note{margin:14px 0 0;font-size:12.5px;color:var(--muted);}
+  .note b{color:var(--ink);font-weight:600;}
+
+  .eq{font-family:var(--mono);font-size:13px;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:10px;padding:14px 15px;line-height:1.95;overflow-x:auto;}
+  .eq .op{color:var(--accent);font-weight:700;}
+  .eq .mut{color:var(--muted);}
+  ul.facts{list-style:none;padding:0;margin:14px 0 0;display:flex;flex-direction:column;gap:8px;}
+  ul.facts li{font-size:12.8px;padding-left:18px;position:relative;color:var(--ink);}
+  ul.facts li::before{content:"";position:absolute;left:0;top:7px;width:8px;height:8px;border-radius:50%;
+    background:var(--accent);}
+  ul.facts li small{color:var(--muted);}
+
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:22px;}
+  .chip{font-family:var(--mono);font-size:12px;background:var(--chip);color:var(--chip-ink);
+    border:1px solid var(--line);border-radius:999px;padding:6px 12px;}
+  .chip b{color:var(--accent);font-weight:700;}
+  footer{margin-top:26px;font-size:12px;color:var(--muted);font-family:var(--mono);}
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">architecture · morph-unet balanced</p>
+  <h1>Balanced Morphological U-Net</h1>
+  <p class="lede">A standard U-Net whose two highest-resolution stages on each side are replaced by
+    morphological neurons. Morphology handles the fine tubular geometry (vessels); the deep semantic
+    stages stay convolutional. This is exactly the model <code>--morph-unet balanced</code> builds.</p>
+
+  <div class="card diagram">
+    <svg viewBox="0 0 930 612" role="img" aria-label="Balanced morph U-Net architecture">
+      <defs>
+        <marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="4.2" orient="auto">
+          <path d="M0,0 L8,4.2 L0,8.4 Z" fill="context-stroke"/>
+        </marker>
+      </defs>
+
+      <!-- skip connections (drawn first, behind boxes) -->
+      <g>
+        <path class="skip" marker-end="url(#ah)" d="M270,103 H656"/>
+        <path class="skip" marker-end="url(#ah)" d="M270,213 H656"/>
+        <path class="skip" marker-end="url(#ah)" d="M270,323 H656"/>
+        <path class="skip" marker-end="url(#ah)" d="M270,433 H656"/>
+      </g>
+
+      <!-- down-sampling (max pool) -->
+      <g>
+        <path class="flow" marker-end="url(#ah)" d="M190,136 V176"/>
+        <path class="flow" marker-end="url(#ah)" d="M190,246 V286"/>
+        <path class="flow" marker-end="url(#ah)" d="M190,356 V396"/>
+        <path class="flow" marker-end="url(#ah)" d="M190,466 C190,500 300,506 402,516"/>
+      </g>
+      <!-- up-sampling (up-conv) -->
+      <g>
+        <path class="flow" marker-end="url(#ah)" d="M578,516 C680,506 740,500 740,470"/>
+        <path class="flow" marker-end="url(#ah)" d="M740,400 V360"/>
+        <path class="flow" marker-end="url(#ah)" d="M740,290 V250"/>
+        <path class="flow" marker-end="url(#ah)" d="M740,180 V140"/>
+      </g>
+
+      <!-- input / stem + output -->
+      <g class="io">
+        <rect x="150" y="20" width="80" height="26"/>
+        <text class="io-t" x="190" y="37" text-anchor="middle">input · 128²</text>
+        <path class="flow" marker-end="url(#ah)" d="M190,46 V66"/>
+        <text class="edge-lbl" x="198" y="60" text-anchor="start">stem 3×3</text>
+
+        <rect x="694" y="20" width="92" height="26"/>
+        <text class="io-t" x="740" y="37" text-anchor="middle">1×1 → 3 cls</text>
+        <path class="flow" marker-end="url(#ah)" d="M740,66 V48"/>
+      </g>
+
+      <!-- ENCODER -->
+      <g class="box box-morph"><rect x="110" y="70" width="160" height="66" rx="11"/>
+        <text class="b-name" x="190" y="90" text-anchor="middle">enc1</text>
+        <text class="b-ch" x="190" y="112" text-anchor="middle">64 ch</text>
+        <text class="b-res" x="190" y="128" text-anchor="middle">128² · morph</text></g>
+      <g class="box box-morph"><rect x="110" y="180" width="160" height="66" rx="11"/>
+        <text class="b-name" x="190" y="200" text-anchor="middle">enc2</text>
+        <text class="b-ch" x="190" y="222" text-anchor="middle">128 ch</text>
+        <text class="b-res" x="190" y="238" text-anchor="middle">64² · morph</text></g>
+      <g class="box box-conv"><rect x="110" y="290" width="160" height="66" rx="11"/>
+        <text class="b-name" x="190" y="310" text-anchor="middle">enc3</text>
+        <text class="b-ch" x="190" y="332" text-anchor="middle">256 ch</text>
+        <text class="b-res" x="190" y="348" text-anchor="middle">32² · conv</text></g>
+      <g class="box box-conv"><rect x="110" y="400" width="160" height="66" rx="11"/>
+        <text class="b-name" x="190" y="420" text-anchor="middle">enc4</text>
+        <text class="b-ch" x="190" y="442" text-anchor="middle">512 ch</text>
+        <text class="b-res" x="190" y="458" text-anchor="middle">16² · conv</text></g>
+
+      <!-- BOTTLENECK -->
+      <g class="box box-conv"><rect x="380" y="518" width="220" height="66" rx="11"/>
+        <text class="b-name" x="490" y="538" text-anchor="middle">center · bottleneck</text>
+        <text class="b-ch" x="490" y="560" text-anchor="middle">1024 ch</text>
+        <text class="b-res" x="490" y="576" text-anchor="middle">8² · conv</text></g>
+
+      <!-- DECODER -->
+      <g class="box box-morph"><rect x="660" y="70" width="160" height="66" rx="11"/>
+        <text class="b-name" x="740" y="90" text-anchor="middle">dec1</text>
+        <text class="b-ch" x="740" y="112" text-anchor="middle">64 ch</text>
+        <text class="b-res" x="740" y="128" text-anchor="middle">128² · morph</text></g>
+      <g class="box box-morph"><rect x="660" y="180" width="160" height="66" rx="11"/>
+        <text class="b-name" x="740" y="200" text-anchor="middle">dec2</text>
+        <text class="b-ch" x="740" y="222" text-anchor="middle">128 ch</text>
+        <text class="b-res" x="740" y="238" text-anchor="middle">64² · morph</text></g>
+      <g class="box box-conv"><rect x="660" y="290" width="160" height="66" rx="11"/>
+        <text class="b-name" x="740" y="310" text-anchor="middle">dec3</text>
+        <text class="b-ch" x="740" y="332" text-anchor="middle">256 ch</text>
+        <text class="b-res" x="740" y="348" text-anchor="middle">32² · conv</text></g>
+      <g class="box box-conv"><rect x="660" y="400" width="160" height="66" rx="11"/>
+        <text class="b-name" x="740" y="420" text-anchor="middle">dec4</text>
+        <text class="b-ch" x="740" y="442" text-anchor="middle">512 ch</text>
+        <text class="b-res" x="740" y="458" text-anchor="middle">16² · conv</text></g>
+    </svg>
+  </div>
+
+  <div class="legend">
+    <span><i class="sw morph"></i> morphological stage (soft dilation + erosion)</span>
+    <span><i class="sw conv"></i> standard conv stage</span>
+    <span><i class="sw skip"></i> skip: copy &amp; concatenate</span>
+    <span><i class="sw flow"></i> ↓ max-pool 2×2 &nbsp;·&nbsp; ↑ up-conv 2×2</span>
+  </div>
+
+  <div class="grid2">
+    <!-- Card A: inside a stage -->
+    <div class="card panel">
+      <h2>Inside every morphological stage</h2>
+      <p class="sub">2 sub-layers · residual on the 2nd</p>
+      <div class="pipe">
+        <div class="stagebar">Stage(x) = h + sub2(h),&nbsp; h = sub1(x)</div>
+        <div class="flowrow">
+          <div class="step morph"><b>3×3 depthwise<br>soft morphology</b><small>the SE — spatial geometry</small></div>
+          <span class="arrow">→</span>
+          <div class="step"><b>1×1 conv</b><small>channel mixing</small></div>
+          <span class="arrow">→</span>
+          <div class="step"><b>InstanceNorm</b><small>re-centre</small></div>
+          <span class="arrow">→</span>
+          <div class="step"><b>LeakyReLU</b><small></small></div>
+        </div>
+      </div>
+      <p class="note"><b>Depthwise-separable, on purpose:</b> the 3×3 does the <b>spatial</b> morphology
+        (one structuring element per channel); the 1×1 is the linear "activation" that mixes
+        <b>channels</b>. The paper proves this linear step is what makes a morphological stack a
+        universal approximator.</p>
+    </div>
+
+    <!-- Card B: the neuron -->
+    <div class="card panel">
+      <h2>The MPM neuron</h2>
+      <p class="sub">inside the depthwise morphology</p>
+      <div class="eq">
+out = α · ( <span class="op">δ</span> + <span class="op">ε</span> )<br>
+<span class="op">δ</span> = b<sub>dil</sub> <span class="op">∨</span> max<sub>j</sub>( x<sub>j</sub> + se )&nbsp;&nbsp;<span class="mut">← dilation</span><br>
+<span class="op">ε</span> = b<sub>ero</sub> <span class="op">∧</span> min<sub>j</sub>( x<sub>j</sub> + se )&nbsp;&nbsp;<span class="mut">← erosion</span>
+      </div>
+      <ul class="facts">
+        <li>one <b>shared</b> 3×3 <b>se</b> for both paths <small>— hard-tied, always</small></li>
+        <li><b>distinct</b> biases b<sub>dil</sub>, b<sub>ero</sub> <small>— join / meet, not addition</small></li>
+        <li>max/min are <b>soft</b> via LogSumExp <small>— β warms 2 → 10, dense gradients early</small></li>
+        <li>se initialised <b>N(0,1)</b> <small>— paper's MPM init</small></li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="chips">
+    <span class="chip"><b>default</b> conv stem</span>
+    <span class="chip"><b>default</b> β-warmup 30 ep</span>
+    <span class="chip">InstanceNorm</span>
+    <span class="chip">max-pool downsampling</span>
+    <span class="chip">residual stages (RMPM)</span>
+    <span class="chip">grad-checkpoint</span>
+    <span class="chip">batch 24 @ 128²</span>
+    <span class="chip">≈ 30.3 M params</span>
+  </div>
+
+  <footer>morph-unet · Task08 HepaticVessel · fs=64 · k=3 · balanced = high-res stages only</footer>
+</div>
+
+</body></html>

@@ -29,12 +29,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 #
-# depthwise grey morphology: alpha * (soft_dilation(x) + soft_erosion(x)) + bias
-# one shared structuring element per channel, with a per-channel scale/bias
-# (the MPM layer of Fotopoulos & Maragos with lambda = 0.5, shared weights, biased)
+# depthwise grey morphology -- the Max-Plus-Min (MPM) neuron of Fotopoulos & Maragos,
+# "Training Deep Morphological Neural Networks as Universal Approximators" (Setting 1):
+#
+#   out = alpha * ( [ b_dil  v  max_j(x_j + se_dil) ]     # biased soft dilation (max-plus)
+#                 + [ b_ero  ^  min_j(x_j + se_ero) ] )   # biased soft erosion  (min-plus)
+#
+# Per the paper the dilation (max-plus) and erosion (min-plus) paths SHARE the structuring
+# element and carry DIFFERENT biases -- and the bias enters through the join (v) / meet (^),
+# NOT as an addition, so the two biases are genuinely distinct and cannot be folded into one
+# additive constant (which is what a trailing "+ bias" would have been). Both paths use
+# x_j + se (min-plus erosion is min_j(x_j + se), not the classical min_j(x_j - se)).
+#
+# Within a neuron the dilation (max-plus) and erosion (min-plus) paths SHARE ONE structuring
+# element -- a single parameter `se`, tied at init AND throughout training (the paper's hard
+# weight-tie) -- while carrying DIFFERENT biases. (The separate-but-init-tied behaviour lives
+# one level up, across paired neurons in different layers; see MorphUNet's `tie_pairs`.)
+#
+# Init follows Appendix C for MPM/lambda=1/2 nets: "all morphological layers are initialised
+# to follow a standard distribution" (SE ~ N(0,1)). The sum of max and min is naturally
+# zero-mean, so no negative-mean shift (needed only for pure max-plus) is required.
+#
+# max/min are softened with a LogSumExp of temperature beta to avoid the dead gradients of
+# hard min/max; each bias is folded into the LSE via logaddexp so no extra
+# (B,C,k*k+1,H,W) tensor is materialised.
 #
 class SoftMorph2d(nn.Module):
 
@@ -43,10 +65,12 @@ class SoftMorph2d(nn.Module):
         assert k % 2 == 1, "kernel size k must be odd"
         self.k = k
         self.pad = k // 2
-        # shared SE per channel (flat init -> starts near identity), per-channel affine
-        self.se = nn.Parameter(torch.zeros(1, channels, k * k, 1, 1))
+        # ONE structuring element per channel, shared by both paths (hard weight-tie), N(0,1)
+        self.se = nn.Parameter(torch.randn(1, channels, k * k, 1, 1))
+        # distinct join/meet biases + per-channel linear scaling of the sum
+        self.b_dil = nn.Parameter(torch.randn(1, channels, 1, 1))
+        self.b_ero = nn.Parameter(torch.randn(1, channels, 1, 1))
         self.alpha = nn.Parameter(torch.ones(1, channels, 1, 1))
-        self.bias = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.register_buffer("beta", torch.tensor(float(beta)))
 
     def _neigh(self, x):
@@ -55,21 +79,19 @@ class SoftMorph2d(nn.Module):
         cols = F.unfold(x, self.k, padding=self.pad)
         return cols.view(B, C, self.k * self.k, H, W)
 
-    # soft dilation = (1/b) * logsumexp(b * (neigh + SE))
-    def soft_dilation(self, x):
-        n = self._neigh(x) + self.se
-        return torch.logsumexp(self.beta * n, dim=2) / self.beta
-
-    # soft erosion = -(1/b) * logsumexp(-b * (neigh - SE))
-    def soft_erosion(self, x):
-        n = self._neigh(x) - self.se
-        return -torch.logsumexp(-self.beta * n, dim=2) / self.beta
-
     def set_beta(self, beta):
         self.beta.fill_(float(beta))
 
     def forward(self, x):
-        return self.alpha * (self.soft_dilation(x) + self.soft_erosion(x)) + self.bias
+        # unfold ONCE and share the neighbourhood tensor between the two paths: the
+        # (B,C,k*k,H,W) cols are this layer's dominant activation.
+        b = self.beta
+        n = self._neigh(x) + self.se                          # (B,C,k*k,H,W), shared SE
+        # biased soft dilation: (1/b) logsumexp over the neighbourhood joined with b_dil
+        dil = torch.logaddexp(torch.logsumexp(b * n, dim=2), b * self.b_dil) / b
+        # biased soft erosion: -(1/b) logsumexp over -(neighbourhood) met with b_ero
+        ero = -torch.logaddexp(torch.logsumexp(-b * n, dim=2), -b * self.b_ero) / b
+        return self.alpha * (dil + ero)
 
 
 #
@@ -101,24 +123,133 @@ class MorphUnit(nn.Module):
         return self.act(self.norm(self.proj(self.morph(x))))
 
 
+class HybridUnit(nn.Module):
+
+    # half the *input* channels go through soft morphology, the other half through a
+    # plain 3x3 conv; the two outputs are concatenated to out_ch. Splitting on the input
+    # is what buys the speed-up -- the morphological unfold (this layer's cost) then runs
+    # on only in_ch//2 channels. Falls back to a full ConvUnit when the input is too thin
+    # to split (e.g. the 1-channel image stage), where morphology would be meaningless anyway.
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+        super().__init__()
+        self.in_m = in_ch // 2                         # channels routed to morphology
+        self.in_c = in_ch - self.in_m                  # channels routed to conv
+        self.out_m = out_ch // 2 if self.in_m > 0 else 0
+        self.out_c = out_ch - self.out_m
+        self.morph = MorphUnit(self.in_m, self.out_m, k=k, beta=beta) if self.out_m else None
+        self.conv = ConvUnit(self.in_c, self.out_c) if self.out_c else None
+
+    def forward(self, x):
+        if self.morph is None:                         # thin input -> all conv
+            return self.conv(x)
+        xm, xc = x[:, :self.in_m], x[:, self.in_m:]
+        return torch.cat([self.morph(xm), self.conv(xc)], dim=1)
+
+
+#
+# STRICT (paper "Setting 1" conv) morphology: a full channel-mixing max-plus + min-plus
+# convolution. Each output channel takes a soft max/min over ALL input channels and the k*k
+# structuring shifts (unlike the depthwise SoftMorph2d) -- the faithful morphological conv, so
+# the max-plus weights carry the bulk of the parameters (which is what makes it prune the
+# paper's way). Shared weight W for both paths, distinct join/meet biases (the MPM neuron).
+#
+# Implemented as a numerically-stable LOG-DOMAIN MATMUL:
+#   soft-dilation = (1/b) logsumexp_{ik}( b(U + W) ) = (1/b) log( exp(bW) @ exp(bU) )
+# with a separate max subtracted from U (per location) and W (per output channel) so the
+# exponentials never overflow -- this keeps it a single (im2col) matmul instead of the
+# infeasible (B, C_out, C_in*k*k, H, W) tensor.
+#
+class StrictMorph2d(nn.Module):
+
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+        super().__init__()
+        assert k % 2 == 1, "kernel size k must be odd"
+        self.k = k
+        self.pad = k // 2
+        self.out_ch = out_ch
+        self.weight = nn.Parameter(torch.randn(out_ch, in_ch * k * k))   # structuring functions, N(0,1)
+        self.b_dil = nn.Parameter(torch.randn(out_ch))                   # join bias
+        self.b_ero = nn.Parameter(torch.randn(out_ch))                   # meet bias
+        self.register_buffer("beta", torch.tensor(float(beta)))
+
+    def set_beta(self, beta):
+        self.beta.fill_(float(beta))
+
+    def _lse(self, U, sign):
+        # logsumexp_{ik}( sign*beta*(U + W) ), stable, as a log-matmul -> (B, out, L)
+        b = self.beta
+        sU = (sign * b) * U                              # (B, ik, L)
+        sW = (sign * b) * self.weight                    # (out, ik)
+        uM = sU.amax(dim=1, keepdim=True)                # (B, 1, L)
+        wM = sW.amax(dim=1, keepdim=True)                # (out, 1)
+        prod = torch.einsum('oi,bil->bol',
+                            torch.exp(sW - wM), torch.exp(sU - uM))   # (B, out, L)
+        return uM + wM.unsqueeze(0) + torch.log(prod.clamp_min(1e-30))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        b = self.beta
+        U = F.unfold(x, self.k, padding=self.pad)        # (B, in*k*k, H*W)
+        bd = self.b_dil.view(1, -1, 1)
+        be = self.b_ero.view(1, -1, 1)
+        dil = torch.logaddexp(self._lse(U, 1.0), b * bd) / b            # biased soft dilation
+        ero = -torch.logaddexp(self._lse(U, -1.0), -b * be) / b        # biased soft erosion
+        return (dil + ero).view(B, self.out_ch, H, W)
+
+
+class StrictMorphUnit(nn.Module):
+
+    # paper Setting-1 conv block: full max-plus/min-plus morphological conv (does the channel
+    # mixing itself), then a DEPTHWISE 3x3 linear activation (per-channel, 9*out_ch params),
+    # then norm + act. Contrast MorphUnit, which is depthwise-morph then a 1x1 channel mix.
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+        super().__init__()
+        self.morph = StrictMorph2d(in_ch, out_ch, k=k, beta=beta)
+        self.act_conv = nn.Conv2d(out_ch, out_ch, k, padding=k // 2, groups=out_ch)  # depthwise linear
+        self.norm = nn.InstanceNorm2d(out_ch)
+        self.act = nn.LeakyReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.norm(self.act_conv(self.morph(x))))
+
+
 #
 # a U-Net stage = two sublayers (in->out, out->out) with a residual on the second
-# (residual connections improve generalisation of morphological nets -- the RMPM trick)
+# (residual connections improve generalisation of morphological nets -- the RMPM trick).
+# mode: "conv" (plain), "morph" (MPM neurons), or "half" (HybridUnit: half morph, half conv).
+# impl: "fast" (depthwise-morph + 1x1) or "paper" (StrictMorphUnit: full max-plus + depthwise 3x3).
 #
 class Stage(nn.Module):
 
-    def __init__(self, in_ch, out_ch, morph=False, k=3, beta=10.0):
+    def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast"):
         super().__init__()
-        if morph:
-            self.sub1 = MorphUnit(in_ch, out_ch, k=k, beta=beta)
-            self.sub2 = MorphUnit(out_ch, out_ch, k=k, beta=beta)
-        else:
-            self.sub1 = ConvUnit(in_ch, out_ch)
-            self.sub2 = ConvUnit(out_ch, out_ch)
+        self.mode = mode
+        self.use_ckpt = True            # toggled by MorphUNet.set_checkpointing
+        if mode == "conv":
+            self.sub1, self.sub2 = ConvUnit(in_ch, out_ch), ConvUnit(out_ch, out_ch)
+        elif mode == "half":
+            self.sub1 = HybridUnit(in_ch, out_ch, k=k, beta=beta)
+            self.sub2 = HybridUnit(out_ch, out_ch, k=k, beta=beta)
+        else:                            # "morph"
+            Unit = StrictMorphUnit if impl == "paper" else MorphUnit
+            self.sub1 = Unit(in_ch, out_ch, k=k, beta=beta)
+            self.sub2 = Unit(out_ch, out_ch, k=k, beta=beta)
 
-    def forward(self, x):
+    def _forward(self, x):
         x = self.sub1(x)
         return x + self.sub2(x)     # sub2 is out->out, so the residual shapes match
+
+    def forward(self, x):
+        # gradient-checkpoint the morphological stages: their (B,C,k*k,H,W) neighbourhood
+        # tensors are the dominant activation and holding them for all the balanced stages
+        # overflows the GPU, so recompute them in backward instead of storing. plain conv
+        # stages are cheap and left un-checkpointed. use_reentrant=False so a non-grad input
+        # (e.g. enc1's raw image) and bf16 autocast both work. Checkpointing is a pure
+        # compute<->memory trade with NO effect on the maths, so it can be turned off
+        # (set_checkpointing(False)) when there is enough VRAM to go faster.
+        if self.use_ckpt and self.mode in ("morph", "half") and self.training and torch.is_grad_enabled():
+            return checkpoint(self._forward, x, use_reentrant=False)
+        return self._forward(x)
 
 
 #
@@ -128,22 +259,51 @@ STAGE_CONFIGS = {
     "heavy":      {"enc1", "enc2", "enc3", "enc4", "center", "dec4", "dec3", "dec2", "dec1"},
     "balanced":   {"enc1", "enc2", "dec2", "dec1"},   # high-resolution stages only
     "bottleneck": {"center"},
+    "deep":       {"enc4", "center", "dec4"},         # bottleneck + its two skip-adjacent neighbours
     "none":       set(),                              # all-conv reference
 }
 
 
+def _tie_se(src_stage, dst_stage):
+    # copy structuring elements from src_stage's morph neurons into dst_stage's matching
+    # ones (same sub-module path AND same shape), so the pair starts identical. They remain
+    # separate Parameters, so training lets them diverge. Shape-mismatched neurons (e.g. the
+    # in->out sub1 of an encoder vs. its decoder mirror) are skipped. Biases stay independent.
+    src = dict(src_stage.named_modules())
+    for name, dm in dst_stage.named_modules():
+        sm = src.get(name)
+        if (isinstance(dm, SoftMorph2d) and isinstance(sm, SoftMorph2d)
+                and sm.se.shape == dm.se.shape):
+            with torch.no_grad():
+                dm.se.copy_(sm.se)
+
+
 class MorphUNet(nn.Module):
 
-    def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy"):
+    # half_morph : morphological stages use HybridUnit (half morph, half conv) instead of full
+    #              MorphUnit -- ~halves the morphological cost for faster training.
+    # tie_mirror : encoder<->decoder mirror stages (enc1<->dec1, enc2<->dec2) start with
+    #              *identical* structuring elements, then diverge freely during training.
+    # conv_stem  : a 3x3 conv lifts the raw input to fs channels BEFORE any morphology, so the
+    #              first morphological neuron sees smooth conv features (denoising) rather than
+    #              the raw 1-channel intensities -- consistent with the paper's linear/morph
+    #              alternation (Setting 3). Without it, enc1 morphology runs on the raw input.
+    # checkpoint : gradient-checkpoint the morph stages (memory<->compute trade, no maths change).
+    def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy",
+                 half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast"):
         super().__init__()
         morph = STAGE_CONFIGS[config] if isinstance(config, str) else set(config)
         self.config = config
+        morph_mode = "half" if half_morph else "morph"
 
         def stage(name, i, o):
-            return Stage(i, o, morph=(name in morph), k=k, beta=beta)
+            return Stage(i, o, mode=(morph_mode if name in morph else "conv"), k=k, beta=beta, impl=impl)
 
+        # optional denoising conv stem: lift in_channels -> fs before enc1 (which then runs on fs)
+        self.stem = ConvUnit(in_channels, fs) if conv_stem else nn.Identity()
+        enc1_in = fs if conv_stem else in_channels
         # encoder
-        self.enc1 = stage("enc1", in_channels, fs)
+        self.enc1 = stage("enc1", enc1_in, fs)
         self.enc2 = stage("enc2", fs, fs * 2)
         self.enc3 = stage("enc3", fs * 2, fs * 4)
         self.enc4 = stage("enc4", fs * 4, fs * 8)
@@ -162,13 +322,26 @@ class MorphUNet(nn.Module):
         # 1x1 output head stays linear
         self.final = nn.Conv2d(fs, num_classes, 1)
 
+        if tie_mirror:                       # start each enc<->dec mirror from the same SEs
+            for enc, dec in [(self.enc1, self.dec1), (self.enc2, self.dec2),
+                             (self.enc3, self.dec3), (self.enc4, self.dec4)]:
+                _tie_se(enc, dec)            # a no-op where the pair isn't morphological
+        self.set_checkpointing(checkpoint)
+
+    def set_checkpointing(self, flag):
+        # toggle gradient checkpointing on every stage/gate that supports it (has use_ckpt)
+        self.ckpt_enabled = flag
+        for mod in self.modules():
+            if hasattr(mod, "use_ckpt"):
+                mod.use_ckpt = flag
+
     def set_beta(self, beta):
         for mod in self.modules():
-            if isinstance(mod, SoftMorph2d):
+            if isinstance(mod, (SoftMorph2d, StrictMorph2d)):
                 mod.set_beta(beta)
 
     def forward(self, x):
-        e1 = self.enc1(x)
+        e1 = self.enc1(self.stem(x))
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
         e4 = self.enc4(self.pool(e3))

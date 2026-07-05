@@ -24,6 +24,7 @@ import config
 from networks.UNET import UNet
 from networks.morph_block import MorphResidualUNet, MorphBankUNet, ConvBankUNet
 from networks.morph_unet import MorphUNet
+from networks.morph_attention import MorphAttentionUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
@@ -311,8 +312,33 @@ def main():
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
-    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck"],
-                   help="replace conv stages with morphological-separable blocks (networks/morph_unet.py)")
+    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck", "deep"],
+                   help="replace conv stages with morphological-separable blocks (networks/morph_unet.py). "
+                        "deep = bottleneck + its two skip-adjacent neighbours (enc4, center, dec4)")
+    p.add_argument("--morph-impl", choices=["fast", "paper"], default="fast",
+                   help="morph block: 'fast' = depthwise morph + 1x1 (efficient); "
+                        "'paper' = strict full channel-mixing max-plus conv + depthwise 3x3 activation "
+                        "(Setting 1, faithful, prunes the paper's way, heavier)")
+    p.add_argument("--morph-half", action="store_true",
+                   help="morph stages use HybridUnit (half channels morphological, half plain conv) "
+                        "-- ~2x faster training, lower memory")
+    p.add_argument("--morph-tie-mirror", action="store_true",
+                   help="init encoder<->decoder mirror stages (enc1<->dec1, enc2<->dec2) with identical "
+                        "structuring elements; they diverge freely during training")
+    p.add_argument("--morph-attn", action="store_true",
+                   help="morphological Attention-U-Net: gate skip connections with soft top-hat/bottom-hat "
+                        "attention (networks/morph_attention.py)")
+    p.add_argument("--morph-no-conv-stem", action="store_true",
+                   help="disable the default 3x3 denoising conv stem (raw input goes straight into "
+                        "morphology instead of conv features)")
+    p.add_argument("--morph-no-checkpoint", action="store_true",
+                   help="disable gradient checkpointing on morph stages: faster, uses more VRAM, "
+                        "identical maths/training. Use when the model fits (e.g. --morph-half)")
+    p.add_argument("--morph-beta-warmup", type=int, default=30, metavar="EPOCHS",
+                   help="ramp the LogSumExp temperature beta from --morph-beta-start up to --morph-beta "
+                        "over this many epochs (softer morphology early -> denser gradients). default 30; 0 = off")
+    p.add_argument("--morph-beta-start", type=float, default=2.0,
+                   help="starting beta for --morph-beta-warmup")
     p.add_argument("--morph-bank", metavar="SPEC",
                    help='trainable morph bank, e.g. "tophat:3,tophat:5,bottomhat:1,gradient:2" (radii); '
                         'use "auto" to load this task/fold spec from the survey\'s results/explore/<TASK>_bank.json')
@@ -380,9 +406,14 @@ def main():
     if args.morph_unet:
         # morphological-separable U-Net: conv stages replaced by depthwise soft morphology
         # + 1x1 projection, per the chosen config. Its SEs end in ".se", so they pick up the
-        # boosted SE lr and --freeze-se just like the bank/residual variants.
-        model = MorphUNet(num_classes=args.num_classes, in_channels=in_channels,
-                          k=args.morph_k, beta=args.morph_beta, config=args.morph_unet).to(device)
+        # boosted SE lr and --freeze-se just like the bank/residual variants. --morph-attn
+        # swaps in the morphological Attention-U-Net (gated skips); the other flags apply to both.
+        Net = MorphAttentionUNet if args.morph_attn else MorphUNet
+        model = Net(num_classes=args.num_classes, in_channels=in_channels,
+                    k=args.morph_k, beta=args.morph_beta, config=args.morph_unet,
+                    half_morph=args.morph_half, tie_mirror=args.morph_tie_mirror,
+                    conv_stem=not args.morph_no_conv_stem,
+                    checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl).to(device)
     elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
         if args.morph_bank == "auto":
@@ -416,7 +447,11 @@ def main():
     # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
     if args.morph_unet:
-        mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta})"
+        extra = ("".join(f",{t}" for t, on in
+                 [("attn", args.morph_attn), ("half", args.morph_half), ("tie", args.morph_tie_mirror),
+                  ("stem", not args.morph_no_conv_stem), ("bwarm", args.morph_beta_warmup > 0),
+                  (f"impl={args.morph_impl}", args.morph_impl != "fast")] if on))
+        mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta}{extra})"
     elif args.morph_bank:
         kind = "conv-control" if args.conv_control else "morph-bank"
         mode = f"{kind}([{args.morph_bank}],beta={args.morph_beta})"
@@ -474,6 +509,13 @@ def main():
                       f"{start_epoch - 1 - best_epoch}/{args.patience} epochs stale)")
         se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
         for epoch in range(start_epoch, args.epochs + 1):
+            if args.morph_beta_warmup > 0 and hasattr(model, "set_beta"):
+                # linearly ramp beta start -> target over the warmup epochs, then hold
+                frac = min(1.0, (epoch - 1) / args.morph_beta_warmup)
+                cur_beta = args.morph_beta_start + frac * (args.morph_beta - args.morph_beta_start)
+                model.set_beta(cur_beta)
+                if epoch == start_epoch or epoch <= args.morph_beta_warmup + 1:
+                    print(f"  beta warmup: epoch {epoch} -> beta={cur_beta:.2f}")
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
             do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
             if do_val:

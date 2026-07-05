@@ -9,3 +9,7 @@ papers
 **__init__.py
 results
 log_*.txt
+
+Archive.7z
+*.7z
+__MACOSX
