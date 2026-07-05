@@ -61,6 +61,10 @@ class SoftMorph2D(nn.Module):
         n = self._neigh(x) - self.se
         return -torch.logsumexp(-self.beta * n, dim=2) / self.beta
 
+    def set_beta(self, beta):
+        # anneal the log-sum-exp temperature: higher beta -> sharper (more faithful) morphology
+        self.beta.fill_(float(beta))
+
     def forward(self, x):
         if self.mode == "tophat":
             # top-hat : x - opening(x), opening = dilation(erosion(x))
@@ -92,6 +96,11 @@ class MorphResidualUNet(nn.Module):
         self.bottomhat = SoftMorph2D(k=k, beta=beta, mode="bottomhat") if use_bottomhat else None
         self.unet = base_unet
 
+    def set_beta(self, beta):
+        for blk in (self.tophat, self.bottomhat):
+            if blk is not None:
+                blk.set_beta(beta)
+
     def forward(self, x):
         chans = [x]
         if self.tophat is not None:
@@ -119,6 +128,10 @@ class MorphBankUNet(nn.Module):
                         init_inside=init_inside, init_outside=init_outside)
             for mode, r in specs])
         self.unet = base_unet
+
+    def set_beta(self, beta):
+        for blk in self.blocks:
+            blk.set_beta(beta)
 
     def forward(self, x):
         chans = [x] + [blk(x) for blk in self.blocks]

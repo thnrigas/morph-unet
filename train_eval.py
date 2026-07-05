@@ -383,56 +383,44 @@ def compare_runs(paths):
 #
 def main():
     p = argparse.ArgumentParser()
+    # id
     p.add_argument("--tag")
+    # modes
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
-    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck"],
-                   help="replace conv stages with morphological-separable blocks (networks/morph_unet.py)")
-    p.add_argument("--morph-bank", metavar="SPEC",
-                   help='trainable morph bank, e.g. "tophat:3,tophat:5,bottomhat:1,gradient:2" (radii); '
-                        'use "auto" to load this task/fold spec from the survey\'s results/explore/<TASK>_bank.json')
-    p.add_argument("--conv-control", action="store_true",
-                   help="matched conv front-end (same #channels) instead of the morph bank")
-    p.add_argument("--survey-top-k", type=int, default=5,
-                   help="--morph-bank auto: how many (mode,radius) the survey selects if it must run")
-    p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 8),
-                   help="--morph-bank auto: parallel workers for the survey if it must run")
-    p.add_argument("--morph-k", type=int, default=5)
-    p.add_argument("--morph-k-max", type=int, default=11,
-                   help="shared SE window for the morph bank; disk-init radii sit inside it (room to grow)")
-    p.add_argument("--morph-beta", type=float, default=10.0)
-    p.add_argument("--freeze-se", action="store_true",
-                   help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
+    p.add_argument("--morph-bank", metavar="SPEC")
+    p.add_argument("--conv-control", action="store_true")
+    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck"])
+    # morph parameters
+    p.add_argument("--morph-k", type=int, default=5)
+    p.add_argument("--morph-k-max", type=int, default=11)
+    p.add_argument("--morph-beta", type=float, default=10.0)
+    p.add_argument("--morph-beta-final", type=float, default=30.0)
+    p.add_argument("--survey-top-k", type=int, default=5)
+    p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 8))
+    p.add_argument("--freeze-se", action="store_true")
+    # training parameters
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
-    p.add_argument("--patience", type=int, default=config.HP["patience"],
-                   help="early stop after this many EPOCHS with no fg-Dice gain (independent of --val-every)")
-    p.add_argument("--val-every", type=int, default=3,
-                   help="run full-slice foreground-Dice validation every K epochs (raise to speed up)")
-    p.add_argument("--val-batch", type=int, default=12,
-                   help="full slices per validation forward pass; packs the GPU, auto-halves on CUDA OOM")
-    p.add_argument("--val-cases", type=int, default=15,
-                   help="validate on this many fixed (seeded) val volumes instead of all (unbiased, cheaper); "
-                        "0 = all. Falls back to all if the val set is smaller.")
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--patience", type=int, default=config.HP["patience"])
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
     p.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 6))
     p.add_argument("--lr", type=float, default=config.HP["lr"])
-    p.add_argument("--iters-per-epoch", type=int, default=config.HP["iters_per_epoch"],
-                   help="cap batches per (train/val) epoch; 0 = full pass over all slices")
-    p.add_argument("--fg-fraction", type=float, default=config.HP["fg_fraction"],
-                   help="fraction of train crops centred on a foreground voxel")
-    p.add_argument("--se-lr-mult", type=float, default=10.0,
-                   help="lr multiplier for the morphological SE weights (own param group)")
+    p.add_argument("--iters-per-epoch", type=int, default=config.HP["iters_per_epoch"])
+    p.add_argument("--val-cases", type=int, default=15)
+    p.add_argument("--val-every", type=int, default=3)
+    p.add_argument("--val-batch", type=int, default=12)
+    p.add_argument("--fg-fraction", type=float, default=config.HP["fg_fraction"])
+    p.add_argument("--se-lr-mult", type=float, default=10.0)
+    # other
     p.add_argument("--fold", type=int, default=0)
-    p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--test-only", action="store_true")
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
-    p.add_argument("--test-only", action="store_true")
-    p.add_argument("--resume", action="store_true",
-                   help="continue from <tag>_f<fold>_last.pth if it exists (survives interruption / spot preemption)")
+    p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
     if args.fold_mean:
@@ -457,7 +445,7 @@ def main():
         # morphological-separable U-Net: conv stages replaced by depthwise soft morphology
         # + 1x1 projection, per the chosen config. Its SEs end in ".se", so they pick up the
         # boosted SE lr and --freeze-se just like the bank/residual variants.
-        model = MorphUNet(num_classes=args.num_classes, in_channels=in_channels,
+        model = MorphUNet(num_classes=config.NUM_CLASSES, in_channels=in_channels,
                           k=args.morph_k, beta=args.morph_beta, config=args.morph_unet).to(device)
     elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
@@ -466,7 +454,7 @@ def main():
                                                args.survey_top_k, args.survey_workers)
         specs = parse_bank(args.morph_bank)
         n_extra = len(specs)
-        base = UNet(num_classes=args.num_classes, in_channels=1 + n_extra)
+        base = UNet(num_classes=config.NUM_CLASSES, in_channels=1 + n_extra)
         if args.conv_control:
             model = ConvBankUNet(base, n_extra=n_extra, k=args.morph_k_max).to(device)
         else:
@@ -476,13 +464,13 @@ def main():
         # residuals, both computed on the fly. under --morph-block default to top-hat.
         use_th = args.tophat or (args.morph_block and not args.bottomhat)
         use_bh = args.bottomhat
-        base = UNet(num_classes=args.num_classes, in_channels=1 + use_th + use_bh)
+        base = UNet(num_classes=config.NUM_CLASSES, in_channels=1 + use_th + use_bh)
         model = MorphResidualUNet(base, k=args.morph_k, beta=args.morph_beta,
                                   use_tophat=use_th, use_bottomhat=use_bh).to(device)
         if not args.morph_block:            # static residual -> fixed (frozen) SE
             args.freeze_se = True
     else:
-        model = UNet(num_classes=args.num_classes, in_channels=in_channels).to(device)
+        model = UNet(num_classes=config.NUM_CLASSES, in_channels=in_channels).to(device)
 
     if args.freeze_se:                      # static: SE is a fixed structuring element
         for n, p in model.named_parameters():
@@ -548,11 +536,26 @@ def main():
                 print(f"resumed from epoch {ck['epoch']} (best fg-Dice={best_dice:.4f} @ ep {best_epoch}, "
                       f"{start_epoch - 1 - best_epoch}/{args.patience} epochs stale)")
         se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
+        # geometric beta anneal (soft -> sharper morphology): on by default (--morph-beta-final),
+        # only for models exposing set_beta (bank / residual -- baseline & conv control have none),
+        # and skipped for a frozen SE (static residual stays a fully fixed operation) or when the
+        # target equals the start. schedule is a pure function of epoch, so it survives --resume.
+        anneal_beta = (args.morph_beta_final is not None
+                       and args.morph_beta_final != args.morph_beta
+                       and hasattr(model, "set_beta") and not args.freeze_se)
+        cur_beta = args.morph_beta
+        if anneal_beta:
+            print(f"  beta anneal: {args.morph_beta:g} -> {args.morph_beta_final:g} "
+                  f"(geometric over {args.epochs} epochs)")
         for epoch in range(start_epoch, args.epochs + 1):
+            if anneal_beta:
+                frac = (epoch - 1) / max(args.epochs - 1, 1)
+                cur_beta = args.morph_beta * (args.morph_beta_final / args.morph_beta) ** frac
+                model.set_beta(cur_beta)
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
             do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
             if do_val:
-                vd, per_class = run_val_dice(model, val_loader, device, args.num_classes)
+                vd, per_class = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
                 scheduler.step(-vd)    # scheduler minimises; we maximise Dice, so feed -Dice
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val_fgDice={vd:.4f}  "
                       f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]")
@@ -566,7 +569,8 @@ def main():
                     norms.append(p.detach().norm().item())
                     se_prev[n] = p.detach().clone()
                 print("  SE |Δ|: " + " ".join(f"{d:.3f}" for d in deltas)
-                      + "   |SE|: " + " ".join(f"{v:.3f}" for v in norms))
+                      + "   |SE|: " + " ".join(f"{v:.3f}" for v in norms)
+                      + (f"   beta={cur_beta:.1f}" if anneal_beta else ""))
             if do_val:
                 if vd > best_dice:
                     best_dice, best_epoch = vd, epoch
