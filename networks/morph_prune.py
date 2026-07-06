@@ -242,6 +242,37 @@ def _compose_paths(layers, R_by_name):
     return scores
 
 
+# --------------------------------------------------------------------------------------
+# path_j: the BOUND-ALIGNED path score (Thm./Cor. of path_pruning_theory.tex, Eq. 8).
+# It differs from path_soft in exactly the two ways the perturbation bound prescribes:
+#   (i) each backward hop is scaled by the per-channel gain d^ell of the intervening linear
+#       block (norm.scale * activation.slope * depthwise DC gain), estimated empirically as
+#       the magnitude ratio  mag_in[next] / mag_out[this]  over the channel shared by the two;
+#   (ii) the chain is SEEDED with a downstream-usage proxy (the terminal layer's output
+#       magnitude), not the uniform 1 of path_soft.
+# Recursion:  J^ell = R^{ell,T} ( d^ell (.) J^{ell+1} ),  which is (D^ell R^ell)^T J^{ell+1}.
+# path_soft is the special case d^ell == 1, seed == 1.
+# --------------------------------------------------------------------------------------
+def _compose_paths_gain(layers, R_by_name, mag_in, mag_out):
+    scores = {}
+    for chain in _find_chains(layers):
+        J_next = None
+        for k in range(len(chain) - 1, -1, -1):          # deepest layer of the chain first
+            n = chain[k]
+            R = R_by_name[n].clone()
+            if R.shape[0] == R.shape[1]:                  # square -> residual sub2 -> add I
+                R = R + torch.eye(R.shape[0])
+            if k == len(chain) - 1:                       # terminal: external downstream seed
+                J_next = torch.ones(R.shape[0])
+                d = mag_out[n].clamp_min(1e-9)            # output magnitude = downstream-usage proxy
+            else:                                         # intervening-block per-channel gain
+                d = mag_in[chain[k + 1]] / mag_out[n].clamp_min(1e-9)
+            J_in = R.t() @ (d * J_next)
+            scores[n] = J_in
+            J_next = J_in / J_in.mean().clamp_min(1e-9)   # message to the upstream layer
+    return scores
+
+
 @torch.no_grad()
 def collect_scores(model, calib_batches, device, criteria=("l1", "act", "winner", "winner_soft")):
     """Run a forward calibration pass and return {layer_name: {criterion: score(in_ch)}}.
@@ -251,8 +282,9 @@ def collect_scores(model, calib_batches, device, criteria=("l1", "act", "winner"
     """
     layers = strict_layers(model)
     stores = {n: {} for n in layers}
-    p_soft, p_hard = "path_soft" in criteria, "path_hard" in criteria
-    need_data = any(c in ("act", "winner", "winner_soft", "path_soft", "path_hard") for c in criteria)
+    p_soft, p_hard, p_j = "path_soft" in criteria, "path_hard" in criteria, "path_j" in criteria
+    need_data = any(c in ("act", "winner", "winner_soft", "path_soft", "path_hard", "path_j")
+                    for c in criteria)
 
     handles = []
     if need_data:
@@ -265,9 +297,15 @@ def collect_scores(model, calib_batches, device, criteria=("l1", "act", "winner"
                     _acc_winner(mod, x, _store)
                 if "winner_soft" in criteria:
                     _acc_winner_soft(mod, x, _store)
-                if p_soft or p_hard:
-                    _acc_routing(mod, x, _store, p_soft, p_hard)
+                if p_soft or p_hard or p_j:
+                    _acc_routing(mod, x, _store, p_soft or p_j, p_hard)
+                if p_j:                                   # per-input-channel magnitude
+                    _store["mag_in"] = _store.get("mag_in", 0) + x.abs().mean(dim=(0, 2, 3)).cpu()
             handles.append(m.register_forward_pre_hook(pre_hook))
+            if p_j:                                       # per-output-channel magnitude
+                def post_hook(mod, inp, out, _store=stores[n]):
+                    _store["mag_out"] = _store.get("mag_out", 0) + out.abs().mean(dim=(0, 2, 3)).cpu()
+                handles.append(m.register_forward_hook(post_hook))
 
     model.eval()
     if need_data:
@@ -297,6 +335,13 @@ def collect_scores(model, calib_batches, device, criteria=("l1", "act", "winner"
         ps = _compose_paths(layers, R_by_name)
         for n in layers:
             out[n][skey] = ps[n]
+    if p_j:                                              # bound-aligned, gain-weighted variant
+        R_by_name = {n: stores[n]["R_soft"] for n in layers}
+        mag_in = {n: stores[n]["mag_in"] for n in layers}
+        mag_out = {n: stores[n]["mag_out"] for n in layers}
+        js = _compose_paths_gain(layers, R_by_name, mag_in, mag_out)
+        for n in layers:
+            out[n]["path_j"] = js[n]
     return out
 
 
@@ -373,7 +418,7 @@ if __name__ == "__main__":
                     impl="paper", checkpoint=False).to(dev).eval()
     calib = [torch.randn(1, 1, 64, 64, device=dev) for _ in range(3)]
 
-    crits = ("l1", "act", "winner", "winner_soft", "path_soft", "path_hard")
+    crits = ("l1", "act", "winner", "winner_soft", "path_soft", "path_hard", "path_j")
     sc = collect_scores(net, calib, dev, criteria=crits)
     layers = strict_layers(net)
     chains = _find_chains(layers)
@@ -388,7 +433,8 @@ if __name__ == "__main__":
     print(f"[{name0}] in_ch={s['l1'].numel()}  top-8 overlaps: "
           f"l1-winnerSoft={ov(s['l1'], s['winner_soft']):.2f}  "
           f"winnerSoft-pathSoft={ov(s['winner_soft'], s['path_soft']):.2f}  "
-          f"pathSoft-pathHard={ov(s['path_soft'], s['path_hard']):.2f}  (low => differ)")
+          f"pathSoft-pathJ={ov(s['path_soft'], s['path_j']):.2f}  "
+          f"(pathJ = bound-aligned; low => the D^l gains + seed re-rank)")
 
     # masked forward runs and actually changes the output (channels pruned)
     x = calib[0]
