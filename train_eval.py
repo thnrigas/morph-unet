@@ -312,9 +312,11 @@ def main():
     p.add_argument("--tophat", action="store_true")
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
-    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck", "deep"],
+    p.add_argument("--morph-unet",
+                   choices=["heavy", "balanced", "bottleneck", "deep", "full", "full_l1", "full_l2"],
                    help="replace conv stages with morphological-separable blocks (networks/morph_unet.py). "
-                        "deep = bottleneck + its two skip-adjacent neighbours (enc4, center, dec4)")
+                        "deep = enc4+center+dec4; full = all stages morph (18 layers); "
+                        "full_l1/full_l2 = full but with level 1 / levels 1-2 kept linear (14 / 10 layers)")
     p.add_argument("--morph-impl", choices=["fast", "paper"], default="fast",
                    help="morph block: 'fast' = depthwise morph + 1x1 (efficient); "
                         "'paper' = strict full channel-mixing max-plus conv + depthwise 3x3 activation "
@@ -334,6 +336,14 @@ def main():
     p.add_argument("--morph-no-checkpoint", action="store_true",
                    help="disable gradient checkpointing on morph stages: faster, uses more VRAM, "
                         "identical maths/training. Use when the model fits (e.g. --morph-half)")
+    p.add_argument("--morph-relu", action="store_true",
+                   help="use plain ReLU instead of LeakyReLU everywhere (the non-linearity the "
+                        "tropical-geometry / TropNNC pruning theory is derived for). Auto-appends "
+                        "'_relu' to --tag so it writes to a NEW file, not the LeakyReLU one")
+    p.add_argument("--finetune-from", metavar="CKPT",
+                   help="warm-start the model weights from this checkpoint (a _best.pth state-dict or "
+                        "a _last.pth full-state), then train fresh (new optimizer/scheduler at --lr). "
+                        "Use with --morph-relu to fine-tune a LeakyReLU model into a ReLU one cheaply")
     p.add_argument("--morph-beta-warmup", type=int, default=30, metavar="EPOCHS",
                    help="ramp the LogSumExp temperature beta from --morph-beta-start up to --morph-beta "
                         "over this many epochs (softer morphology early -> denser gradients). default 30; 0 = off")
@@ -393,6 +403,10 @@ def main():
         return
     if not args.tag:
         p.error("--tag is required")
+    # ReLU runs write to a *_relu tag so the LeakyReLU checkpoints/scores are never overwritten
+    if args.morph_relu and not args.tag.endswith("_relu"):
+        args.tag += "_relu"
+        print(f"[--morph-relu] output tag -> {args.tag}")
 
     set_seed(args.seed)
     device = pick_device()
@@ -413,7 +427,8 @@ def main():
                     k=args.morph_k, beta=args.morph_beta, config=args.morph_unet,
                     half_morph=args.morph_half, tie_mirror=args.morph_tie_mirror,
                     conv_stem=not args.morph_no_conv_stem,
-                    checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl).to(device)
+                    checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl,
+                    act="relu" if args.morph_relu else "leaky").to(device)
     elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
         if args.morph_bank == "auto":
@@ -444,12 +459,31 @@ def main():
             if n.endswith(".se"):
                 p.requires_grad_(False)
 
+    # warm-start: load weights from a prior checkpoint (e.g. a LeakyReLU run) into this model
+    # before training. Activations carry no parameters, so a LeakyReLU state-dict loads 1:1 into
+    # a ReLU model. Optimizer/scheduler are NOT restored -- training starts fresh at --lr, which
+    # is the whole point of a fine-tune (vs --resume, which continues the same run). Skipped when
+    # --resume is set (then we continue this tag's own _last.pth instead).
+    if args.finetune_from and not args.resume:
+        if not os.path.exists(args.finetune_from):
+            raise SystemExit(f"--finetune-from: no such file {args.finetune_from}")
+        ck = torch.load(args.finetune_from, map_location=device)
+        if isinstance(ck, dict) and "model" in ck:      # a full-state _last.pth
+            ck = ck["model"]
+        missing, unexpected = model.load_state_dict(ck, strict=False)
+        if missing or unexpected:
+            print(f"  [finetune] WARNING partial load: {len(missing)} missing, "
+                  f"{len(unexpected)} unexpected params")
+        print(f"warm-started weights from {args.finetune_from} "
+              f"(fresh optimizer/scheduler @ lr={args.lr:g})")
+
     # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
     if args.morph_unet:
         extra = ("".join(f",{t}" for t, on in
                  [("attn", args.morph_attn), ("half", args.morph_half), ("tie", args.morph_tie_mirror),
                   ("stem", not args.morph_no_conv_stem), ("bwarm", args.morph_beta_warmup > 0),
+                  ("relu", args.morph_relu),
                   (f"impl={args.morph_impl}", args.morph_impl != "fast")] if on))
         mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta}{extra})"
     elif args.morph_bank:

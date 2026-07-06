@@ -33,6 +33,15 @@ from torch.utils.checkpoint import checkpoint
 
 
 #
+# activation factory. "leaky" (nnU-Net default) is used for training; "relu" gives the plain
+# ReLU that the tropical-geometry framework (and TropNNC) is derived for, so a network meant
+# for TropNNC pruning can be built/fine-tuned with exact ReLU non-linearities.
+#
+def make_act(act="leaky"):
+    return nn.ReLU(inplace=True) if act == "relu" else nn.LeakyReLU(inplace=True)
+
+
+#
 # depthwise grey morphology -- the Max-Plus-Min (MPM) neuron of Fotopoulos & Maragos,
 # "Training Deep Morphological Neural Networks as Universal Approximators" (Setting 1):
 #
@@ -99,11 +108,11 @@ class SoftMorph2d(nn.Module):
 #
 class ConvUnit(nn.Module):
 
-    def __init__(self, in_ch, out_ch, k=3):
+    def __init__(self, in_ch, out_ch, k=3, act="leaky"):
         super().__init__()
         self.conv = nn.Conv2d(in_ch, out_ch, k, padding=k // 2)
         self.norm = nn.InstanceNorm2d(out_ch)
-        self.act = nn.LeakyReLU(inplace=True)
+        self.act = make_act(act)
 
     def forward(self, x):
         return self.act(self.norm(self.conv(x)))
@@ -112,14 +121,20 @@ class ConvUnit(nn.Module):
 class MorphUnit(nn.Module):
 
     # depthwise soft morphology on in_ch, then a 1x1 projection to out_ch (+ norm + act)
-    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0, act="leaky"):
         super().__init__()
         self.morph = SoftMorph2d(in_ch, k=k, beta=beta)
         self.proj = nn.Conv2d(in_ch, out_ch, 1)
         self.norm = nn.InstanceNorm2d(out_ch)
-        self.act = nn.LeakyReLU(inplace=True)
+        self.act = make_act(act)
+        # when structurally pruned, `_in_keep` holds the surviving input-channel indices and the
+        # forward selects them before the (shrunk) morph/proj. A buffer (not a patched method) so
+        # it follows .to(device) and the whole pruned module pickles/reloads cleanly.
+        self.register_buffer("_in_keep", None)
 
     def forward(self, x):
+        if self._in_keep is not None:
+            x = x[:, self._in_keep]
         return self.act(self.norm(self.proj(self.morph(x))))
 
 
@@ -130,14 +145,14 @@ class HybridUnit(nn.Module):
     # is what buys the speed-up -- the morphological unfold (this layer's cost) then runs
     # on only in_ch//2 channels. Falls back to a full ConvUnit when the input is too thin
     # to split (e.g. the 1-channel image stage), where morphology would be meaningless anyway.
-    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0, act="leaky"):
         super().__init__()
         self.in_m = in_ch // 2                         # channels routed to morphology
         self.in_c = in_ch - self.in_m                  # channels routed to conv
         self.out_m = out_ch // 2 if self.in_m > 0 else 0
         self.out_c = out_ch - self.out_m
-        self.morph = MorphUnit(self.in_m, self.out_m, k=k, beta=beta) if self.out_m else None
-        self.conv = ConvUnit(self.in_c, self.out_c) if self.out_c else None
+        self.morph = MorphUnit(self.in_m, self.out_m, k=k, beta=beta, act=act) if self.out_m else None
+        self.conv = ConvUnit(self.in_c, self.out_c, act=act) if self.out_c else None
 
     def forward(self, x):
         if self.morph is None:                         # thin input -> all conv
@@ -202,12 +217,12 @@ class StrictMorphUnit(nn.Module):
     # paper Setting-1 conv block: full max-plus/min-plus morphological conv (does the channel
     # mixing itself), then a DEPTHWISE 3x3 linear activation (per-channel, 9*out_ch params),
     # then norm + act. Contrast MorphUnit, which is depthwise-morph then a 1x1 channel mix.
-    def __init__(self, in_ch, out_ch, k=3, beta=10.0):
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0, act="leaky"):
         super().__init__()
         self.morph = StrictMorph2d(in_ch, out_ch, k=k, beta=beta)
         self.act_conv = nn.Conv2d(out_ch, out_ch, k, padding=k // 2, groups=out_ch)  # depthwise linear
         self.norm = nn.InstanceNorm2d(out_ch)
-        self.act = nn.LeakyReLU(inplace=True)
+        self.act = make_act(act)
 
     def forward(self, x):
         return self.act(self.norm(self.act_conv(self.morph(x))))
@@ -221,19 +236,19 @@ class StrictMorphUnit(nn.Module):
 #
 class Stage(nn.Module):
 
-    def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast"):
+    def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast", act="leaky"):
         super().__init__()
         self.mode = mode
         self.use_ckpt = True            # toggled by MorphUNet.set_checkpointing
         if mode == "conv":
-            self.sub1, self.sub2 = ConvUnit(in_ch, out_ch), ConvUnit(out_ch, out_ch)
+            self.sub1, self.sub2 = ConvUnit(in_ch, out_ch, act=act), ConvUnit(out_ch, out_ch, act=act)
         elif mode == "half":
-            self.sub1 = HybridUnit(in_ch, out_ch, k=k, beta=beta)
-            self.sub2 = HybridUnit(out_ch, out_ch, k=k, beta=beta)
+            self.sub1 = HybridUnit(in_ch, out_ch, k=k, beta=beta, act=act)
+            self.sub2 = HybridUnit(out_ch, out_ch, k=k, beta=beta, act=act)
         else:                            # "morph"
             Unit = StrictMorphUnit if impl == "paper" else MorphUnit
-            self.sub1 = Unit(in_ch, out_ch, k=k, beta=beta)
-            self.sub2 = Unit(out_ch, out_ch, k=k, beta=beta)
+            self.sub1 = Unit(in_ch, out_ch, k=k, beta=beta, act=act)
+            self.sub2 = Unit(out_ch, out_ch, k=k, beta=beta, act=act)
 
     def _forward(self, x):
         x = self.sub1(x)
@@ -260,6 +275,10 @@ STAGE_CONFIGS = {
     "balanced":   {"enc1", "enc2", "dec2", "dec1"},   # high-resolution stages only
     "bottleneck": {"center"},
     "deep":       {"enc4", "center", "dec4"},         # bottleneck + its two skip-adjacent neighbours
+    # morphology everywhere, progressively freeing the high-res (expensive) levels back to conv:
+    "full":       {"enc1", "enc2", "enc3", "enc4", "center", "dec4", "dec3", "dec2", "dec1"},  # all -> 18 morph layers (== heavy)
+    "full_l1":    {"enc2", "enc3", "enc4", "center", "dec4", "dec3", "dec2"},                   # linear level 1 -> 14 morph layers
+    "full_l2":    {"enc3", "enc4", "center", "dec4", "dec3"},                                   # linear levels 1-2 -> 10 morph layers
     "none":       set(),                              # all-conv reference
 }
 
@@ -289,18 +308,22 @@ class MorphUNet(nn.Module):
     #              the raw 1-channel intensities -- consistent with the paper's linear/morph
     #              alternation (Setting 3). Without it, enc1 morphology runs on the raw input.
     # checkpoint : gradient-checkpoint the morph stages (memory<->compute trade, no maths change).
+    # act        : "leaky" (nnU-Net default, used for training) or "relu" (plain ReLU, the
+    #              non-linearity the tropical-geometry / TropNNC pruning theory is derived for).
     def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy",
-                 half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast"):
+                 half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast",
+                 act="leaky"):
         super().__init__()
         morph = STAGE_CONFIGS[config] if isinstance(config, str) else set(config)
         self.config = config
         morph_mode = "half" if half_morph else "morph"
 
         def stage(name, i, o):
-            return Stage(i, o, mode=(morph_mode if name in morph else "conv"), k=k, beta=beta, impl=impl)
+            return Stage(i, o, mode=(morph_mode if name in morph else "conv"), k=k, beta=beta,
+                         impl=impl, act=act)
 
         # optional denoising conv stem: lift in_channels -> fs before enc1 (which then runs on fs)
-        self.stem = ConvUnit(in_channels, fs) if conv_stem else nn.Identity()
+        self.stem = ConvUnit(in_channels, fs, act=act) if conv_stem else nn.Identity()
         enc1_in = fs if conv_stem else in_channels
         # encoder
         self.enc1 = stage("enc1", enc1_in, fs)
