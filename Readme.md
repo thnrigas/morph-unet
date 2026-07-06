@@ -1,61 +1,59 @@
 ﻿# Morphological U-Net
 
-The project investigates whether morphological variations of the U-Net improves segmentation over the unaltered baseline. This is done in the context of the Medical Segmentation Decathlon. Morphological variants include top and/or bottom hat residuals as additional input channels, either precomputed with a fixed structuring element or computed by a morphological block with a trainable structuring element and a morphological loss function added to the preexisting loss.
+The project investigates whether morphological variations of the U-Net improve segmentation over the unaltered baseline, in the context of the Medical Segmentation Decathlon. We implement a standard U-Net and inject morphology at the input, with residuals as extra channels, either precomputed with a fixed structuring element or computed with a trainable structuring element by a morphological block, selected by a per task survey that ranks a library of classical filters (top/bottom-hat, gradient, reconstruction and h-/volume-dome, alternating-sequential and leveling residuals) and autoselects the top channels or custom selection. We also implement a morphological U-Net that replaces the convolution itself with morphological layers, whose stages use depthwise soft erosion/dilation followed by a 1x1 projection, in configurations that morphologise the whole network, only the high-resolution stages or only the bottleneck. All soft-morphology blocks approximate dilation/erosion via logsumexp with a temperature that is annealed during training to avoid the dead gradient problem. The pipeline runs 3-fold cross-validation with segmentation and training-cost/convergence metrics, and includes an MC-Dropout branch for predictive uncertainty.
 
 ## Setup & Run
 
 Data available in http://medicaldecathlon.com. Place in `./data/` or add path to config.
 
-Install requirements :
 ```
 pip install -r requirements.txt
 ```
 
-Preprocess data :
 ```
 python3 run_preprocessing.py
 ```
 
-Train and test (5-fold cross-validation) :
-
-Baseline Model :
+Baseline Model:
 ```
-for f in 0 1 2 3 4; do
+for f in 0 1 2; do
     python3 train_eval.py --tag baseline --fold $f
 done
 ```
 
-Static Residuals (one or both) :
+Static Filters:
 ```
-for f in 0 1 2 3 4; do
-    python3 train_eval.py --tag tophat --tophat --fold $f
+for f in 0 1 2; do
+    python3 train_eval.py --tag staticbank --static-auto --fold $f
 done
 ```
 
-Trainable Residuals (one or both) :
+Trainable Filters:
 ```
-for f in 0 1 2 3 4; do
-    python3 train_eval.py --tag morphblock --morph-block --tophat --fold $f
+for f in 0 1 2; do
+    python3 train_eval.py --tag morphbank --morph-bank auto --fold $f
 done
 ```
 
-Morph Loss Function (could add residuals, fixed or trainable) :
+Morphological Variants:
 ```
-for f in 0 1 2 3 4; do
-    python3 train_eval.py --tag morphloss --morph-loss --fold $f
+for cfg in bottleneck balanced deep; do
+    for f in 0 1 2; do
+        python3 train_eval.py --tag morphunet_$cfg --morph-unet $cfg --morph-k 3 --fold $f
+    done
 done
 ```
 
-Mean score over folds :
 ```
-for t in baseline tophat morphblock morphloss; do
+for t in baseline staticbank morphbank bottleneck balanced deep; do
     python3 train_eval.py --fold-mean $t
 done
 ```
 
-Compare results :
 ```
-python3 train_eval.py --compare baseline_mean_scores.json tophat_mean_scores.json morphblock_mean_scores.json morphloss_mean_scores.json
+python3 train_eval.py --compare baseline_mean_scores.json staticbank_mean_scores.json \
+    morphbank_mean_scores.json bottleneck_mean_scores.json balanced_mean_scores.json \
+    deep_mean_scores.json
 ```
 
 ## Attribution & License

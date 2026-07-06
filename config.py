@@ -13,20 +13,20 @@ TASK = os.environ.get("TASK", "Task08_HepaticVessel")
 CHANNEL = int(os.environ.get("CHANNEL", "0"))
 
 # per task default training hyperparameters
-_HP_DEFAULT = dict(epochs=150, patience=12, batch_size=8, patch_size=64, lr=2e-4, iters_per_epoch=0, fg_fraction=0.33)
+_HP_DEFAULT = dict(epochs=400, patience=30, batch_size=16, patch_size=128, lr=2e-4, iters_per_epoch=250, fg_fraction=0.33, val_cases=15, val_batch=12, grad_clip=5.0)
 
 # per task default custom hyperparameters
 _HP = {
-    "Task01_BrainTumour": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40),
+    "Task01_BrainTumour": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40, val_cases=25, grad_clip=1.0, lr=1e-4),
     "Task02_Heart": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
-    "Task03_Liver": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40),
-    "Task04_Hippocampus": dict(epochs=150, patience=12, iters_per_epoch=0, batch_size=32, fg_fraction=0.33),
+    "Task03_Liver": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40),
+    "Task04_Hippocampus": dict(epochs=150, patience=15, iters_per_epoch=0, batch_size=32, patch_size=64, fg_fraction=0.33),
     "Task05_Prostate": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
-    "Task06_Lung": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66),
-    "Task07_Pancreas": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.50),
-    "Task08_HepaticVessel": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=24, patch_size=128, fg_fraction=0.33),
+    "Task06_Lung": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66, grad_clip=2.0),
+    "Task07_Pancreas": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.50, grad_clip=2.0),
+    "Task08_HepaticVessel": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=24, patch_size=128, fg_fraction=0.33, grad_clip=5.0),
     "Task09_Spleen": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
-    "Task10_Colon": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66),
+    "Task10_Colon": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66, grad_clip=2.0),
 }
 HP = {**_HP_DEFAULT, **_HP.get(TASK, {})}
 

@@ -1,8 +1,12 @@
-# google cloud
+# google cloud setup
 gcloud auth login
 gcloud projects list
 gcloud config set project project-id
-gcloud compute ssh athnrigas@deeplearning-4-vm
+gcloud compute ssh athnrigas@deeplearning-1-vm
+
+# download files from google cloud
+gcloud compute scp athnrigas@deeplearning-1-vm:~/repo/filename ./
+gcloud compute scp --recurse athnrigas@deeplearning-1-vm:~/repo/foldername ./
 
 # clone repo
 git clone "https://github.com/thnrigas/morph-unet.git" repo
@@ -19,29 +23,32 @@ tar -xvf Task08_HepaticVessel.tar
 cd ..
 python3 run_preprocessing.py
 
+
+# Task08_HepaticVessel
+
 # baseline
 for f in 0 1 2 3 4; do
     python3 train_eval.py --tag baseline --fold $f
 done
 
-# morphological U-Net sweep
+# morphological U-Net
 for cfg in bottleneck balanced heavy; do
     for f in 0 1 2; do
         python3 train_eval.py --tag morphunet_$cfg --morph-unet $cfg --morph-k 3 --fold $f
     done
 done
 
-# trainable morphological blocks, survey-selected
+# trainable filters
 for f in 0 1 2; do
     python3 train_eval.py --tag morphbank --morph-bank auto --fold $f
 done
 
-# conv front-end (isolates morphology from "extra channels")
+# conv front-end
 for f in 0 1 2; do
     python3 train_eval.py --tag convctrl --morph-bank auto --conv-control --fold $f
 done
 
-# survey -> top-k STATIC filters -> datasets/augment_channels.py -> extra input channels
+# static filters
 for f in 0 1 2 3 4; do
     python3 train_eval.py --tag static --static-auto --fold $f
 done
@@ -58,7 +65,3 @@ done
 
 python3 train_eval.py --compare baseline_mean_scores.json \
     morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json morphunet_heavy_mean_scores.json
-
-# download files from VM
-gcloud compute scp athnrigas@deeplearning-4-vm:~/repo/filename ./
-gcloud compute scp --recurse athnrigas@deeplearning-4-vm:~/repo/foldername ./

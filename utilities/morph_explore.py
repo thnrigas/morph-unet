@@ -22,6 +22,7 @@
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import pickle
@@ -427,54 +428,9 @@ def _resolve_datasets(datasets):
 
 
 #
-# residual filters worth ranking on a single slice (bright/dark detail vs the target),
-# excludes the simplification outputs (leveling / area-open/close), which aren't residuals
+# subcommand: explore — render every filter on one representative case per dataset (visual only,
+# no scoring; use `survey` for train-split filter selection over all slices / n cases)
 #
-def _explore_bank(img2d, r, h, area):
-    lo = max(r - 1, 1)
-    return [
-        (f"tophat r={r}",         tophat(img2d, r)),
-        (f"bottomhat r={r}",      bottomhat(img2d, r)),
-        (f"gradient r={r}",       gradient(img2d, r)),
-        (f"recontophat r={r}",    recon_tophat(img2d, r)),
-        (f"ltophat r={r}",        line_tophat(img2d, r)),
-        (f"lbottomhat r={r}",     line_bottomhat(img2d, r)),
-        (f"asftophat r={r}",      asf_tophat(img2d, r)),
-        (f"leveltophat r={r}",    leveling_tophat(img2d, r)),
-        (f"hdome h={h}",          hdome(img2d, h)),
-        (f"vdome h={h} a={area}", volume_dome(img2d, h, area)),
-        (f"gband {lo}-{r}",       band(img2d, lo, r)),
-        (f"fband {lo}-{r}",       band_dark(img2d, lo, r)),
-    ]
-
-
-#
-# single-slice ranking of the filter bank against the label, same metrics as survey but on one
-# slice (indicative only, use survey for train-split selection), returns sorted rows
-#
-def _rank_slice(img2d, lbl2d, r, h, area, rank_by):
-    rows = []
-    for name, res in _explore_bank(img2d, r, h, area):
-        s = region_stats(res, lbl2d)
-        if not s:
-            continue
-        row = {"key": name, **{m: s[m] for m in METRICS}}
-        row["conc_auc"] = row["concentration"] * row["auc"]
-        rows.append(row)
-    rows.sort(key=lambda x: x[rank_by], reverse=True)
-    return rows
-
-
-def _print_rank(rows, rank_by):
-    cols = ("concentration", "enrichment", "auc", "fisher", "conc_auc")
-    print(f"  ranking (single slice, rank-by={rank_by}):")
-    print("    " + f"{'filter':16s}" + " ".join(f"{c:>13s}" for c in cols))
-    for row in rows:
-        print("    " + f"{row['key']:16s}" + " ".join(f"{row[c]:13.3f}" for c in cols))
-    if rows:
-        print(f"    >>> best ({rank_by}) = {rows[0][rank_by]:.3f}  ({rows[0]['key']})")
-
-
 def cmd_explore(args):
     os.makedirs(args.out_dir, exist_ok=True)
     for ddir in _resolve_datasets(args.datasets):
@@ -502,9 +458,6 @@ def cmd_explore(args):
             print(f"{task_name}: selected case {fn}, slice {sel} -> {out_path}", flush=True)
             render_all(i2, l2, args.se_radius, args.h, args.area, out_path,
                        show=not args.no_show, save_individual=False)
-            if not args.no_rank and l2 is not None and (l2 > 0).any():
-                _print_rank(_rank_slice(i2, l2, args.se_radius, args.h, args.area, args.rank_by),
-                            args.rank_by)
         except Exception as e:
             print(f"{ddir}: FAILED {type(e).__name__}: {e}", flush=True)
 
@@ -714,8 +667,11 @@ def cmd_survey(args):
     with open(out_path, "w") as f:
         f.write("\n".join(head) + "\n")
 
+    # whole-dataset surveys (tag "all", not a fold's train split) write to separate *_all_* files,
+    # so they never clobber the leakage-clean per-fold specs that train_eval's --*-auto consumes
+    fname_tag = "all_" if tag == "all" else ""
     # machine-readable handoff: fold -> spec, consumed by `train_eval.py --morph-bank auto`
-    bank_path = os.path.join(args.out_dir, f"{task}_bank.json")
+    bank_path = os.path.join(args.out_dir, f"{task}_{fname_tag}bank.json")
     bank = {}
     if os.path.exists(bank_path):
         with open(bank_path) as f:
@@ -725,7 +681,7 @@ def cmd_survey(args):
         json.dump(bank, f, indent=2)
 
     # machine-readable static handoff: fold -> list of filter specs for augment_channels.py
-    static_path = os.path.join(args.out_dir, f"{task}_static.json")
+    static_path = os.path.join(args.out_dir, f"{task}_{fname_tag}static.json")
     static_bank = {}
     if os.path.exists(static_path):
         with open(static_path) as f:
@@ -746,7 +702,8 @@ def cmd_survey(args):
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # project root
         aug = os.path.join(root_dir, "datasets", "augment_channels.py")
         src = os.path.join(args.dataset_dir, "preprocessed")
-        out = os.path.join(args.dataset_dir, f"preprocessed_static_f{args.fold}")
+        suffix = "h" + hashlib.md5(",".join(static_specs).encode()).hexdigest()[:8]
+        out = os.path.join(args.dataset_dir, f"preprocessed_static_{suffix}")
         if not os.path.isdir(src):
             print(f"[augment] SKIPPED: preprocessed dir not found ({src}). Run run_preprocessing.py first.")
         else:
@@ -772,9 +729,6 @@ def build_parser():
     pe.add_argument("--scan", type=int, default=6, help="cases scanned per dataset to pick the densest")
     pe.add_argument("--out-dir", default="results/explore", help="output directory to save PNGs")
     pe.add_argument("--no-show", action="store_true")
-    pe.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
-                    default="conc_auc", help="metric to rank the single-slice filter table by")
-    pe.add_argument("--no-rank", action="store_true", help="skip the single-slice ranking table")
     pe.set_defaults(func=cmd_explore)
 
     ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
@@ -797,7 +751,7 @@ def build_parser():
                     help="quick: score only the densest foreground slice per case")
     ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
                     default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
-    ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 8),
+    ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 16),
                     help="parallel worker processes (default: cpu count capped at 8, min 1)")
     ps.add_argument("--top-k", type=int, default=5, help="how many trainable + static filters to auto-select")
     ps.add_argument("--out-dir", default="results/explore")

@@ -72,7 +72,7 @@ def preprocess_data(root_dir, modality=None, channel=0, y_shape=64, z_shape=64, 
     worker = partial(_process_case, image_dir=image_dir, label_dir=label_dir, output_dir=output_dir,
                      mod=mod, channel=channel, n_mod=n_mod, se_radius=se_radius, y_shape=y_shape, z_shape=z_shape)
     if num_workers is None:
-        num_workers = min(os.cpu_count() or 1, 8)
+        num_workers = min(os.cpu_count() or 1, 16)
     if num_workers <= 1:
         for f in nii_files:
             print(worker(f), flush=True)

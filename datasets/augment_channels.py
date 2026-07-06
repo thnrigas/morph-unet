@@ -85,7 +85,7 @@ def main():
     ap.add_argument("--src", default=str(config.PREPROCESSED_DIR),
                     help="dir of (image,label) npys (default: config.PREPROCESSED_DIR)")
     ap.add_argument("--out", default=None, help="output dir (default: <src>_static)")
-    ap.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 8))
+    ap.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 16))
     args = ap.parse_args()
 
     src = args.src

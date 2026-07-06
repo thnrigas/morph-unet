@@ -5,6 +5,7 @@
 import argparse
 import contextlib
 import glob
+import hashlib
 import json
 import os
 import pickle
@@ -108,8 +109,39 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
     return spec
 
 #
-# resolve static channels, read cached spec or run the full survey, then run augment_channels.py
-# if the augmented dir doesn't exist yet, n_ch is the number of static filter channels
+# build (or reuse) the augmented preprocessed dir holding `specs` as static channels, running
+# augment_channels.py once; reuse only if the cached dir's manifest matches specs exactly (not
+# just the count). `suffix` disambiguates the dir (per-fold for survey, spec-hash for manual)
+#
+def _ensure_static_dir(specs, suffix):
+    prep_dir = str(config.PREPROCESSED_DIR)
+    static_dir = prep_dir.rstrip("/") + f"_static_{suffix}"
+    manifest = os.path.join(static_dir, "filters.json")
+    if os.path.exists(manifest):
+        with open(manifest) as f:
+            cached = json.load(f)
+    else:
+        cached = None
+    if cached == specs:
+        print(f"static dir exists: {static_dir} ({len(specs)} filters)", flush=True)
+    else:
+        print(f"precomputing static channels: {specs} -> {static_dir}", flush=True)
+        augment = os.path.join(config.PROJECT_ROOT, "datasets", "augment_channels.py")
+        subprocess.run([sys.executable, augment, "--filters"] + specs + [
+                        "--src", prep_dir, "--out", static_dir], check=True)
+    print(f"static -> {specs}  ({len(specs)} channels)", flush=True)
+    return static_dir, len(specs)
+
+#
+# augmented dirs are keyed by a hash of the spec list, the filter channels are deterministic
+# so any fold runs with the same specs, shares one dir and rebuilds are skipped
+#
+def _spec_suffix(specs):
+    return "h" + hashlib.md5(",".join(specs).encode()).hexdigest()[:8]
+
+#
+# resolve static channels, read cached spec or run the full survey (per fold, since selection is
+# fold dependent), then build/reuse the spec-hashed augmented dir, n_ch is the channel count
 #
 def ensure_static_channels(task, fold, dataset_dir, top_k, workers, root="results/explore", n=0):
     specs = _read_static_spec(task, fold, root)
@@ -119,26 +151,14 @@ def ensure_static_channels(task, fold, dataset_dir, top_k, workers, root="result
     if not specs:
         print("no static filters selected by survey", flush=True)
         return None, 0
-    # augmented dir is per fold
-    prep_dir = str(config.PREPROCESSED_DIR)
-    static_dir = prep_dir.rstrip("/") + f"_static_f{fold}"
-    # reuse only if the cached dir was built from the exact same filters
-    manifest = os.path.join(static_dir, "filters.json")
-    if os.path.exists(manifest):
-        with open(manifest) as f:
-            cached = json.load(f)
-    else:
-        cached = None
-    fresh = cached == specs
-    if fresh:
-        print(f"static dir exists: {static_dir} ({len(specs)} filters)", flush=True)
-    else:
-        print(f"precomputing static channels: {specs} -> {static_dir}", flush=True)
-        augment = os.path.join(config.PROJECT_ROOT, "datasets", "augment_channels.py")
-        subprocess.run([sys.executable, augment, "--filters"] + specs + [
-                        "--src", prep_dir, "--out", static_dir], check=True)
-    print(f"static -> {specs}  ({len(specs)} channels)", flush=True)
-    return static_dir, len(specs)
+    return _ensure_static_dir(specs, _spec_suffix(specs))
+
+#
+# resolve explicit --static-filters (bypass the survey): same spec-hashed dir, so it dedupes with
+# the survey path whenever the specs coincide
+#
+def ensure_static_filters(specs):
+    return _ensure_static_dir(specs, _spec_suffix(specs))
 
 #
 # build loaders
@@ -172,7 +192,7 @@ def build_loaders(args):
 #
 # run epoch
 #
-def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_loss=None):
+def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_loss=None, grad_clip=5.0):
     train_mode = optimizer is not None
     model.train() if train_mode else model.eval()
     losses = []
@@ -192,9 +212,10 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
                     loss = loss + morph_loss(pred_softmax)
             if train_mode:
                 loss.backward()
-                # clip grad norm so foreground sparse batch with sharp Dice gradient
-                # can't spike/destabilise the epoch
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                # clip grad norm so a foreground-sparse batch with a sharp Dice gradient can't
+                # spike/diverge the epoch, tighter clip for sparse multi-class tasks
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
@@ -449,26 +470,28 @@ def main():
     p.add_argument("--morph-beta", type=float, default=10.0)
     p.add_argument("--morph-beta-final", type=float, default=30.0)
     p.add_argument("--survey-top-k", type=int, default=5)
-    p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 8))
     p.add_argument("--survey-n", type=int, default=25)
+    p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 16))
     p.add_argument("--freeze-se", action="store_true")
     # training parameters
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
     p.add_argument("--patience", type=int, default=config.HP["patience"])
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
-    p.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 6))
+    p.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
     p.add_argument("--lr", type=float, default=config.HP["lr"])
     p.add_argument("--iters-per-epoch", type=int, default=config.HP["iters_per_epoch"])
-    p.add_argument("--val-cases", type=int, default=15)
+    p.add_argument("--val-cases", type=int, default=config.HP["val_cases"])
     p.add_argument("--val-every", type=int, default=3)
-    p.add_argument("--val-batch", type=int, default=12)
+    p.add_argument("--val-batch", type=int, default=config.HP["val_batch"])
     p.add_argument("--fg-fraction", type=float, default=config.HP["fg_fraction"])
+    p.add_argument("--grad-clip", type=float, default=config.HP["grad_clip"])
     p.add_argument("--se-lr-mult", type=float, default=10.0)
     # static input channels
     p.add_argument("--static-dir", default=None)
     p.add_argument("--static-channels", type=int, default=0)
     p.add_argument("--static-auto", action="store_true")
+    p.add_argument("--static-filters", nargs="+", metavar="SPEC")
     # other
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--resume", action="store_true")
@@ -503,6 +526,9 @@ def main():
     if args.morph_bank == "auto":
         args.morph_bank = ensure_bank_spec(config.TASK, args.fold, config.DATA_DIR,
                                            args.survey_top_k, args.survey_workers, n=args.survey_n)
+    # --static-filters : explicit specs -> extra input channels (takes priority over --static-auto)
+    if args.static_filters and not args.static_dir and args.static_channels == 0:
+        args.static_dir, args.static_channels = ensure_static_filters(args.static_filters)
     if args.static_auto and not args.static_dir and args.static_channels == 0:
         sdir, n = ensure_static_channels(config.TASK, args.fold, config.DATA_DIR,
                                          args.survey_top_k, args.survey_workers, n=args.survey_n)
@@ -563,7 +589,7 @@ def main():
     print(f"[{stem}] device={device} mode={mode} loss={loss_desc} seed={args.seed} "
           f"fold={args.fold} loader_in_ch={in_channels} patch={args.patch_size} "
           f"iters/epoch={epoch_len} max-epochs={args.epochs} (<= {epoch_len * args.epochs} updates) "
-          f"fg={args.fg_fraction}{static_info}")
+          f"fg={args.fg_fraction} grad_clip={args.grad_clip:g}{static_info}")
 
     # foreground only Dice, background is most of pixels and its Dice is almost constant
     # so including it dilutes the gradient on the sparse target, CE still sees all classes
@@ -620,7 +646,8 @@ def main():
                 frac = (epoch - 1) / max(args.epochs - 1, 1)
                 cur_beta = args.morph_beta * (args.morph_beta_final / args.morph_beta) ** frac
                 model.set_beta(cur_beta)
-            tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss)
+            tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss,
+                           grad_clip=args.grad_clip)
             do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
             if do_val:
                 vd, per_class = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
