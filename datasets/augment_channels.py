@@ -13,18 +13,24 @@
 #   hdome:H   vdome:H:AREA  areaopen:AREA  areaclose:AREA
 #
 # Examples:
-#   python augment_channels.py --filters recontophat:3 hdome:0.1 vdome:0.1:100
-#   TASK=Task08_HepaticVessel python augment_channels.py --filters vdome:0.1:100 --workers 8
+#   python datasets/augment_channels.py --filters recontophat:3 hdome:0.1 vdome:0.1:100
+#   TASK=Task08_HepaticVessel python datasets/augment_channels.py --filters vdome:0.1:100 --workers 8
 #
 # Then train on the result by pointing the loader at --out with input_slice=(0..N), label_slice=N+1.
 #
 
 import argparse
+import json
 import os
+import sys
 from functools import partial
 from multiprocessing import Pool
 
 import numpy as np
+
+# run from anywhere: put the project root (parent of this folder) on the import path so the
+# shared project modules (config, utilities.morph_explore) resolve
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from utilities.morph_explore import (norm01, tophat, bottomhat, gradient, recon_tophat, hdome,
@@ -106,6 +112,11 @@ def main():
         for fname in cases:
             _, shape = worker(fname)
             print(f"  {fname}  {shape}", flush=True)
+    # manifest of the exact specs this dir was built from, written last (after every case
+    # succeeded) so a crashed/partial run leaves no manifest and the dir is treated as stale.
+    # consumers reuse the dir only if this list matches their specs exactly (not just the count).
+    with open(os.path.join(out, "filters.json"), "w") as f:
+        json.dump(args.filters, f)
     print("done.")
 
 

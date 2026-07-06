@@ -26,6 +26,11 @@ from collections import defaultdict
 import numpy as np
 import torch
 
+# run from anywhere: put the project root (parent of this folder) on the import path so the
+# shared project modules (config, train_eval, networks, ...) resolve alongside sibling mc_common
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import config
 from train_eval import pick_device
 from mc_common import build_plain_loaders

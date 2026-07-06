@@ -6,8 +6,14 @@
 #
 # Kaggle (writes into DATA_DIR -> point it at a WRITABLE copy of the raw task):
 #   DATA_DIR=/kaggle/working/data/Task04_Hippocampus TASK=Task04_Hippocampus \
-#       python run_preprocessing_mc.py
+#       python uncertainty/run_preprocessing_mc.py
 #
+
+# run from anywhere: put the project root (parent of this folder) on the import path so the
+# shared project modules (config, datasets, ...) resolve
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from datasets.preprocessing_plain import preprocess_data_plain

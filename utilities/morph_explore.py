@@ -1,27 +1,27 @@
 #
 # Morphology Explorer
 #
-# one tool, two subcommands:
+# two modes
 #
-#   explore  - single-case deep dive. 4-panel (image, top-hat, bottom-hat, image+label),
-#              2D or 3D, precomputed 4-channel .npy OR fresh morphology, with region stats.
-#   survey   - batch, per-dataset look to pick a task before training: modality-aware
-#              preprocessing (CT windowing / MRI normalisation), an SE-size sweep and
-#              granulometric bands, scored by a target-concentration ranking.
+#   explore  render every filter in the vocabulary on the densest foreground slice of one
+#            case, for a specific dataset or all of them, visual only, no ranking
+#   survey   batch ranking to pick filters before training, modality-aware preprocessing,
+#            an SE-size sweep and bands scored over all foreground slices
+#            by a target-concentration ranking, computes only, no figures
 #
 # examples
-#   # single preprocessed volume (what the network receives)
-#   python utilities/morph_explore.py explore data/Task04_Hippocampus/preprocessed/hippocampus_001.npy
-#   # a raw image + its label, fresh morphology at a chosen SE size
-#   python utilities/morph_explore.py explore img.nii.gz --label mask.nii.gz --fresh --se-radius 3
-#   # survey a dataset: sweep radii + bands over 8 cases, render the first 2, rank residuals
-#   python utilities/morph_explore.py survey data/Task08_HepaticVessel --n 8 --viz 2
-#   python utilities/morph_explore.py survey data/Task01_BrainTumour --channel 0   # FLAIR
+#   # visualise the full filter bank on one dataset (or every data/Task*)
+#   python3 utilities/morph_explore.py explore data/Task08_HepaticVessel
+#   python3 utilities/morph_explore.py explore all
+#   # survey a dataset, rank residuals over 25 cases, all foreground slices, train split
+#   python3 utilities/morph_explore.py survey data/Task08_HepaticVessel
+#   python3 utilities/morph_explore.py survey data/Task01_BrainTumour --channel 0
 #
-# (bare `morph_explore.py <path>` still works: it defaults to the explore subcommand.)
+# (`morph_explore.py <dataset>` still works, it defaults to the explore subcommand)
 #
 
 import argparse
+import glob
 import json
 import os
 import pickle
@@ -31,12 +31,10 @@ from functools import partial
 from multiprocessing import Pool
 import numpy as np
 
-
 #
-# IO
+# IO, load image formats to float arrays
 #
 def load_any(path):
-    """Load .npy / .nii(.gz) / common image formats -> float ndarray."""
     ext = path.lower()
     if ext.endswith(".npy"):
         return np.load(path).astype(np.float64)
@@ -48,12 +46,10 @@ def load_any(path):
     arr = np.asarray(Image.open(path)).astype(np.float64)
     return arr.mean(-1) if arr.ndim == 3 else arr
 
-
 def load_meta(ds_dir):
     with open(os.path.join(ds_dir, "dataset.json")) as f:
         d = json.load(f)
     return d.get("modality", {"0": "MRI"}), d.get("labels", {})
-
 
 def norm01(v):
     rng = v.max() - v.min()
@@ -63,16 +59,10 @@ def norm01(v):
 #
 # preprocessing (windowing / normalisation), modality-aware
 #
-def preprocess(vol, modality_str, channel=0, n_mod=1, ct_center=40.0, ct_width=400.0,
-               p_lo=0.5, p_hi=99.5):
-    """Normalise to [0,1] matched to the modality.
-
-    CT  : clip to a Hounsfield window so soft tissue keeps contrast (vs air/bone).
-    MRI : robust percentile clip of the foreground, then min-max (intensity is relative).
-    """
-    if vol.ndim == 4:                       # multi-modal: sequences stacked on one axis
+def preprocess(vol, modality_str, channel=0, n_mod=1, ct_center=40.0, ct_width=400.0, p_lo=0.5, p_hi=99.5):
+    if vol.ndim == 4:       # multi-modal, sequences stacked on one axis
         # the modality axis is the one whose length equals the modality count
-        # (medpy may place it first or last), leaving 3 spatial axes to match the label
+        # leaving 3 spatial axes to match the label
         cand = [ax for ax in range(4) if vol.shape[ax] == n_mod]
         vol = np.take(vol, channel, axis=cand[-1] if cand else 3)
     v = vol.astype(np.float64)
@@ -85,46 +75,39 @@ def preprocess(vol, modality_str, channel=0, n_mod=1, ct_center=40.0, ct_width=4
         v = np.clip(v, lo, hi)
     return norm01(v)
 
-
 #
-# morphology (2D or 3D, chosen by ndim)
+# morphology (2D or 3D)
 #
 def _footprint(ndim, r):
     from skimage.morphology import ball, disk
     return ball(r) if ndim == 3 else disk(r)
 
-
 def opening_of(img, r):
     from scipy.ndimage import grey_opening
     return grey_opening(img, footprint=_footprint(img.ndim, r))
-
 
 def closing_of(img, r):
     from scipy.ndimage import grey_closing
     return grey_closing(img, footprint=_footprint(img.ndim, r))
 
-
 def tophat(img, r):
     return np.clip(img - opening_of(img, r), 0, None)
-
 
 def bottomhat(img, r):
     return np.clip(closing_of(img, r) - img, 0, None)
 
-
 def gradient(img, r):
-    """morphological gradient = dilation - erosion (boundary-selective)."""
     from scipy.ndimage import grey_dilation, grey_erosion
     fp = _footprint(img.ndim, r)
     return np.clip(grey_dilation(img, footprint=fp) - grey_erosion(img, footprint=fp), 0, None)
 
-
+#
+# reconstruction top-hat = img - opening-by-reconstruction, marker = erosion(img, disk_r)
+# kills small bright structures, geodesic reconstruction regrows the survivors to their exact
+# original shape, residual is a boundary-faithful map of the removed thin structures
+# non differentiable, static channel only, not a trainable SE block
+#
 def recon_tophat(img, r):
-    """reconstruction top-hat = img - opening-by-reconstruction. Marker = erosion(img, disk_r)
-    kills thin/small bright structures; geodesic reconstruction under `img` regrows the SURVIVORS
-    to their exact original shape (no corner rounding, unlike the plain disk top-hat), so the
-    residual is a boundary-faithful map of the removed thin structures. Non-differentiable
-    (iterative reconstruction) -> static channel only, not a trainable SE block."""
     from scipy.ndimage import grey_erosion
     from skimage.morphology import reconstruction
     marker = grey_erosion(img, footprint=_footprint(img.ndim, r))
@@ -132,40 +115,49 @@ def recon_tophat(img, r):
     return np.clip(img - opened, 0, None)
 
 
+#
+# h-dome = img - reconstruction(img - h, img), extracts every bright peak/ridge rising more
+# than height h above its surroundings, size and shape agnostic (no radius), robust to h
+# non differentiable (iterative), static channel only
+#
 def hdome(img, h):
-    """h-dome = img - reconstruction(img - h, img). Extracts every bright peak/ridge that rises
-    more than height `h` above its local surroundings, size- and shape-agnostically (no radius
-    to pick), robust to the exact `h`. Non-differentiable (iterative) -> static channel only."""
     from skimage.morphology import reconstruction
     rec = reconstruction(img - float(h), img, method="dilation")
     return np.clip(img - rec, 0, None)
 
 
+#
+# area opening, drop bright connected components smaller than area px, keep the rest at their
+# exact shape, a denoiser (thin long vessels survive, small bright blobs don't), static
+#
 def area_open(img, area):
-    """area opening: drop bright connected components smaller than `area` pixels, keeping the rest
-    at their exact shape. A denoiser -- thin long vessels (large area) survive, small bright blobs
-    don't. Use as a cleaned input channel (precision), not as a residual. Static."""
     from skimage.morphology import area_opening
     return area_opening(img.astype(np.float32), area_threshold=int(area))
 
 
+#
+# area closing (dual of area_open), fill dark components smaller than area, bridges small dark
+# gaps in the bright vessel tree (recall), static
+#
 def area_close(img, area):
-    """area closing (dual of area_open): fill dark components smaller than `area` -- bridges small
-    dark gaps in the bright vessel tree (recall). Static."""
     from skimage.morphology import area_closing
     return area_closing(img.astype(np.float32), area_threshold=int(area))
 
 
+#
+# area-gated h-dome (cv18 volume marker), keep only bright domes that are both high-contrast
+# (rise > h) and large enough (>= area px), isolates vessels better than contrast or size alone
+# static (non differentiable)
+#
 def volume_dome(img, h, area):
-    """area-gated h-dome (cv18 'volume' marker): keep only bright domes that are BOTH high-contrast
-    (rise > h) AND large enough (>= `area` px). Vessels are high-contrast and large-area, so this
-    isolates them better than contrast or size alone. Static (non-differentiable)."""
     return area_open(hdome(img, h), area)
 
 
+#
+# alternating sequential filter, cascade opening-then-closing at radii 1..r
+# (multiscale, edge-respecting simplification / denoise), static
+#
 def asf(img, r):
-    """alternating sequential filter: cascade opening-then-closing at radii 1..r (multiscale,
-    edge-respecting simplification / denoise). Static."""
     from scipy.ndimage import grey_opening, grey_closing
     out = img
     for rr in range(1, int(r) + 1):
@@ -174,16 +166,20 @@ def asf(img, r):
     return out
 
 
+#
+# img - ASF, the bright detail the ASF removed (multiscale top-hat), cleaner thin-structure
+# highlighter than a single-scale opening, static
+#
 def asf_tophat(img, r):
-    """img - ASF: the bright detail the ASF removed (multiscale top-hat). Cleaner thin-structure
-    highlighter than a single-scale opening. Static."""
     return np.clip(img - asf(img, r), 0, None)
 
 
+#
+# morphological leveling toward a Gaussian marker (sigma=r), edge-preserving simplification,
+# flattens small fluctuations without blurring or shifting strong contours, iterate the marker
+# g <- (f wedge dilate(g)) vee erode(g) to near idempotence, static
+#
 def leveling(img, r, iters=30):
-    """morphological leveling toward a Gaussian marker (sigma=r): edge-preserving simplification --
-    flattens small fluctuations WITHOUT blurring or shifting strong contours. Iterate the marker
-    g <- (f wedge dilate(g)) vee erode(g) to (near) idempotence. Static."""
     from scipy.ndimage import gaussian_filter, grey_dilation, grey_erosion
     f = img.astype(np.float32)
     g = gaussian_filter(f, sigma=float(r))
@@ -197,13 +193,17 @@ def leveling(img, r, iters=30):
     return g
 
 
+#
+# img - leveling, fine bright detail the leveling simplified away, static
+#
 def leveling_tophat(img, r):
-    """img - leveling: fine bright detail the leveling simplified away. Static."""
     return np.clip(img - leveling(img, r), 0, None)
 
 
+#
+# (L, L) binary line SE through the centre at angle radians (2D only)
+#
 def _line_footprint(length, angle):
-    """(L, L) binary line SE through the centre at `angle` radians (2-D only)."""
     r = length // 2
     fp = np.zeros((length, length), dtype=bool)
     for t in range(-r, r + 1):
@@ -214,10 +214,11 @@ def _line_footprint(length, angle):
     return fp
 
 
+#
+# orientation-invariant line top-hat, max over oriented line SEs of (img - opening), so a
+# tubular structure survives at whatever angle it runs, 2D only, falls back to isotropic on 3D
+#
 def line_tophat(img, r, n_angles=4):
-    """orientation-invariant line top-hat: max over oriented line SEs of (img - opening),
-    so a tubular structure survives at whatever angle it runs. 2-D slices only; falls back
-    to the isotropic top-hat on 3-D input."""
     from scipy.ndimage import grey_opening
     if img.ndim != 2:
         return tophat(img, r)
@@ -228,9 +229,11 @@ def line_tophat(img, r, n_angles=4):
     return best
 
 
+#
+# orientation-invariant line bottom-hat, max over oriented line SEs of (closing - img), for
+# dark tubular structures, 2D only, falls back to the isotropic bottom-hat on 3D
+#
 def line_bottomhat(img, r, n_angles=4):
-    """orientation-invariant line bottom-hat: max over oriented line SEs of (closing - img),
-    for dark tubular structures. 2-D slices only; falls back to the isotropic bottom-hat on 3-D."""
     from scipy.ndimage import grey_closing
     if img.ndim != 2:
         return bottomhat(img, r)
@@ -241,18 +244,22 @@ def line_bottomhat(img, r, n_angles=4):
     return best
 
 
+#
+# granulometric band (opening γ), bright structure with scale in (r_lo, r_hi]
+#
 def band(img, r_lo, r_hi):
-    """granulometric band (opening γ): bright structure with scale in (r_lo, r_hi]."""
     return np.clip(opening_of(img, r_lo) - opening_of(img, r_hi), 0, None)
 
 
+#
+# anti-granulometric band (closing φ), dark structure with scale in (r_lo, r_hi]
+#
 def band_dark(img, r_lo, r_hi):
-    """anti-granulometric band (closing φ): dark structure with scale in (r_lo, r_hi]."""
     return np.clip(closing_of(img, r_hi) - closing_of(img, r_lo), 0, None)
 
 
 #
-# slice selection: (axis, index) of the largest-target slice over all axes
+# slice selection, (axis, index) of the largest target slice over all axes
 #
 def pick_slice(label, forced=None):
     if label is None or label.ndim == 2 or not (label > 0).any():
@@ -275,11 +282,12 @@ def take(a, sel):
     return np.take(a, idx, axis=ax)
 
 
+#
+# reorder img axes to match the label (medpy permutes the spatial axes of some 4D volumes),
+# when several permutations match the shape disambiguate by the one whose label foreground sits
+# on image tissue (highest mean intensity), since a wrong swap lands the label on background
+#
 def align_axes(img, label):
-    """Reorder img axes to match the label (medpy permutes the spatial axes of some
-    4-D volumes). When several permutations match the shape — e.g. two equal-length
-    axes — disambiguate by choosing the one whose label foreground sits on image
-    tissue (highest mean intensity), since a wrong swap lands the label on background."""
     from itertools import permutations
     if img.shape == label.shape:
         return img
@@ -297,10 +305,11 @@ def align_axes(img, label):
 #
 # stats: where residual energy lands relative to the target
 #
+#
+# AUC = P(residual on a random fg pixel > a random bg pixel), via Mann-Whitney U, threshold-free
+# discriminability (0.5 = chance, 1.0 = perfectly separable), background subsampled for speed
+#
 def _auc(pos, neg, max_n=20000):
-    """AUC = P(residual on a random fg pixel > a random bg pixel), via Mann-Whitney U.
-    Threshold-free discriminability: 0.5 = chance, 1.0 = perfectly separable. Background is
-    subsampled for speed."""
     from scipy.stats import rankdata
     pos = np.asarray(pos, np.float64).ravel()
     neg = np.asarray(neg, np.float64).ravel()
@@ -343,57 +352,11 @@ def region_stats(residual, label):
 #
 # rendering
 #
-def render_single(image, th, bh, label, out, show):
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 4, figsize=(16, 4.2))
-    ax[0].imshow(image, cmap="gray"); ax[0].set_title("image")
-    ax[1].imshow(th, cmap="magma"); ax[1].set_title("top-hat")
-    ax[2].imshow(bh, cmap="magma"); ax[2].set_title("bottom-hat")
-    ax[3].imshow(image, cmap="gray"); ax[3].set_title("image + label contour")
-    if label is not None and label.max() > 0:
-        for a in (ax[1], ax[2], ax[3]):
-            a.contour(label, levels=np.arange(0.5, label.max() + 1), colors="cyan", linewidths=0.7)
-    for a in ax:
-        a.axis("off")
-    fig.tight_layout()
-    if out:
-        fig.savefig(out, dpi=130, bbox_inches="tight"); print(f"saved figure -> {out}")
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def render_grid(img2d, label2d, radii, bands, out, dark_bands=()):
-    import matplotlib.pyplot as plt
-    ncol = max(len(radii) + 1, len(bands) + len(dark_bands) + 1)
-    fig, ax = plt.subplots(3, ncol, figsize=(3.0 * ncol, 9.2))
-    for a in ax.ravel():
-        a.axis("off")
-
-    def contour(a):
-        if label2d is not None and label2d.max() > 0:
-            a.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.6)
-
-    ax[0, 0].imshow(img2d, cmap="gray"); ax[0, 0].set_title("image (preprocessed)")
-    ax[1, 0].imshow(img2d, cmap="gray"); ax[1, 0].set_title("image + label"); contour(ax[1, 0])
-    ax[2, 0].imshow(img2d, cmap="gray"); ax[2, 0].set_title("image")
-    for j, r in enumerate(radii, start=1):
-        ax[0, j].imshow(tophat(img2d, r), cmap="magma"); ax[0, j].set_title(f"top-hat r={r}"); contour(ax[0, j])
-        ax[1, j].imshow(bottomhat(img2d, r), cmap="magma"); ax[1, j].set_title(f"bottom-hat r={r}"); contour(ax[1, j])
-    # row 2: bright bands (opening γ) then dark bands (closing φ)
-    row2 = [(f"γ{lo}-γ{hi}", band(img2d, lo, hi)) for lo, hi in bands] \
-        + [(f"φ{lo}-φ{hi}", band_dark(img2d, lo, hi)) for lo, hi in dark_bands]
-    for j, (name, m) in enumerate(row2, start=1):
-        if j < ncol:
-            ax[2, j].imshow(m, cmap="magma"); ax[2, j].set_title(name); contour(ax[2, j])
-    fig.tight_layout()
-    fig.savefig(out, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-
-
-def render_all(img2d, label2d, r, h, area, out, show):
-    """Grid of EVERY filter in the library at the given radius / h / area, with the label contour
-    overlaid, so a single case shows the full vocabulary (trainable + static) side by side."""
+#
+# grid of every filter in the library at the given radius / h / area, with the label contour
+# overlaid, so a single case shows the full vocabulary (trainable + static) side by side
+#
+def render_all(img2d, label2d, r, h, area, out, show, save_individual=True):
     import matplotlib.pyplot as plt
     lo = max(r - 1, 1)
     panels = [
@@ -429,54 +392,121 @@ def render_all(img2d, label2d, r, h, area, out, show):
     fig.tight_layout()
     if out:
         fig.savefig(out, dpi=120, bbox_inches="tight"); print(f"saved grid -> {out}")
-        # also save one PNG per filter next to the grid: <stem>_<filter>.png
-        stem, ext = os.path.splitext(out)
-        ext = ext or ".png"
-        for title, m, cmap, cont in panels:
-            f2, a2 = plt.subplots(figsize=(4, 4))
-            a2.imshow(m, cmap=cmap); a2.set_title(title, fontsize=10); a2.axis("off")
-            if cont and has_lbl:
-                a2.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.7)
-            safe = title.replace(" ", "_").replace("=", "").replace("/", "-")
-            f2.savefig(f"{stem}_{safe}{ext}", dpi=120, bbox_inches="tight"); plt.close(f2)
-        print(f"saved {len(panels)} per-filter PNGs -> {stem}_<filter>{ext}")
+        if save_individual:
+            # also save one PNG per filter next to the grid: <stem>_<filter>.png
+            stem, ext = os.path.splitext(out)
+            ext = ext or ".png"
+            for title, m, cmap, cont in panels:
+                f2, a2 = plt.subplots(figsize=(4, 4))
+                a2.imshow(m, cmap=cmap); a2.set_title(title, fontsize=10); a2.axis("off")
+                if cont and has_lbl:
+                    a2.contour(label2d, levels=np.arange(0.5, label2d.max() + 1), colors="cyan", linewidths=0.7)
+                safe = title.replace(" ", "_").replace("=", "").replace("/", "-")
+                f2.savefig(f"{stem}_{safe}{ext}", dpi=120, bbox_inches="tight"); plt.close(f2)
+            print(f"saved {len(panels)} per-filter PNGs -> {stem}_<filter>{ext}")
     if show:
         plt.show()
     plt.close(fig)
 
 
 #
-# subcommand: explore (single case)
+# subcommand: explore — render every filter in the vocabulary on the densest-foreground
+# slice of one (densest) case per dataset, and print a single-slice concentration/AUC
+# ranking of that same bank (a quick preview of what `survey` aggregates over the dataset).
+# Pass one or more MSD task dirs, or "all" for every data/Task* dir.
 #
+#
+# expand the 'all' shortcut to every data/Task* dir that has an imagesTr/
+#
+def _resolve_datasets(datasets):
+    if datasets == ["all"]:
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+        return sorted(d for d in glob.glob(os.path.join(root, "Task*"))
+                      if os.path.isdir(os.path.join(d, "imagesTr")))
+    return datasets
+
+
+#
+# residual filters worth ranking on a single slice (bright/dark detail vs the target),
+# excludes the simplification outputs (leveling / area-open/close), which aren't residuals
+#
+def _explore_bank(img2d, r, h, area):
+    lo = max(r - 1, 1)
+    return [
+        (f"tophat r={r}",         tophat(img2d, r)),
+        (f"bottomhat r={r}",      bottomhat(img2d, r)),
+        (f"gradient r={r}",       gradient(img2d, r)),
+        (f"recontophat r={r}",    recon_tophat(img2d, r)),
+        (f"ltophat r={r}",        line_tophat(img2d, r)),
+        (f"lbottomhat r={r}",     line_bottomhat(img2d, r)),
+        (f"asftophat r={r}",      asf_tophat(img2d, r)),
+        (f"leveltophat r={r}",    leveling_tophat(img2d, r)),
+        (f"hdome h={h}",          hdome(img2d, h)),
+        (f"vdome h={h} a={area}", volume_dome(img2d, h, area)),
+        (f"gband {lo}-{r}",       band(img2d, lo, r)),
+        (f"fband {lo}-{r}",       band_dark(img2d, lo, r)),
+    ]
+
+
+#
+# single-slice ranking of the filter bank against the label, same metrics as survey but on one
+# slice (indicative only, use survey for train-split selection), returns sorted rows
+#
+def _rank_slice(img2d, lbl2d, r, h, area, rank_by):
+    rows = []
+    for name, res in _explore_bank(img2d, r, h, area):
+        s = region_stats(res, lbl2d)
+        if not s:
+            continue
+        row = {"key": name, **{m: s[m] for m in METRICS}}
+        row["conc_auc"] = row["concentration"] * row["auc"]
+        rows.append(row)
+    rows.sort(key=lambda x: x[rank_by], reverse=True)
+    return rows
+
+
+def _print_rank(rows, rank_by):
+    cols = ("concentration", "enrichment", "auc", "fisher", "conc_auc")
+    print(f"  ranking (single slice, rank-by={rank_by}):")
+    print("    " + f"{'filter':16s}" + " ".join(f"{c:>13s}" for c in cols))
+    for row in rows:
+        print("    " + f"{row['key']:16s}" + " ".join(f"{row[c]:13.3f}" for c in cols))
+    if rows:
+        print(f"    >>> best ({rank_by}) = {rows[0][rank_by]:.3f}  ({rows[0]['key']})")
+
+
 def cmd_explore(args):
-    raw = load_any(args.path)
-    label = None
-    if raw.ndim >= 3 and raw.shape[0] == 4:            # legacy stack (img, top, bot, label)
-        image, label = raw[0], raw[3]
-    elif raw.ndim >= 3 and raw.shape[0] == 2:          # current stack (img, label)
-        image, label = raw[0], raw[1]
-    else:
-        image = raw[0] if (raw.ndim >= 3 and raw.shape[0] == 1) else raw
-    if args.label:
-        label = load_any(args.label)
-
-    image = norm01(image)
-    sel = pick_slice(label if label is not None else image, args.slice)
-    img2d = take(image, sel)
-    lbl2d = take(label, sel) if label is not None else None
-    print(f"input: {os.path.basename(args.path)}  shape={image.shape}  "
-          f"se_radius={args.se_radius} h={args.h} area={args.area}  slice={sel}")
-    if lbl2d is not None:
-        for name, res in (("top-hat", tophat(img2d, args.se_radius)),
-                          ("recon-tophat", recon_tophat(img2d, args.se_radius)),
-                          ("h-dome", hdome(img2d, args.h)),
-                          ("volume-dome", volume_dome(img2d, args.h, args.area))):
-            s = region_stats(res, lbl2d)
-            if s:
-                print(f"  {name:13s} concentration={s['concentration']:.2f}x  "
-                      f"enrichment={s['enrichment']:.1f}x  %energy-on-target={s['pct_on_target']:.1f}")
-
-    render_all(img2d, lbl2d, args.se_radius, args.h, args.area, args.out, show=not args.no_show)
+    os.makedirs(args.out_dir, exist_ok=True)
+    for ddir in _resolve_datasets(args.datasets):
+        try:
+            task_name = os.path.basename(ddir.rstrip('/'))
+            modality, _ = load_meta(ddir)
+            mod = modality.get("0", "MRI")
+            ig, lg = os.path.join(ddir, "imagesTr"), os.path.join(ddir, "labelsTr")
+            cases = sorted(f for f in os.listdir(ig) if f.endswith(".nii.gz") and not f.startswith("."))
+            if not cases:
+                print(f"{ddir}: no NIfTI cases found, skipping", flush=True)
+                continue
+            best = None
+            for fn in cases[:args.scan]:                 # pick the densest-foreground case
+                lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+                fgv = (lbl > 0).sum()
+                if best is None or fgv > best[1]:
+                    best = (fn, fgv)
+            fn = best[0]
+            img = preprocess(load_any(os.path.join(ig, fn)), mod, 0, len(modality))
+            lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
+            img = align_axes(img, lbl); sel = pick_slice(lbl)
+            i2, l2 = take(img, sel), take(lbl, sel)
+            out_path = os.path.join(args.out_dir, f"{task_name}_explore.png")
+            print(f"{task_name}: selected case {fn}, slice {sel} -> {out_path}", flush=True)
+            render_all(i2, l2, args.se_radius, args.h, args.area, out_path,
+                       show=not args.no_show, save_individual=False)
+            if not args.no_rank and l2 is not None and (l2 > 0).any():
+                _print_rank(_rank_slice(i2, l2, args.se_radius, args.h, args.area, args.rank_by),
+                            args.rank_by)
+        except Exception as e:
+            print(f"{ddir}: FAILED {type(e).__name__}: {e}", flush=True)
 
 
 #
@@ -486,12 +516,13 @@ def cmd_explore(args):
 METRICS = ("concentration", "enrichment", "auc", "fisher")   # accumulated per residual
 
 
+#
+# accumulate the per-(residual, class) metric sums over a case's foreground slices, slices axis 0
+# to match the training loader (the exact plane the network trains on), scores each labelled class
+# separately (plus the pooled 'all') so e.g. Vessel and Tumour rank independently, picklable
+#
 def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, all_slices,
                  h_values=(), areas=(), classes=()):
-    """Accumulate the per-(residual, class) metric sums over a case's foreground slices.
-    Slices spatial axis 0 to match the training loader (NumpyDataLoader always slices axis 0),
-    so selection is measured on the exact plane the network trains on. Scores each labelled class
-    separately (plus the pooled 'all') so e.g. Vessel and Tumour rank independently. Picklable."""
     img = preprocess(load_any(os.path.join(image_dir, fn)), mod, channel, n_mod)
     lbl = load_any(os.path.join(label_dir, fn))
     if lbl.ndim == 4:
@@ -542,12 +573,12 @@ def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, al
     return fn, acc, len(idxs)
 
 
+#
+# --morph-bank spec from the ranking, top-k distinct (mode, radius) among the trainable-SE modes
+# (tophat/bottomhat/gradient), bands / line SEs / connected operators are diagnostic only (bands
+# redundant, oriented line SEs not disk-representable, connected operators non differentiable = static)
+#
 def _select_spec(rows, k):
-    """--morph-bank spec from the ranking: top-k distinct (mode, radius) among the modes that
-    have a trainable SoftMorph2D block (tophat/bottomhat/gradient). Bands, line top-hats and the
-    connected operators (recontophat/hdome) are diagnostic only — bands are redundant (the U-Net
-    synthesises them), oriented line SEs aren't representable by the disk-initialised trainable
-    block, and the connected operators are non-differentiable (usable only as STATIC channels)."""
     picked = []
     for row in rows:
         key = row["key"]
@@ -576,10 +607,12 @@ def _vdome_spec(key):
     return f"vdome:{h}:{a}"
 
 
+#
+# top-k static (non differentiable) filters from the ranking, formatted as augment_channels.py
+# --filters specs, the connected/oriented operators that can't be trainable SE blocks and must
+# be pre-computed as static input channels
+#
 def _select_static(rows, k):
-    """Top-k static (non-differentiable) filters from the ranking, formatted as
-    augment_channels.py --filters specs. These are the connected/oriented operators
-    that can't be trainable SE blocks and must be pre-computed as static input channels."""
     picked = []
     for row in rows:
         key = row["key"]
@@ -616,19 +649,6 @@ def cmd_survey(args):
                   f"train-only selection); falling back to ALL cases", flush=True)
     if args.n > 0:
         cases = cases[:args.n]
-
-    # visual sanity: render the first --viz cases (one representative slice each). Optional — the
-    # ranking/spec never needs it, so a missing matplotlib (or any plotting error) must not abort.
-    for fn in cases[:args.viz]:
-        try:
-            lbl = load_any(os.path.join(lbl_dir, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
-            img = align_axes(preprocess(load_any(os.path.join(img_dir, fn)), mod, args.channel, len(modality)), lbl)
-            sel = pick_slice(lbl)
-            render_grid(take(img, sel), take(lbl, sel), args.radii, bands,
-                        os.path.join(args.out_dir, f"{task}_{fn.replace('.nii.gz','')}.png"), dark_bands=bands)
-        except Exception as e:
-            print(f"[warn] viz skipped ({type(e).__name__}: {e})", flush=True)
-            break
 
     # parallel per-case accumulation over all foreground slices (or one, per --all-slices)
     worker = partial(_survey_case, image_dir=img_dir, label_dir=lbl_dir, mod=mod, channel=args.channel,
@@ -687,7 +707,7 @@ def cmd_survey(args):
         head.append(f">>> selected --morph-bank \"{spec}\"  (from pooled 'all')")
         if static_specs:
             head.append(f">>> selected --filters {' '.join(static_specs)}")
-            head.append(f">>>   augment_channels.py --filters {' '.join(static_specs)}")
+            head.append(f">>>   datasets/augment_channels.py --filters {' '.join(static_specs)}")
             head.append(f">>>   train_eval.py --static-channels {len(static_specs)}")
     print("\n".join(head))
     out_path = os.path.join(args.out_dir, f"{task}_{tag}_stats.txt")
@@ -724,7 +744,7 @@ def cmd_survey(args):
     # the printed --static-dir / --static-channels; no survey/augment logic lives in the trainer.
     if args.augment and static_specs:
         root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # project root
-        aug = os.path.join(root_dir, "augment_channels.py")
+        aug = os.path.join(root_dir, "datasets", "augment_channels.py")
         src = os.path.join(args.dataset_dir, "preprocessed")
         out = os.path.join(args.dataset_dir, f"preprocessed_static_f{args.fold}")
         if not os.path.isdir(src):
@@ -738,89 +758,28 @@ def cmd_survey(args):
 
 
 #
-# subcommand: gallery (cross-dataset montage) — one row per MSD task dir, key filters as columns,
-# with modality-aware preprocessing (CT windowing / MRI norm) so raw NIfTI is faithful, unlike
-# explore's plain norm01. Picks each dataset's densest-foreground slice automatically.
-#
-def cmd_gallery(args):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    cols = [("image+label", None),
-            ("top-hat r=1", lambda im: tophat(im, 1)),
-            ("recon-tophat", lambda im: recon_tophat(im, 1)),
-            ("h-dome 0.2", lambda im: hdome(im, 0.2)),
-            ("vol-dome 0.2/50", lambda im: volume_dome(im, 0.2, 50)),
-            ("leveling", lambda im: leveling(im, 1))]
-    dsets = args.datasets
-    fig, ax = plt.subplots(len(dsets), len(cols), figsize=(2.6 * len(cols), 2.6 * len(dsets)), squeeze=False)
-    for r, ddir in enumerate(dsets):
-        try:
-            modality, _ = load_meta(ddir)
-            mod = modality.get("0", "MRI")
-            ig, lg = os.path.join(ddir, "imagesTr"), os.path.join(ddir, "labelsTr")
-            cases = sorted(f for f in os.listdir(ig) if f.endswith(".nii.gz") and not f.startswith("."))
-            best = None
-            for fn in cases[:args.scan]:                 # pick the densest-foreground case
-                lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
-                fgv = (lbl > 0).sum()
-                if best is None or fgv > best[1]:
-                    best = (fn, fgv)
-            fn = best[0]
-            img = preprocess(load_any(os.path.join(ig, fn)), mod, 0, len(modality))
-            lbl = load_any(os.path.join(lg, fn)); lbl = lbl[..., 0] if lbl.ndim == 4 else lbl
-            img = align_axes(img, lbl); sel = pick_slice(lbl)
-            i2, l2 = take(img, sel), take(lbl, sel)
-            for c, (name, fnf) in enumerate(cols):
-                a = ax[r][c]
-                a.imshow(i2 if fnf is None else fnf(i2), cmap="gray" if fnf is None else "magma")
-                if l2 is not None and l2.max() > 0:
-                    a.contour(l2, levels=np.arange(0.5, l2.max() + 1), colors="cyan", linewidths=0.4)
-                if r == 0:
-                    a.set_title(name, fontsize=9)
-                if c == 0:
-                    a.set_ylabel(f"{os.path.basename(ddir.rstrip('/'))}\n({mod})", fontsize=7)
-                a.set_xticks([]); a.set_yticks([])
-            print(f"{os.path.basename(ddir)}: {fn}", flush=True)
-        except Exception as e:
-            print(f"{ddir}: FAILED {type(e).__name__}: {e}", flush=True)
-            for c in range(len(cols)):
-                ax[r][c].axis("off")
-    fig.tight_layout()
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    fig.savefig(args.out, dpi=100, bbox_inches="tight"); plt.close(fig)
-    print(f"[written] {args.out}")
-
-
-#
 # main
 #
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pe = sub.add_parser("explore", help="single-case 4-panel + region stats")
-    pe.add_argument("path", help="4-channel .npy, or a single image (.npy/.nii/.png/...)")
-    pe.add_argument("--label", help="separate label file (when not a 4-channel stack)")
-    pe.add_argument("--fresh", action="store_true", help="ignore precomputed channels; recompute morphology")
+    pe = sub.add_parser("explore", help="render every filter on one case per dataset (or 'all')")
+    pe.add_argument("datasets", nargs="+", help="one or more MSD task dirs (data/TaskXX ...), or 'all'")
     pe.add_argument("--se-radius", type=int, default=2)
     pe.add_argument("--h", type=float, default=0.1, help="h-dome / volume-dome height (normalised intensity)")
     pe.add_argument("--area", type=int, default=100, help="area threshold (px) for volume-dome / area ops")
-    pe.add_argument("--slice", type=int, default=None, help="force axis-0 slice (3D)")
-    pe.add_argument("--out", default=None, help="save the figure (PNG)")
+    pe.add_argument("--scan", type=int, default=6, help="cases scanned per dataset to pick the densest")
+    pe.add_argument("--out-dir", default="results/explore", help="output directory to save PNGs")
     pe.add_argument("--no-show", action="store_true")
+    pe.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
+                    default="conc_auc", help="metric to rank the single-slice filter table by")
+    pe.add_argument("--no-rank", action="store_true", help="skip the single-slice ranking table")
     pe.set_defaults(func=cmd_explore)
-
-    pg = sub.add_parser("gallery", help="cross-dataset filter montage (modality-aware, faithful)")
-    pg.add_argument("datasets", nargs="+", help="one or more MSD task dirs (data/TaskXX ...)")
-    pg.add_argument("--out", default="results/explore/gallery.png", help="output PNG")
-    pg.add_argument("--scan", type=int, default=6, help="cases scanned per dataset to pick the densest")
-    pg.set_defaults(func=cmd_gallery)
 
     ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
     ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
-    ps.add_argument("--n", type=int, default=0, help="cases to score (0 = all, the default = full survey)")
-    ps.add_argument("--viz", type=int, default=3, help="render panels for the first N cases")
+    ps.add_argument("--n", type=int, default=25, help="cases to score (0 = all, the default = quick 25-case survey)")
     ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
     ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
@@ -852,8 +811,8 @@ def build_parser():
 def main():
     import sys
     argv = sys.argv[1:]
-    # backward-compat: `morph_explore.py <path> ...` -> `explore <path> ...`
-    if argv and argv[0] not in ("explore", "survey", "gallery", "-h", "--help"):
+    # backward-compat: `morph_explore.py <dataset> ...` -> `explore <dataset> ...`
+    if argv and argv[0] not in ("explore", "survey", "-h", "--help"):
         argv = ["explore"] + argv
     args = build_parser().parse_args(argv)
     args.func(args)

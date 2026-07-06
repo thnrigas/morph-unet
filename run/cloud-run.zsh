@@ -1,3 +1,9 @@
+# google cloud
+gcloud auth login
+gcloud projects list
+gcloud config set project project-id
+gcloud compute ssh athnrigas@deeplearning-4-vm
+
 # clone repo
 git clone "https://github.com/thnrigas/morph-unet.git" repo
 cd repo
@@ -15,28 +21,43 @@ python3 run_preprocessing.py
 
 # baseline
 for f in 0 1 2 3 4; do
-    python3 train_eval.py --tag hepatic_base --fold $f
+    python3 train_eval.py --tag baseline --fold $f
 done
 
-# morphological-separable U-Net sweep (3 configs x 5 folds)
-# on CUDA leave --num-workers at its default (the 0 was a mac/MPS-only workaround)
+# morphological U-Net sweep
 for cfg in bottleneck balanced heavy; do
-    for f in 0 1 2 3 4; do
+    for f in 0 1 2; do
         python3 train_eval.py --tag morphunet_$cfg --morph-unet $cfg --morph-k 3 --fold $f
     done
 done
 
-# fold means + comparison vs baseline (Dice / ASSD deltas per label)
+# trainable morphological blocks, survey-selected
+for f in 0 1 2; do
+    python3 train_eval.py --tag morphbank --morph-bank auto --fold $f
+done
+
+# conv front-end (isolates morphology from "extra channels")
+for f in 0 1 2; do
+    python3 train_eval.py --tag convctrl --morph-bank auto --conv-control --fold $f
+done
+
+# survey -> top-k STATIC filters -> datasets/augment_channels.py -> extra input channels
+for f in 0 1 2 3 4; do
+    python3 train_eval.py --tag static --static-auto --fold $f
+done
+
+# combined
+for f in 0 1 2 3 4; do
+    python3 train_eval.py --tag combined --morph-bank auto --static-auto --fold $f
+done
+
+# fold means and comparison vs baseline
 for t in hepatic_base morphunet_bottleneck morphunet_balanced morphunet_heavy; do
     python3 train_eval.py --fold-mean $t
 done
-python3 train_eval.py --compare hepatic_base_mean_scores.json \
-    morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json morphunet_heavy_mean_scores.json
 
-gcloud auth login
-gcloud projects list
-gcloud config set project project-id
-gcloud compute ssh athnrigas@deeplearning-4-vm
+python3 train_eval.py --compare baseline_mean_scores.json \
+    morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json morphunet_heavy_mean_scores.json
 
 # download files from VM
 gcloud compute scp athnrigas@deeplearning-4-vm:~/repo/filename ./

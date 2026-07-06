@@ -14,7 +14,7 @@
 # DATA_DIR / TASK env vars. Point DATA_DIR at your (read-only) input dataset and
 # keep --out-dir on a writable path, e.g.
 #   !DATA_DIR=/kaggle/input/msd-prep/Task08_HepaticVessel TASK=Task08_HepaticVessel \
-#        python train_mc.py --fold 0 --out-dir /kaggle/working/results
+#        python uncertainty/train_mc.py --fold 0 --out-dir /kaggle/working/results
 #
 
 import argparse
@@ -23,6 +23,11 @@ import os
 import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+# run from anywhere: put the project root (parent of this folder) on the import path so the
+# shared project modules (config, train_eval, networks, ...) resolve alongside sibling mc_common
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from train_eval import run_epoch, set_seed, pick_device

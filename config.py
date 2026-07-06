@@ -6,28 +6,27 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # which MSD task to use
-# Task01_BrainTumour  Task02_Heart     Task03_Liver          Task04_Hippocampus  Task05_Prostate
-# Task06_Lung         Task07_Pancreas  Task08_HepaticVessel  Task09_Spleen       Task10_Colon
+# Task01_BrainTumour Task02_Heart    Task03_Liver         Task04_Hippocampus Task05_Prostate
+# Task06_Lung        Task07_Pancreas Task08_HepaticVessel Task09_Spleen      Task10_Colon
 TASK = os.environ.get("TASK", "Task08_HepaticVessel")
 
 CHANNEL = int(os.environ.get("CHANNEL", "0"))
 
 # per task default training hyperparameters
 _HP_DEFAULT = dict(epochs=150, patience=12, batch_size=8, patch_size=64, lr=2e-4, iters_per_epoch=0, fg_fraction=0.33)
+
 # per task default custom hyperparameters
-# iters_per_epoch caps big-volume tasks so an epoch isn't a full pass over all slices
-# fg_fraction is higher for sparse targets and lower for large organs
 _HP = {
-    "Task01_BrainTumour": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.33),
-    "Task02_Heart": dict(epochs=300, patience=30, iters_per_epoch=250, fg_fraction=0.33),
-    "Task03_Liver": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.40),
-    "Task04_Hippocampus": dict(epochs=150, patience=12, iters_per_epoch=0, fg_fraction=0.33),
-    "Task05_Prostate": dict(epochs=300, patience=30, iters_per_epoch=250, fg_fraction=0.33),
-    "Task06_Lung": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.66),
-    "Task07_Pancreas": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.50),
+    "Task01_BrainTumour": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40),
+    "Task02_Heart": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
+    "Task03_Liver": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.40),
+    "Task04_Hippocampus": dict(epochs=150, patience=12, iters_per_epoch=0, batch_size=32, fg_fraction=0.33),
+    "Task05_Prostate": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
+    "Task06_Lung": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66),
+    "Task07_Pancreas": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.50),
     "Task08_HepaticVessel": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=24, patch_size=128, fg_fraction=0.33),
-    "Task09_Spleen": dict(epochs=300, patience=30, iters_per_epoch=250, fg_fraction=0.33),
-    "Task10_Colon": dict(epochs=400, patience=40, iters_per_epoch=250, fg_fraction=0.66),
+    "Task09_Spleen": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
+    "Task10_Colon": dict(epochs=400, patience=40, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66),
 }
 HP = {**_HP_DEFAULT, **_HP.get(TASK, {})}
 
