@@ -268,11 +268,16 @@ class StrictMorphUnit(nn.Module):
 #
 class Stage(nn.Module):
 
-    def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast", act="leaky"):
+    def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast", act="leaky",
+                 dropout=0.0):
         super().__init__()
         self.mode = mode
         self.impl = impl
         self.use_ckpt = True            # toggled by MorphUNet.set_checkpointing
+        # spatial (channel-wise) dropout on the stage OUTPUT, applied AFTER any checkpointed
+        # compute so it never interacts with the checkpoint RNG. Identity when dropout==0 (the
+        # default) -> existing models are bit-for-bit unchanged.
+        self.drop = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
         if mode == "conv":
             self.sub1, self.sub2 = ConvUnit(in_ch, out_ch, act=act), ConvUnit(out_ch, out_ch, act=act)
         elif mode == "half":
@@ -304,8 +309,8 @@ class Stage(nn.Module):
         # so they are NOT checkpointed -- checkpointing would only add a redundant recompute.
         heavy = self.mode in ("morph", "half") and self.impl != "convsep"
         if self.use_ckpt and heavy and self.training and torch.is_grad_enabled():
-            return checkpoint(self._forward, x, use_reentrant=False)
-        return self._forward(x)
+            return self.drop(checkpoint(self._forward, x, use_reentrant=False))
+        return self.drop(self._forward(x))
 
 
 #
@@ -353,7 +358,7 @@ class MorphUNet(nn.Module):
     #              non-linearity the tropical-geometry / TropNNC pruning theory is derived for).
     def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy",
                  half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast",
-                 act="leaky"):
+                 act="leaky", dropout=0.0):
         super().__init__()
         morph = STAGE_CONFIGS[config] if isinstance(config, str) else set(config)
         self.config = config
@@ -361,7 +366,7 @@ class MorphUNet(nn.Module):
 
         def stage(name, i, o):
             return Stage(i, o, mode=(morph_mode if name in morph else "conv"), k=k, beta=beta,
-                         impl=impl, act=act)
+                         impl=impl, act=act, dropout=dropout)
 
         # optional denoising conv stem: lift in_channels -> fs before enc1 (which then runs on fs)
         self.stem = ConvUnit(in_channels, fs, act=act) if conv_stem else nn.Identity()

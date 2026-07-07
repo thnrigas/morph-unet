@@ -104,7 +104,9 @@ def main():
     p.add_argument("--tag", required=True, help="base tag of the trained model (e.g. mpm_full_l2)")
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--config", default="full_l2")
-    p.add_argument("--impl", default="fast", choices=["fast", "paper"])
+    p.add_argument("--impl", default="fast", choices=["fast", "paper", "convsep"],
+                   help="'convsep' prunes the depthwise-conv twin (lin/act/fb/random criteria; "
+                        "l1x1 falls back to depthwise-filter norm, 'morph' is not valid)")
     p.add_argument("--no-conv-stem", action="store_true", help="model was trained WITHOUT conv stem")
     p.add_argument("--method", required=True,
                    choices=["l1x1", "morph", "lin", "act", "fb", "random", "tropnnc"])

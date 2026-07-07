@@ -40,19 +40,52 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from networks.morph_unet import MorphUNet, MorphUnit, SoftMorph2d, Stage
+from networks.morph_unet import MorphUNet, MorphUnit, SoftMorph2d, Stage, ConvSepUnit
 
 
 # --------------------------------------------------------------------------------------
-# discovery: every MorphUnit in the net (these are the prunable morph blocks)
+# discovery: every prunable unit in the net.
+# Two unit types share the SAME shape contract -- a per-INPUT-channel spatial op feeding a
+# 1x1 proj (out<-in) -- so the whole pipeline is generic once a handful of helpers dispatch
+# on type: the fast MorphUnit (depthwise soft morphology + 1x1) and its plain-conv twin
+# ConvSepUnit (depthwise 3x3 + 1x1). Pruning an input channel drops that channel's spatial
+# filter AND the matching proj input column; the proj OUTPUT width is untouched -> LOCAL, no
+# cascade -- identical for both. The morphology-native criteria (l1x1/morph) need the SE and
+# are morph-only; the agnostic ones (lin=weight-norm, act, fb, random) transfer to convsep.
 # --------------------------------------------------------------------------------------
+_PRUNABLE = (MorphUnit, ConvSepUnit)
+
+
 def morph_units(model):
-    """name -> MorphUnit, in call order."""
-    return {n: m for n, m in model.named_modules() if isinstance(m, MorphUnit)}
+    """name -> prunable unit (MorphUnit or ConvSepUnit), in call order."""
+    return {n: m for n, m in model.named_modules() if isinstance(m, _PRUNABLE)}
+
+
+def _is_conv(unit):
+    return isinstance(unit, ConvSepUnit)
+
+
+def _spatial(unit):
+    # the per-input-channel spatial sub-module (calibration hook target):
+    #   convsep -> the depthwise 3x3 conv `dw`;  morph -> the SoftMorph2d `morph`.
+    # Both output one activation map per INPUT channel, so act/fb read the same quantity.
+    return unit.dw if _is_conv(unit) else unit.morph
+
+
+def _dev(unit):
+    return unit.proj.weight.device                    # proj exists on both unit types
 
 
 def _in_ch(unit):
+    if _is_conv(unit):
+        return unit.dw.weight.shape[0]                # depthwise conv weight: (in, 1, k, k)
     return unit.morph.se.shape[1]
+
+
+def _dw_norm(unit):
+    # per-channel L2 norm of the depthwise 3x3 filters -> (in,); convsep analogue of SE spread
+    w = unit.dw.weight                                # (in, 1, k, k)
+    return w.view(w.shape[0], -1).norm(dim=1)
 
 
 # --------------------------------------------------------------------------------------
@@ -81,9 +114,14 @@ def score_unit(unit, criterion, act_rate=None, act_mag=None):
     act_mag : optional (in_ch,) mean |morph output| from calibration (used by "act").
     """
     if criterion == "l1x1":
+        if _is_conv(unit):
+            # no SE/alpha on a conv; use the depthwise-filter energy as the spatial-effect proxy
+            return _proj_in_norm(unit) * _dw_norm(unit)
         s = _proj_in_norm(unit) * _alpha_abs(unit) * _se_spread(unit)
         return s
     if criterion == "morph":
+        if _is_conv(unit):
+            raise ValueError("criterion 'morph' is morphology-specific; not valid for ConvSepUnit")
         s = _alpha_abs(unit) * _se_spread(unit)
         if act_rate is not None:
             s = s * (act_rate.to(s.device) + 1e-6)    # win-rate is gathered on CPU; match the score's device
@@ -104,12 +142,14 @@ def score_unit(unit, criterion, act_rate=None, act_mag=None):
         # complement of "morph": it PRESERVES inert-but-informative linear pathways instead of
         # discarding them -- an identity morph followed by its proj column is still a useful linear
         # projection of the input channel.
+        if _is_conv(unit):
+            return _proj_in_norm(unit)                # no alpha on a conv -> pure 1x1 weight norm
         return _proj_in_norm(unit) * _alpha_abs(unit)
     if criterion == "random":
         # SANITY BASELINE: ignore every weight/activation and score channels at random, so top-k
         # keeps a uniformly random keep_ratio of channels. If the informed criteria don't beat this,
         # they aren't buying anything. Uses the global RNG (seeded in prune.py) for reproducibility.
-        return torch.rand(_in_ch(unit), device=unit.morph.se.device)
+        return torch.rand(_in_ch(unit), device=_dev(unit))
     raise ValueError(f"unknown criterion {criterion!r}")
 
 
@@ -188,7 +228,7 @@ def collect_act_mag(model, calib_batches, device):
         return hook
 
     for n, u in units.items():
-        handles.append(u.morph.register_forward_hook(mk_hook(n)))
+        handles.append(_spatial(u).register_forward_hook(mk_hook(n)))
     model.eval()
     for xb in calib_batches:
         model(xb.to(device))
@@ -228,7 +268,7 @@ def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8):
         return hook
 
     for n in names:
-        handles.append(units[n].morph.register_forward_hook(mk_hook(n)))
+        handles.append(_spatial(units[n]).register_forward_hook(mk_hook(n)))
     model.eval()
     for xb in calib_batches:
         model(xb.to(device))
@@ -254,7 +294,7 @@ def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8):
         b = T[l] @ beta[l + 1]
         beta[l] = b / (b.sum() + eps)
 
-    dev = units[names[0]].morph.se.device
+    dev = _dev(units[names[0]])
     gamma = {}
     for l, n in enumerate(names):
         g = alpha[l] * beta[l]
@@ -266,15 +306,32 @@ def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8):
 # structural surgery: rebuild a MorphUnit keeping only `keep` input channels
 # --------------------------------------------------------------------------------------
 def prune_unit(unit, keep):
-    """In-place shrink a MorphUnit to the boolean/index `keep` over its input channels."""
+    """In-place shrink a prunable unit (MorphUnit or ConvSepUnit) to `keep` input channels."""
     if keep.dtype == torch.bool:
         keep = keep.nonzero(as_tuple=False).flatten()
     keep = keep.to(torch.long).sort().values
-    dev = unit.morph.se.device
-    old_morph = unit.morph
+    dev = _dev(unit)
     new_in = keep.numel()
     out_ch = unit.proj.weight.shape[0]
 
+    if _is_conv(unit):
+        # shrink the depthwise 3x3 (keep the surviving per-channel filters) + drop proj columns
+        old_dw = unit.dw
+        k, pad = old_dw.kernel_size[0], old_dw.padding[0]
+        new_dw = nn.Conv2d(new_in, new_in, k, padding=pad, groups=new_in).to(dev)
+        with torch.no_grad():
+            new_dw.weight.copy_(old_dw.weight[keep])       # (in,1,k,k) -> keep rows
+            new_dw.bias.copy_(old_dw.bias[keep])
+        unit.dw = new_dw
+        new_proj = nn.Conv2d(new_in, out_ch, 1).to(dev)
+        with torch.no_grad():
+            new_proj.weight.copy_(unit.proj.weight[:, keep])
+            new_proj.bias.copy_(unit.proj.bias)
+        unit.proj = new_proj
+        unit.register_buffer("_in_keep", keep.to(dev))
+        return unit
+
+    old_morph = unit.morph
     # shrunk depthwise morphology (copy the surviving per-channel params)
     m = SoftMorph2d(new_in, k=old_morph.k, beta=float(old_morph.beta)).to(dev)
     with torch.no_grad():
@@ -367,7 +424,7 @@ def _global_keep(units, scores, keep_ratio, min_keep, global_norm):
     pool.sort(key=lambda t: t[0], reverse=True)
     for _, name, j in pool[:remaining]:                # fill the rest by global rank
         keep[name].add(j)
-    dev = next(iter(units.values())).morph.se.device
+    dev = _dev(next(iter(units.values())))
     return {name: torch.tensor(sorted(idx), dtype=torch.long, device=dev)
             for name, idx in keep.items()}
 
@@ -445,4 +502,27 @@ if __name__ == "__main__":
               and all(r["in_after"] >= 2 for r in rep.values()))
         print(f"global {crit:6s}: params {p0/1e6:.3f}M -> {p1/1e6:.3f}M "
               f"({100*(1-p1/p0):.1f}% off)  per-layer[{widths}]  finite/floor={ok}")
+
+    # --- CONVSEP twin: the agnostic criteria (lin/act/fb/random) must prune it identically ---
+    print("--- convsep (depthwise 3x3 + 1x1) ---")
+    cnet = MorphUNet(num_classes=3, in_channels=1, fs=16, config="full_l2", impl="convsep",
+                     conv_stem=True, checkpoint=False).to(dev).eval()
+    cy0 = cnet(x)
+    cp0 = count_params(cnet)
+    ccalib = [torch.randn(1, 1, 64, 64, device=dev) for _ in range(3)]
+    for crit in ("l1x1", "lin", "act", "fb", "random"):     # l1x1 falls back to dw-norm on conv
+        c2 = MorphUNet(num_classes=3, in_channels=1, fs=16, config="full_l2", impl="convsep",
+                       conv_stem=True, checkpoint=False).to(dev).eval()
+        c2.load_state_dict(cnet.state_dict())
+        for alloc in ("local", "global"):
+            c3 = MorphUNet(num_classes=3, in_channels=1, fs=16, config="full_l2", impl="convsep",
+                           conv_stem=True, checkpoint=False).to(dev).eval()
+            c3.load_state_dict(cnet.state_dict())
+            prune_morph_channels(c3, criterion=crit, keep_ratio=0.5, calib_batches=ccalib,
+                                 device=dev, alloc=alloc, global_norm="max", min_keep=2, verbose=False)
+            cy1 = c3(x)
+            cp1 = count_params(c3)
+            ok = tuple(cy1.shape) == tuple(cy0.shape) and torch.isfinite(cy1).all().item()
+            print(f"convsep {crit:6s} {alloc:6s}: {cp0/1e6:.3f}M -> {cp1/1e6:.3f}M "
+                  f"({100*(1-cp1/cp0):.1f}% off)  out={tuple(cy1.shape)}  finite={ok}")
     print("OK")

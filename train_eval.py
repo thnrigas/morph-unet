@@ -364,6 +364,9 @@ def main():
     p.add_argument("--morph-k-max", type=int, default=11,
                    help="shared SE window for the morph bank; disk-init radii sit inside it (room to grow)")
     p.add_argument("--morph-beta", type=float, default=10.0)
+    p.add_argument("--morph-dropout", type=float, default=0.0,
+                   help="spatial Dropout2d rate on every stage output (0 = off, the default). "
+                        "e.g. 0.2 for a regularised deep/bottleneck variant")
     p.add_argument("--freeze-se", action="store_true",
                    help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
@@ -430,7 +433,8 @@ def main():
                     half_morph=args.morph_half, tie_mirror=args.morph_tie_mirror,
                     conv_stem=not args.morph_no_conv_stem,
                     checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl,
-                    act="relu" if args.morph_relu else "leaky").to(device)
+                    act="relu" if args.morph_relu else "leaky",
+                    dropout=args.morph_dropout).to(device)
     elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
         if args.morph_bank == "auto":
@@ -486,6 +490,7 @@ def main():
                  [("attn", args.morph_attn), ("half", args.morph_half), ("tie", args.morph_tie_mirror),
                   ("stem", not args.morph_no_conv_stem), ("bwarm", args.morph_beta_warmup > 0),
                   ("relu", args.morph_relu),
+                  (f"drop={args.morph_dropout}", args.morph_dropout > 0),
                   (f"impl={args.morph_impl}", args.morph_impl != "fast")] if on))
         mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta}{extra})"
     elif args.morph_bank:
