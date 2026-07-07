@@ -1,135 +1,322 @@
 #
-# Morphological Block
+# Morphological filter bank (unified, trainable soft-morphology)
 #
-# x - opening(x) (top-hat), closing(x) - x (bottom-hat) with a trainable structuring element (SE)
-# we add these operations as extra input channel in the vanilla U-Net for it to learn additional information
-# we approximate dilation and erosion via logsumexp as hard min/max operations cause gradients
-# to become zero and backpropagation not to work (the dead gradient problem)
+# One trainable bank spanning the full survey library, built from two soft primitives --
+# soft dilation and soft erosion (logsumexp at temperature beta, annealed during training to
+# avoid the dead-gradient problem). SEs are learnable; reconstruction / dome ops also learn h.
+# Three tiers of operators:
 #
+#   exact          tophat / bottomhat / gradient / opening, ASF, oriented (line) tophat.
+#                  fixed-depth compositions of dilate/erode; no approximation.
+#   reconstruction hdome, reconstruction top-hat. geodesic reconstruction iterates to
+#                  stability; we TRUNCATE to a few soft iterations (partial reconstruction).
+#   surrogate      vdome. area-opening (a connected-component op) has no differentiable
+#                  relaxation, so its size gate is approximated by a learnable granulometric
+#                  opening -- the union of openings by a disk + oriented lines.
+#
+# SE initialisation is by ROLE (the crucial detail from the SoftMorph2D -> soft-bank merge):
+#   * growable grey residual SEs  (tophat/bottomhat/gradient/asf, recon-tophat's erosion)
+#       -> disk, 0.5 inside / 0.0 outside. the whole window participates so the SE can grow
+#          spatially, and erode/dilate cancel the 0.5 inflation. identical to the original
+#          MorphBankUNet, so existing flat-op (tophat/bottomhat/gradient) runs reproduce.
+#   * faithful flat support SEs, where the support must EXCLUDE the rest of the window for a
+#     correct max/min (reconstruction geodesic connectivity; vdome's granulometric size gate;
+#     oriented lines, whose orientation must be preserved)
+#       -> 0.0 on support / -1e4 off it. a soft/inflated SE here floods the reconstruction to
+#          the mask and outputs zeros, and washes out the shape selectivity of the size gate.
+#
+# Every op consumes a single-channel image (B,1,H,W) and returns one channel; MorphBankUNet
+# concatenates them as extra input channels. ConvBankUNet is the parameter-matched control.
+#
+
+import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#
-# Differentiable top-hat or bottom-hat with a learnable structuring element
-#
-class SoftMorph2D(nn.Module):
 
-    def __init__(self, k=5, beta=10.0, mode="tophat", init_radius=None, init_inside=0.5, init_outside=0.0):
+#
+# structuring-element initialisers  (a (k*k,) additive grey structuring function)
+#
+_NEG = 1e4
+
+def _offsets(k):
+    r = k // 2
+    o = torch.arange(k) - r
+    dy, dx = torch.meshgrid(o, o, indexing="ij")
+    return dy.reshape(-1).float(), dx.reshape(-1).float()
+
+def disk_se(k, radius, inside=0.5, outside=0.0):
+    # growable grey SE (exact ops): `inside` on a centred radius-`radius` disk, `outside`
+    # elsewhere. with outside=0 the whole window participates and the SE can grow spatially.
+    dy, dx = _offsets(k)
+    se = torch.full_like(dy, float(outside))
+    se[(dy ** 2 + dx ** 2) <= float(radius) ** 2] = float(inside)
+    return se
+
+def hard_flat_se(k, radius):
+    # faithful flat SE: 0 on the radius-`radius` disk, -1e4 off it (excluded from both the max
+    # of dilation and the min of erosion). used where the support must be exact.
+    return disk_se(k, radius, inside=0.0, outside=-_NEG)
+
+def line_se(k, angle):
+    # faithful flat line SE through the centre at `angle` (radians): 0 within 0.5 of the line,
+    # -1e4 elsewhere -- a hard support so the orientation is preserved.
+    dy, dx = _offsets(k)
+    perp = (dx * math.sin(angle) - dy * math.cos(angle)).abs()
+    se = torch.full_like(dy, -_NEG)
+    se[perp <= 0.5] = 0.0
+    return se
+
+def parabolic_se(k, sigma=None):
+    # b(d) = -||d||^2/(2 sigma^2): the morphological analogue of a Gaussian, dense gradient.
+    if sigma is None:
+        sigma = max(k // 2, 1) / 2.0
+    dy, dx = _offsets(k)
+    return -((dy ** 2 + dx ** 2) / (2.0 * sigma ** 2))
+
+def elementary_se(k):
+    # radius-1 hard flat SE: the fixed geodesic connectivity used by reconstruction.
+    return hard_flat_se(k, 1)
+
+def _inv_softplus(y):
+    # so softplus(raw) == y at init (keeps a learnable non-negative h)
+    return math.log(math.expm1(float(y)))
+
+def _make_se(k, init="disk", radius=None, angle=0.0):
+    if init == "line":
+        se = line_se(k, angle)
+    elif init == "parabolic":
+        se = parabolic_se(k)
+    elif init == "hard":
+        se = hard_flat_se(k, radius if radius is not None else k // 2)
+    else:                                        # "disk" -> growable 0.5/0 (exact ops)
+        se = disk_se(k, radius if radius is not None else k // 2)
+    return se.view(1, 1, k * k, 1, 1)
+
+#
+# base: the soft dilation / erosion primitives + opening / closing / reconstruction
+#
+class _SoftMorph(nn.Module):
+
+    def __init__(self, k, beta):
         super().__init__()
         assert k % 2 == 1, "kernel size k must be odd"
-        assert mode in ("tophat", "bottomhat", "gradient"), "mode must be tophat/bottomhat/gradient"
         self.k = k
         self.pad = k // 2
-        self.mode = mode
-        # SE = one weight per offset in the k x k window.
-        #   init_radius=None -> flat SE (zeros);
-        #   init_radius=r    -> `init_inside` in a radius-r disk, `init_outside` elsewhere.
-        # the block starts as a radius-r disk in a larger window; only the inside-outside gap
-        # matters (top-hat is shift-invariant), and a ~0.5 gap keeps the outside able to grow.
-        se0 = (torch.zeros(k * k) if init_radius is None
-               else self._disk_se(k, init_radius, init_inside, init_outside))
-        self.se = nn.Parameter(se0.view(1, 1, k * k, 1, 1))
         self.register_buffer("beta", torch.tensor(float(beta)))
-
-    @staticmethod
-    def _disk_se(k, radius, inside=0.5, outside=0.0):
-        """(k*k,) SE: `inside` in a centred radius-`radius` disk, `outside` elsewhere."""
-        r = k // 2
-        radius = min(radius, r)                       # disk must fit the window
-        offs = torch.arange(k) - r
-        dr, dc = torch.meshgrid(offs, offs, indexing="ij")
-        disk = (dr ** 2 + dc ** 2) <= radius ** 2
-        se = torch.full((k, k), float(outside))
-        se[disk] = float(inside)
-        return se.reshape(-1)
-
-    def _neigh(self, x):
-        # x: (B,1,H,W) -> (B,1,k*k,H,W) (local neighbourhoods)
-        B, C, H, W = x.shape
-        cols = F.unfold(x, self.k, padding=self.pad)
-        return cols.view(B, C, self.k * self.k, H, W)
-
-    # soft dilation = (1/b) * logsumexp(b * (neigh + SE))
-    def soft_dilation(self, x):
-        n = self._neigh(x) + self.se
-        return torch.logsumexp(self.beta * n, dim=2) / self.beta
-
-    # soft erosion = -(1/b) * logsumexp(-b * (neigh - SE))
-    def soft_erosion(self, x):
-        n = self._neigh(x) - self.se
-        return -torch.logsumexp(-self.beta * n, dim=2) / self.beta
 
     def set_beta(self, beta):
         # anneal the log-sum-exp temperature: higher beta -> sharper (more faithful) morphology
         self.beta.fill_(float(beta))
 
+    def _neigh(self, x):
+        # (B,1,H,W) -> (B,1,k*k,H,W)
+        B, C, H, W = x.shape
+        cols = F.unfold(x, self.k, padding=self.pad)
+        return cols.view(B, C, self.k * self.k, H, W)
+
+    def dilate(self, x, se, debias=False):
+        n = self._neigh(x) + se
+        out = torch.logsumexp(self.beta * n, dim=2) / self.beta
+        if debias:
+            # logsumexp overshoots max by up to log(n_support)/beta; subtract it so the soft
+            # dilation approximates the true max (needed inside reconstruction, where an
+            # inflated dilation floods the marker to the mask and kills the residual).
+            n_on = (se > -1e3).float().sum(dim=2).clamp(min=1.0)
+            out = out - torch.log(n_on) / self.beta
+        return out
+
+    def erode(self, x, se):
+        n = self._neigh(x) - se
+        return -torch.logsumexp(-self.beta * n, dim=2) / self.beta
+
+    def opening(self, x, se):
+        return self.dilate(self.erode(x, se), se)
+
+    def closing(self, x, se):
+        return self.erode(self.dilate(x, se), se)
+
+    def reconstruct(self, marker, mask, se, iters):
+        # geodesic reconstruction by dilation, TRUNCATED to `iters` soft steps (approx.)
+        g = marker
+        for _ in range(iters):
+            g = torch.minimum(self.dilate(g, se, debias=True), mask)   # pointwise min differentiable a.e.
+        return g
+
+#
+# tier 1: exact ops (fixed-depth compositions, no approximation)
+#
+class Tophat(_SoftMorph):
+    def __init__(self, k, beta, init="disk", radius=None, angle=0.0):
+        super().__init__(k, beta)
+        self.se = nn.Parameter(_make_se(k, init, radius, angle))
+
     def forward(self, x):
-        if self.mode == "tophat":
-            # top-hat : x - opening(x), opening = dilation(erosion(x))
-            opened = self.soft_dilation(self.soft_erosion(x))
-            return torch.clamp(x - opened, min=0.0)
-        if self.mode == "gradient":
-            # morphological gradient : dilation(x) - erosion(x) (boundary-selective, >= 0)
-            return torch.clamp(self.soft_dilation(x) - self.soft_erosion(x), min=0.0)
-        # bottom-hat : closing(x) - x, closing = erosion(dilation(x))
-        closed = self.soft_erosion(self.soft_dilation(x))
-        return torch.clamp(closed - x, min=0.0)
+        return (x - self.opening(x, self.se)).clamp(min=0.0)
 
     @torch.no_grad()
     def learned_se(self):
-        # learned structuring element as a (k, k) numpy array
         return self.se.detach().cpu().view(self.k, self.k).numpy()
 
-#
-# Morphological U-Net
-# prepends a learnable top-hat and/or bottom-hat channel to the image
-# and feeds it/them to unet (in_channels = 1 + #residuals)
-#
-class MorphResidualUNet(nn.Module):
-
-    def __init__(self, base_unet, k=5, beta=10.0, use_tophat=True, use_bottomhat=False):
-        super().__init__()
-        assert use_tophat or use_bottomhat, "enable at least one residual"
-        self.tophat = SoftMorph2D(k=k, beta=beta, mode="tophat") if use_tophat else None
-        self.bottomhat = SoftMorph2D(k=k, beta=beta, mode="bottomhat") if use_bottomhat else None
-        self.unet = base_unet
-
-    def set_beta(self, beta):
-        for blk in (self.tophat, self.bottomhat):
-            if blk is not None:
-                blk.set_beta(beta)
+class Bottomhat(_SoftMorph):
+    def __init__(self, k, beta, init="disk", radius=None):
+        super().__init__(k, beta)
+        self.se = nn.Parameter(_make_se(k, init, radius))
 
     def forward(self, x):
-        # morph residuals are computed from the image channel only (ch 0); static filter
-        # channels pass through to the UNet unchanged alongside the morph outputs
-        img = x[:, :1]                    # (B, 1, H, W) — the image
-        chans = [x]                       # all input channels (image + any static filters)
-        if self.tophat is not None:
-            chans.append(self.tophat(img))
-        if self.bottomhat is not None:
-            chans.append(self.bottomhat(img))
-        return self.unet(torch.cat(chans, dim=1))
+        return (self.closing(x, self.se) - x).clamp(min=0.0)
 
+class Gradient(_SoftMorph):
+    def __init__(self, k, beta, init="disk", radius=None):
+        super().__init__(k, beta)
+        self.se = nn.Parameter(_make_se(k, init, radius))
+
+    def forward(self, x):
+        return (self.dilate(x, self.se) - self.erode(x, self.se)).clamp(min=0.0)
+
+class ASF(_SoftMorph):
+    # alternating sequential filter: open-then-close at increasing scales, one learnable SE per
+    # scale (radii 1..n_scales). residual=True -> ASF top-hat (x - ASF).
+    def __init__(self, k, beta, n_scales=3, residual=False):
+        super().__init__(k, beta)
+        self.ses = nn.ParameterList(
+            [nn.Parameter(_make_se(k, "disk", radius=r)) for r in range(1, n_scales + 1)])
+        self.residual = residual
+
+    def forward(self, x):
+        out = x
+        for se in self.ses:
+            out = self.closing(self.opening(out, se), se)
+        return (x - out).clamp(min=0.0) if self.residual else out
 
 #
-# Morphological Bank U-Net
-# prepends a bank of trainable-SE residual channels, seeded from survey-picked
-# (polarity, radius) specs, then feeds image + bank to the U-Net.
-# every block shares a fixed k_max window; each SE is disk-initialised at its survey
-# radius (0 inside / init_outside elsewhere), so blocks start diverse and can still grow.
-# specs: list of (mode, radius), e.g. [("tophat", 3), ("bottomhat", 1)]
+# tier 2: truncated soft reconstruction (approximate)
+#
+class HDome(_SoftMorph):
+    # h-dome = x - reconstruct(x - h, x). learnable h (>=0 via softplus); the geodesic
+    # connectivity is a FIXED elementary SE (standard reconstruction).
+    def __init__(self, k, beta, h_init=0.1, iters=5):
+        super().__init__(k, beta)
+        self.iters = iters
+        self.raw_h = nn.Parameter(torch.tensor(_inv_softplus(h_init)))
+        self.register_buffer("se_recon", elementary_se(k).view(1, 1, k * k, 1, 1))
+
+    def forward(self, x):
+        h = F.softplus(self.raw_h)
+        rec = self.reconstruct(x - h, x, self.se_recon, self.iters)
+        return (x - rec).clamp(min=0.0)
+
+class ReconTophat(_SoftMorph):
+    # reconstruction top-hat = x - reconstruct(erode(x), x). learnable (growable) erosion SE
+    # sets the scale removed; fixed elementary geodesic SE regrows the survivors.
+    def __init__(self, k, beta, radius=3, iters=5):
+        super().__init__(k, beta)
+        self.iters = iters
+        self.se_erode = nn.Parameter(_make_se(k, "disk", radius=radius))   # growable
+        self.register_buffer("se_recon", elementary_se(k).view(1, 1, k * k, 1, 1))
+
+    def forward(self, x):
+        marker = self.erode(x, self.se_erode)
+        rec = self.reconstruct(marker, x, self.se_recon, self.iters)
+        return (x - rec).clamp(min=0.0)
+
+class Leveling(_SoftMorph):
+    # leveling top-hat = x - level(x), level = iterate g <- max(min(x, dilate(g)), erode(g))
+    # toward a Gaussian marker (learnable sigma) to near-idempotence. TRUNCATED to a few soft
+    # iterations (approx., same truncation caveat as hdome/recontophat). geodesic connectivity
+    # is the fixed elementary SE (standard leveling); sigma is the learnable marker scale.
+    def __init__(self, k, beta, sigma_init=3.0, iters=8):
+        super().__init__(k, beta)
+        self.iters = iters
+        self.raw_sigma = nn.Parameter(torch.tensor(_inv_softplus(sigma_init)))
+        self.register_buffer("se", elementary_se(k).view(1, 1, k * k, 1, 1))
+
+    @staticmethod
+    def _gaussian_blur(x, sigma):
+        # separable Gaussian marker, kernel support +/- 3 sigma (differentiable w.r.t. sigma
+        # via the sample grid), same padding convention as the morphology ops.
+        radius = max(int(3.0 * float(sigma.detach())), 1)
+        coords = torch.arange(-radius, radius + 1, device=x.device, dtype=x.dtype)
+        kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel = (kernel / kernel.sum()).view(1, 1, -1)
+        x = F.conv2d(x, kernel.unsqueeze(2), padding=(0, radius))    # horizontal
+        x = F.conv2d(x, kernel.unsqueeze(3), padding=(radius, 0))    # vertical
+        return x
+
+    def forward(self, x):
+        sigma = F.softplus(self.raw_sigma)
+        g = self._gaussian_blur(x, sigma)
+        for _ in range(self.iters):
+            g = torch.maximum(torch.minimum(x, self.dilate(g, self.se, debias=True)),
+                               self.erode(g, self.se))
+        return (x - g).clamp(min=0.0)
+
+#
+# tier 3: vdome surrogate (contrast gate + learnable granulometric size gate)
+#
+class VDomeSurrogate(_SoftMorph):
+    # vdome = area_open(hdome(.)): keep bright domes that are both high-contrast (rise > h) AND
+    # large. area-opening is combinatorial, so the size gate is a granulometric opening -- the
+    # union (max) of openings by a disk + oriented lines. those size-gate SEs use HARD support
+    # (0/-1e4) so the shape selectivity that keeps large / thin structures is preserved.
+    def __init__(self, k, beta, h_init=0.1, iters=5, n_orient=2):
+        super().__init__(k, beta)
+        self.iters = iters
+        self.raw_h = nn.Parameter(torch.tensor(_inv_softplus(h_init)))
+        self.register_buffer("se_recon", elementary_se(k).view(1, 1, k * k, 1, 1))
+        gran = [_make_se(k, "hard", radius=k // 2)]
+        gran += [_make_se(k, "line", angle=math.pi * i / n_orient) for i in range(n_orient)]
+        self.gran_ses = nn.ParameterList([nn.Parameter(s) for s in gran])
+
+    def forward(self, x):
+        h = F.softplus(self.raw_h)
+        dome = (x - self.reconstruct(x - h, x, self.se_recon, self.iters)).clamp(min=0.0)
+        opens = [self.opening(dome, se) for se in self.gran_ses]
+        return torch.stack(opens, dim=0).amax(dim=0)     # union of openings
+
+#
+# spec grammar -> op.  one token per channel, examples:
+#   tophat:3   bottomhat:2   gradient:1   line:3:0   asf:3   asftophat:3
+#   hdome:0.1  recontophat:3  vdome:0.1  leveltophat:3
+#
+def build_op(spec, k, beta):
+    parts = spec.split(":")
+    name = parts[0]
+    if name == "tophat":
+        return Tophat(k, beta, radius=int(parts[1]))
+    if name == "bottomhat":
+        return Bottomhat(k, beta, radius=int(parts[1]))
+    if name == "gradient":
+        return Gradient(k, beta, radius=int(parts[1]))
+    if name == "line":
+        idx = int(parts[2]) if len(parts) > 2 else 0
+        return Tophat(k, beta, init="line", angle=math.pi * idx / 4)
+    if name == "asf":
+        return ASF(k, beta, n_scales=int(parts[1]), residual=False)
+    if name == "asftophat":
+        return ASF(k, beta, n_scales=int(parts[1]), residual=True)
+    if name == "hdome":
+        return HDome(k, beta, h_init=float(parts[1]))
+    if name == "recontophat":
+        return ReconTophat(k, beta, radius=int(parts[1]))
+    if name == "leveltophat":
+        return Leveling(k, beta, sigma_init=float(parts[1]))
+    if name == "vdome":
+        return VDomeSurrogate(k, beta, h_init=float(parts[1]))
+    raise ValueError(f"unknown morph-bank spec: {spec!r}")
+
+#
+# Morphological Bank U-Net: prepend the trainable morph channels to the image (+ any static
+# channels), then feed to the U-Net. specs are full-grammar strings (one channel each).
 #
 class MorphBankUNet(nn.Module):
 
-    def __init__(self, base_unet, specs, k_max=11, beta=10.0, init_inside=0.5, init_outside=0.0):
+    def __init__(self, base_unet, specs, k=11, beta=10.0):
         super().__init__()
-        assert specs, "need at least one (mode, radius) spec"
-        self.blocks = nn.ModuleList([
-            SoftMorph2D(k=k_max, beta=beta, mode=mode, init_radius=r,
-                        init_inside=init_inside, init_outside=init_outside)
-            for mode, r in specs])
+        assert specs, "need at least one spec"
+        self.blocks = nn.ModuleList([build_op(s, k, beta) for s in specs])
         self.unet = base_unet
 
     def set_beta(self, beta):
@@ -137,16 +324,16 @@ class MorphBankUNet(nn.Module):
             blk.set_beta(beta)
 
     def forward(self, x):
-        # morph bank residuals from image channel only (ch 0); static channels pass through
+        # morph residuals from the image channel only (ch 0); static channels pass through in x
         img = x[:, :1]
         chans = [x] + [blk(img) for blk in self.blocks]
         return self.unet(torch.cat(chans, dim=1))
 
-
 #
-# Matched control: a learned conv front-end producing the SAME number of extra
-# channels at matched parameter count (conv k*k weights ~ SE k*k weights), so a
-# comparison isolates morphology's rank/shape selectivity from "extra channels".
+# Matched control: a learned conv front-end producing the SAME number of extra channels, so a
+# comparison isolates morphology's rank/shape selectivity from "extra learned channels".
+# (channel-matched; parameter-matched exactly for the flat ops, approximately once the bank
+# holds reconstruction/dome ops that carry their own h / granulometric params.)
 #
 class ConvBankUNet(nn.Module):
 
@@ -157,6 +344,5 @@ class ConvBankUNet(nn.Module):
         self.unet = base_unet
 
     def forward(self, x):
-        # conv front-end reads all input channels; output is cat'd alongside x
         extra = self.act(self.front(x))
         return self.unet(torch.cat([x, extra], dim=1))

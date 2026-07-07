@@ -56,7 +56,6 @@ def norm01(v):
     rng = v.max() - v.min()
     return (v - v.min()) / rng if rng > 0 else v * 0.0
 
-
 #
 # preprocessing (windowing / normalisation), modality-aware
 #
@@ -115,7 +114,6 @@ def recon_tophat(img, r):
     opened = reconstruction(marker, img, method="dilation")
     return np.clip(img - opened, 0, None)
 
-
 #
 # h-dome = img - reconstruction(img - h, img), extracts every bright peak/ridge rising more
 # than height h above its surroundings, size and shape agnostic (no radius), robust to h
@@ -126,7 +124,6 @@ def hdome(img, h):
     rec = reconstruction(img - float(h), img, method="dilation")
     return np.clip(img - rec, 0, None)
 
-
 #
 # area opening, drop bright connected components smaller than area px, keep the rest at their
 # exact shape, a denoiser (thin long vessels survive, small bright blobs don't), static
@@ -134,7 +131,6 @@ def hdome(img, h):
 def area_open(img, area):
     from skimage.morphology import area_opening
     return area_opening(img.astype(np.float32), area_threshold=int(area))
-
 
 #
 # area closing (dual of area_open), fill dark components smaller than area, bridges small dark
@@ -144,7 +140,6 @@ def area_close(img, area):
     from skimage.morphology import area_closing
     return area_closing(img.astype(np.float32), area_threshold=int(area))
 
-
 #
 # area-gated h-dome (cv18 volume marker), keep only bright domes that are both high-contrast
 # (rise > h) and large enough (>= area px), isolates vessels better than contrast or size alone
@@ -152,7 +147,6 @@ def area_close(img, area):
 #
 def volume_dome(img, h, area):
     return area_open(hdome(img, h), area)
-
 
 #
 # alternating sequential filter, cascade opening-then-closing at radii 1..r
@@ -166,14 +160,12 @@ def asf(img, r):
         out = grey_closing(grey_opening(out, footprint=fp), footprint=fp)
     return out
 
-
 #
 # img - ASF, the bright detail the ASF removed (multiscale top-hat), cleaner thin-structure
 # highlighter than a single-scale opening, static
 #
 def asf_tophat(img, r):
     return np.clip(img - asf(img, r), 0, None)
-
 
 #
 # morphological leveling toward a Gaussian marker (sigma=r), edge-preserving simplification,
@@ -193,13 +185,11 @@ def leveling(img, r, iters=30):
         g = g_new
     return g
 
-
 #
 # img - leveling, fine bright detail the leveling simplified away, static
 #
 def leveling_tophat(img, r):
     return np.clip(img - leveling(img, r), 0, None)
-
 
 #
 # (L, L) binary line SE through the centre at angle radians (2D only)
@@ -213,7 +203,6 @@ def _line_footprint(length, angle):
         if 0 <= y < length and 0 <= x < length:
             fp[y, x] = True
     return fp
-
 
 #
 # orientation-invariant line top-hat, max over oriented line SEs of (img - opening), so a
@@ -229,7 +218,6 @@ def line_tophat(img, r, n_angles=4):
         best = th if best is None else np.maximum(best, th)
     return best
 
-
 #
 # orientation-invariant line bottom-hat, max over oriented line SEs of (closing - img), for
 # dark tubular structures, 2D only, falls back to the isotropic bottom-hat on 3D
@@ -244,20 +232,17 @@ def line_bottomhat(img, r, n_angles=4):
         best = bh if best is None else np.maximum(best, bh)
     return best
 
-
 #
 # granulometric band (opening γ), bright structure with scale in (r_lo, r_hi]
 #
 def band(img, r_lo, r_hi):
     return np.clip(opening_of(img, r_lo) - opening_of(img, r_hi), 0, None)
 
-
 #
 # anti-granulometric band (closing φ), dark structure with scale in (r_lo, r_hi]
 #
 def band_dark(img, r_lo, r_hi):
     return np.clip(closing_of(img, r_hi) - closing_of(img, r_lo), 0, None)
-
 
 #
 # slice selection, (axis, index) of the largest target slice over all axes
@@ -282,7 +267,6 @@ def take(a, sel):
     ax, idx = sel
     return np.take(a, idx, axis=ax)
 
-
 #
 # reorder img axes to match the label (medpy permutes the spatial axes of some 4D volumes),
 # when several permutations match the shape disambiguate by the one whose label foreground sits
@@ -302,10 +286,8 @@ def align_axes(img, label):
                 best, best_score = cand, score
     return best
 
-
 #
 # stats: where residual energy lands relative to the target
-#
 #
 # AUC = P(residual on a random fg pixel > a random bg pixel), via Mann-Whitney U, threshold-free
 # discriminability (0.5 = chance, 1.0 = perfectly separable), background subsampled for speed
@@ -322,7 +304,6 @@ def _auc(pos, neg, max_n=20000):
     n1 = pos.size
     u = ranks[:n1].sum() - n1 * (n1 + 1) / 2.0
     return float(u / (n1 * neg.size))
-
 
 def region_stats(residual, label):
     from scipy.ndimage import binary_erosion, binary_dilation
@@ -349,10 +330,8 @@ def region_stats(residual, label):
         fisher=float((res_fg.mean() - res_bg.mean()) ** 2 / (res_fg.var() + res_bg.var() + 1e-9)),
     )
 
-
 #
 # rendering
-#
 #
 # grid of every filter in the library at the given radius / h / area, with the label contour
 # overlaid, so a single case shows the full vocabulary (trainable + static) side by side
@@ -409,7 +388,6 @@ def render_all(img2d, label2d, r, h, area, out, show, save_individual=True):
         plt.show()
     plt.close(fig)
 
-
 #
 # subcommand: explore — render every filter in the vocabulary on the densest-foreground
 # slice of one (densest) case per dataset, and print a single-slice concentration/AUC
@@ -425,7 +403,6 @@ def _resolve_datasets(datasets):
         return sorted(d for d in glob.glob(os.path.join(root, "Task*"))
                       if os.path.isdir(os.path.join(d, "imagesTr")))
     return datasets
-
 
 #
 # subcommand: explore — render every filter on one representative case per dataset (visual only,
@@ -461,13 +438,11 @@ def cmd_explore(args):
         except Exception as e:
             print(f"{ddir}: FAILED {type(e).__name__}: {e}", flush=True)
 
-
 #
 # subcommand: survey (batch ranking) — parallel, optional train-split + all-slices,
 # with an auto-selector that emits the --morph-bank spec from the ranking
 #
 METRICS = ("concentration", "enrichment", "auc", "fisher")   # accumulated per residual
-
 
 #
 # accumulate the per-(residual, class) metric sums over a case's foreground slices, slices axis 0
@@ -525,23 +500,46 @@ def _survey_case(fn, image_dir, label_dir, mod, channel, n_mod, radii, bands, al
             note(f"fband {lo}-{hi}", band_dark(img2d, lo, hi), lbl2d)
     return fn, acc, len(idxs)
 
+#
+# --morph-bank tokens from a survey key (0, 1, or 2). full grammar (networks/morph_block.py):
+# exact (tophat/bottomhat/gradient/asftophat) AND reconstruction/dome/leveling
+# (recontophat/hdome/vdome/leveltophat). granulometric bands have no dedicated op -- they are a
+# linear difference of two same-family residuals (gband = tophat(hi)-tophat(lo);
+# fband = bottomhat(hi)-bottomhat(lo)), which the U-Net's linear first conv forms from the two
+# appended channels, so a band EXPANDS to its two tophats/bottomhats. vdome -> surrogate (h only).
+# only connected-only operators (area_open/area_close) have no soft op and remain static-only.
+#
+def _trainable_specs_from_key(key):
+    for mode in ("tophat", "bottomhat", "gradient"):
+        if key.startswith(f"{mode} r="):
+            return [f"{mode}:{int(key.split('r=')[1])}"]
+    if key.startswith("asftophat r="):
+        return [f"asftophat:{int(key.split('r=')[1])}"]
+    if key.startswith("recontophat r="):
+        return [f"recontophat:{int(key.split('r=')[1])}"]
+    if key.startswith("leveltophat r="):
+        return [f"leveltophat:{int(key.split('r=')[1])}"]
+    if key.startswith("hdome h="):
+        return [f"hdome:{key.split('h=')[1].split()[0]}"]
+    if key.startswith("vdome h="):
+        return [f"vdome:{key.split('h=')[1].split()[0]}"]
+    if key.startswith("gband "):
+        lo, hi = key.split()[1].split("-")
+        return [f"tophat:{int(lo)}", f"tophat:{int(hi)}"]
+    if key.startswith("fband "):
+        lo, hi = key.split()[1].split("-")
+        return [f"bottomhat:{int(lo)}", f"bottomhat:{int(hi)}"]
+    return []
 
-#
-# --morph-bank spec from the ranking, top-k distinct (mode, radius) among the trainable-SE modes
-# (tophat/bottomhat/gradient), bands / line SEs / connected operators are diagnostic only (bands
-# redundant, oriented line SEs not disk-representable, connected operators non differentiable = static)
-#
 def _select_spec(rows, k):
+    # k caps the number of TOKENS (channels); a band consumes two. dedup keeps a tophat shared
+    # between a band and a standalone pick from being emitted twice.
     picked = []
     for row in rows:
-        key = row["key"]
-        for mode in ("tophat", "bottomhat", "gradient"):
-            if key.startswith(f"{mode} r=") and len(picked) < k:
-                r = int(key.split("r=")[1])
-                if (mode, r) not in picked:
-                    picked.append((mode, r))
-    return ",".join(f"{m}:{r}" for m, r in picked)
-
+        for spec in _trainable_specs_from_key(row["key"]):
+            if spec not in picked and len(picked) < k:
+                picked.append(spec)
+    return ",".join(picked)
 
 # mapping from survey key prefix → augment_channels.py filter spec
 _STATIC_KEY_MAP = {
@@ -558,7 +556,6 @@ def _vdome_spec(key):
     h = parts[1].split("=")[1]
     a = parts[2].split("=")[1]
     return f"vdome:{h}:{a}"
-
 
 #
 # top-k static (non differentiable) filters from the ranking, formatted as augment_channels.py
@@ -598,8 +595,8 @@ def cmd_survey(args):
             cases = [fn for fn in cases if fn.replace(".nii.gz", "") in keys]
             tag = f"train-f{args.fold}"
         else:
-            print(f"[warn] no splits.pkl in {args.dataset_dir} (run run_preprocessing first for "
-                  f"train-only selection); falling back to ALL cases", flush=True)
+            print(f"no splits.pkl in {args.dataset_dir} (run_preprocessing first for "
+                  f"train selection), falling back to all cases", flush=True)
     if args.n > 0:
         cases = cases[:args.n]
 
@@ -608,7 +605,7 @@ def cmd_survey(args):
                      n_mod=len(modality), radii=args.radii, bands=bands, all_slices=args.all_slices,
                      h_values=args.h_values, areas=args.areas, classes=classes)
     total, n_slices = {}, 0
-    print(f"surveying {len(cases)} cases ({tag}, all_slices={args.all_slices}, workers={args.workers}) ...", flush=True)
+    print(f"surveying {len(cases)} cases ({tag}, all_slices={args.all_slices}, workers={args.workers})...", flush=True)
 
     def consume(res):
         nonlocal n_slices
@@ -618,7 +615,7 @@ def cmd_survey(args):
             t = total.setdefault(key, [0.0, 0.0, 0.0, 0.0, 0])
             for i in range(5):
                 t[i] += vals[i]
-        print(f"  {fn}  ({nsl} slices)", flush=True)
+        print(f"    {fn} ({nsl} slices)", flush=True)
 
     if args.workers > 1:
         with Pool(args.workers) as pool:
@@ -645,8 +642,8 @@ def cmd_survey(args):
     cols = ["concentration", "enrichment", "auc", "fisher", "conc_auc"]
     order = ["all"] + [cn for _, cn in classes]
     classes_present = [c for c in order if any(r["class"] == c for r in rows)]
-    head = [f"===== SUMMARY  {task}  ({tag}, modality={mod}, {len(cases)} cases, {n_slices} slices, "
-            f"rank-by={args.rank_by}) ====="]
+    head = [f"SUMMARY  {task}  ({tag}, modality={mod}, {len(cases)} cases, {n_slices} slices, "
+            f"rank-by={args.rank_by})"]
     for cls in classes_present:
         crows = sorted((r for r in rows if r["class"] == cls), key=lambda r: r[args.rank_by], reverse=True)
         head.append(f"\n--- class: {cls} ---")
@@ -657,11 +654,11 @@ def cmd_survey(args):
             head.append(f">>> best {cls} ({args.rank_by}) = {crows[0][args.rank_by]:.3f}  ({crows[0]['key']})")
     head.append("")
     if pooled:
-        head.append(f">>> selected --morph-bank \"{spec}\"  (from pooled 'all')")
+        head.append(f"  selected --morph-bank \"{spec}\"  (trainable, from pooled 'all')")
         if static_specs:
-            head.append(f">>> selected --filters {' '.join(static_specs)}")
-            head.append(f">>>   datasets/augment_channels.py --filters {' '.join(static_specs)}")
-            head.append(f">>>   train_eval.py --static-channels {len(static_specs)}")
+            head.append(f"  selected --filters {' '.join(static_specs)}")
+            head.append(f"      datasets/augment_channels.py --filters {' '.join(static_specs)}")
+            head.append(f"      train_eval.py --static-channels {len(static_specs)}")
     print("\n".join(head))
     out_path = os.path.join(args.out_dir, f"{task}_{tag}_stats.txt")
     with open(out_path, "w") as f:
@@ -721,43 +718,33 @@ def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    pe = sub.add_parser("explore", help="render every filter on one case per dataset (or 'all')")
-    pe.add_argument("datasets", nargs="+", help="one or more MSD task dirs (data/TaskXX ...), or 'all'")
+    pe = sub.add_parser("explore")
+    pe.add_argument("datasets", nargs="+")
     pe.add_argument("--se-radius", type=int, default=2)
-    pe.add_argument("--h", type=float, default=0.1, help="h-dome / volume-dome height (normalised intensity)")
-    pe.add_argument("--area", type=int, default=100, help="area threshold (px) for volume-dome / area ops")
-    pe.add_argument("--scan", type=int, default=6, help="cases scanned per dataset to pick the densest")
-    pe.add_argument("--out-dir", default="results/explore", help="output directory to save PNGs")
+    pe.add_argument("--h", type=float, default=0.1)
+    pe.add_argument("--area", type=int, default=100)
+    pe.add_argument("--scan", type=int, default=5)
+    pe.add_argument("--out-dir", default="results/explore")
     pe.add_argument("--no-show", action="store_true")
     pe.set_defaults(func=cmd_explore)
 
-    ps = sub.add_parser("survey", help="batch SE sweep + bands + concentration ranking")
-    ps.add_argument("dataset_dir", help="MSD task dir with imagesTr/ labelsTr/ dataset.json")
-    ps.add_argument("--n", type=int, default=25, help="cases to score (0 = all, the default = quick 25-case survey)")
-    ps.add_argument("--channel", type=int, default=0, help="modality channel for multi-modal images")
+    ps = sub.add_parser("survey")
+    ps.add_argument("dataset_dir")
+    ps.add_argument("--n", type=int, default=25)
+    ps.add_argument("--channel", type=int, default=0)
     ps.add_argument("--radii", type=int, nargs="+", default=[1, 2, 3, 5])
-    ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5], help="flat lo hi lo hi ...")
-    ps.add_argument("--h-values", dest="h_values", type=float, nargs="+", default=[0.05, 0.1, 0.2],
-                    help="h-dome heights in normalised intensity units (static connected operator)")
-    ps.add_argument("--areas", type=int, nargs="+", default=[50, 150],
-                    help="area thresholds (px) for the area-gated volume-domes (static)")
-    ps.add_argument("--split", choices=["all", "train"], default="train",
-                    help="'train' (default) = only --fold's training keys (needs splits.pkl), avoids "
-                         "test leakage in selection; 'all' = every case (exploration/cross-task ranking)")
+    ps.add_argument("--bands", type=int, nargs="+", default=[1, 2, 2, 3, 3, 5])
+    ps.add_argument("--h-values", dest="h_values", type=float, nargs="+", default=[0.05, 0.1, 0.2])
+    ps.add_argument("--areas", type=int, nargs="+", default=[50, 150])
+    ps.add_argument("--split", choices=["all", "train"], default="train")
     ps.add_argument("--fold", type=int, default=0)
-    ps.add_argument("--all-slices", dest="all_slices", action="store_true", default=True,
-                    help="score every foreground slice (default)")
-    ps.add_argument("--one-slice", dest="all_slices", action="store_false",
-                    help="quick: score only the densest foreground slice per case")
-    ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"],
-                    default="conc_auc", help="metric to rank/select by (default: concentration x auc)")
-    ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 16),
-                    help="parallel worker processes (default: cpu count capped at 8, min 1)")
-    ps.add_argument("--top-k", type=int, default=5, help="how many trainable + static filters to auto-select")
+    ps.add_argument("--all-slices", dest="all_slices", action="store_true", default=True)
+    ps.add_argument("--one-slice", dest="all_slices", action="store_false")
+    ps.add_argument("--rank-by", choices=["concentration", "auc", "fisher", "conc_auc"], default="conc_auc")
+    ps.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 16))
+    ps.add_argument("--top-k", type=int, default=5)
     ps.add_argument("--out-dir", default="results/explore")
-    ps.add_argument("--augment", action="store_true",
-                    help="after selecting top-k static filters, precompute them into "
-                         "<data>/preprocessed_static_f<fold>/ (survey -> select -> preprocess, one command)")
+    ps.add_argument("--augment", action="store_true")
     ps.set_defaults(func=cmd_survey)
     return p
 
@@ -765,7 +752,6 @@ def build_parser():
 def main():
     import sys
     argv = sys.argv[1:]
-    # backward-compat: `morph_explore.py <dataset> ...` -> `explore <dataset> ...`
     if argv and argv[0] not in ("explore", "survey", "-h", "--help"):
         argv = ["explore"] + argv
     args = build_parser().parse_args(argv)

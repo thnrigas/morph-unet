@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import config
 from networks.UNET import UNet
-from networks.morph_block import MorphResidualUNet, MorphBankUNet, ConvBankUNet
+from networks.morph_block import MorphBankUNet, ConvBankUNet
 from networks.morph_unet import MorphUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from loss_functions.morph_loss import MorphConsistencyLoss
@@ -51,16 +51,6 @@ def pick_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-#
-# parse morphbank spec
-#
-def parse_bank(spec):
-    out = []
-    for tok in spec.split(","):
-        mode, r = tok.split(":")
-        out.append((mode.strip(), int(r)))
-    return out
 
 #
 # read morphbank spec
@@ -457,9 +447,6 @@ def main():
     # id
     p.add_argument("--tag")
     # modes
-    p.add_argument("--tophat", action="store_true")
-    p.add_argument("--bottomhat", action="store_true")
-    p.add_argument("--morph-block", action="store_true")
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--morph-bank", metavar="SPEC")
     p.add_argument("--conv-control", action="store_true")
@@ -545,23 +532,16 @@ def main():
         model = MorphUNet(num_classes=config.NUM_CLASSES, in_channels=in_channels,
                           k=args.morph_k, beta=args.morph_beta, config=args.morph_unet).to(device)
     elif args.morph_bank:
-        specs = parse_bank(args.morph_bank)
+        # trainable morph bank spanning the full library (exact / reconstruction / vdome-
+        # surrogate ops); one extra input channel per spec token. --conv-control swaps the
+        # bank for a parameter-matched learned conv front-end.
+        specs = [s for s in args.morph_bank.split(",") if s]
         n_extra = len(specs)
         base = UNet(num_classes=config.NUM_CLASSES, in_channels=in_channels + n_extra)
         if args.conv_control:
             model = ConvBankUNet(base, n_extra=n_extra, k=args.morph_k_max, in_channels=in_channels).to(device)
         else:
-            model = MorphBankUNet(base, specs, k_max=args.morph_k_max, beta=args.morph_beta).to(device)
-    elif args.morph_block or args.tophat or args.bottomhat:
-        # trainable (--morph-block, learnable SE) or static (--tophat/--bottomhat, frozen SE)
-        # residuals, both computed on the fly, under --morph-block default to top-hat
-        use_th = args.tophat or (args.morph_block and not args.bottomhat)
-        use_bh = args.bottomhat
-        base = UNet(num_classes=config.NUM_CLASSES, in_channels=in_channels + use_th + use_bh)
-        model = MorphResidualUNet(base, k=args.morph_k, beta=args.morph_beta,
-                                  use_tophat=use_th, use_bottomhat=use_bh).to(device)
-        if not args.morph_block:            # static residual, fixed SE
-            args.freeze_se = True
+            model = MorphBankUNet(base, specs, k=args.morph_k_max, beta=args.morph_beta).to(device)
     else:
         model = UNet(num_classes=config.NUM_CLASSES, in_channels=in_channels).to(device)
 
@@ -577,12 +557,8 @@ def main():
     elif args.morph_bank:
         kind = "conv-control" if args.conv_control else "morph-bank"
         mode = f"{kind}([{args.morph_bank}],beta={args.morph_beta})"
-    elif args.morph_block:
-        res = "+".join((["tophat"] if use_th else []) + (["bottomhat"] if use_bh else []))
-        mode = f"morph-block({res},k={args.morph_k},beta={args.morph_beta})"
     else:
-        parts = (["tophat"] if args.tophat else []) + (["bottomhat"] if args.bottomhat else [])
-        mode = "+".join(parts) if parts else "baseline"
+        mode = "baseline"
     loss_desc = "dice+ce" + ("+morph" if args.morph_loss else "")
     epoch_len = args.iters_per_epoch if args.iters_per_epoch > 0 else len(train_loader)
     static_info = f" static_ch={args.static_channels} static_dir={args.static_dir}" if args.static_channels else ""
@@ -599,7 +575,12 @@ def main():
     # give the morphological SE weights their own (higher) lr,
     # few, geometrically important params with sparse gradients, so a larger step helps them move
     # frozen SEs are requires_grad=False, excluded from the optimiser
-    se_named = [(n, p) for n, p in model.named_parameters() if n.endswith(".se") and p.requires_grad]
+    # SE tensors across all block types get the boosted lr (bank .se, ASF .ses.N,
+    # recon .se_erode, vdome .gran_ses.N); scalar raw_h keeps the base lr
+    def _is_morph_se(name):
+        return (name.endswith(".se") or ".ses." in name
+                or ".se_erode" in name or ".gran_ses." in name)
+    se_named = [(n, p) for n, p in model.named_parameters() if _is_morph_se(n) and p.requires_grad]
     if se_named:
         se_ids = {id(p) for _, p in se_named}
         other = [p for p in model.parameters() if p.requires_grad and id(p) not in se_ids]
