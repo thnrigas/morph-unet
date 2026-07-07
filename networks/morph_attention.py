@@ -88,7 +88,12 @@ class MorphAttentionGate(nn.Module):
     def _forward(self, x):
         tophat = x - self.morph.opening(x)         # bright thin structures
         bothat = self.morph.closing(x) - x         # dark  thin structures
-        gate = torch.sigmoid(self.gate(torch.cat([tophat, bothat], dim=1)))
+        # IDENTITY init: gate = 2*sigmoid(logits) so zero-init logits -> 2*sigmoid(0)=1 -> the
+        # skip passes through UNCHANGED at start (a plain U-Net), and the model learns deviations
+        # from there. (Plain sigmoid would start at 0.5 and HALVE every skip.) This matches the
+        # ReZero gamma=0 identity init of the linear-attention gate, so the two attention variants
+        # start from the SAME plain-U-Net baseline -- a prerequisite for a fair comparison.
+        gate = 2.0 * torch.sigmoid(self.gate(torch.cat([tophat, bothat], dim=1)))
         return x * gate
 
     def forward(self, x):

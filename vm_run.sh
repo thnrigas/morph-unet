@@ -113,17 +113,25 @@ echo "##### PHASE 1: prune convsep_heavy (best fold = f1) #####"
 prune_model convsep_heavy heavy convsep 1 "${CONVSEP_SCHEMES[@]}"
 
 # ================================================================== PHASE 1b
-echo "##### PHASE 1b: train LINEAR-ATTENTION U-Net (linear-attn skips), folds 0,1,2 #####"
-for FOLD in 0 1 2; do
-  TAG=linattn
-  if [[ -f "$RESULTS/${TAG}_f${FOLD}_best.pth" ]]; then
-    echo "    $TAG f$FOLD already trained -> skip"; n_skip=$((n_skip+1)); continue
-  fi
-  echo "== TRAIN $TAG f$FOLD (linear-attention U-Net, heads=4) =="
-  python train_eval.py --tag "$TAG" --lin-attn --lin-attn-heads 4 --fold "$FOLD" \
-    || echo "    !!! $TAG f$FOLD FAILED (exit $?) -- continuing"
-  n_run=$((n_run+1))
-done
+echo "##### PHASE 1b: MATCHED attention comparison -- same config=none backbone, folds 0,1,2 #####"
+# Three arms, IDENTICAL plain-conv U-Net backbone + schedule (LR/epochs/patience defaults),
+# so the ONLY difference is the skip mechanism. Both attention gates now start as IDENTITY
+# (morph gate = 2*sigmoid; linear gate = ReZero gamma=0), i.e. from the same plain-U-Net point.
+train_arm() {  # $1=tag  $2..=extra train_eval flags
+  local TAG=$1; shift
+  for FOLD in 0 1 2; do
+    if [[ -f "$RESULTS/${TAG}_f${FOLD}_best.pth" ]]; then
+      echo "    $TAG f$FOLD already trained -> skip"; n_skip=$((n_skip+1)); continue
+    fi
+    echo "== TRAIN $TAG f$FOLD =="
+    python train_eval.py --tag "$TAG" --fold "$FOLD" "$@" \
+      || echo "    !!! $TAG f$FOLD FAILED (exit $?) -- continuing"
+    n_run=$((n_run+1))
+  done
+}
+train_arm unet_baseline   --morph-unet none                          # no-attention reference
+train_arm unet_morphattn  --morph-unet none --morph-attn --morph-k 3 # morphological attention
+train_arm unet_linattn    --lin-attn --lin-attn-heads 4              # linear attention
 
 # ================================================================== PHASE 2
 echo "##### PHASE 2: prune deep & bottleneck, folds 1,2 #####"
