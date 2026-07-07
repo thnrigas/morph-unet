@@ -19,8 +19,9 @@ import re
 
 import config
 
-FIELDS = ["tag", "method", "keep_ratio", "params_before", "params_after", "params_off_pct",
-          "val_dice_unpruned", "val_dice_pruned", "val_dice_finetuned"]
+FIELDS = ["tag", "method", "alloc", "keep_ratio", "params_before", "params_after", "params_off_pct",
+          "val_dice_unpruned", "val_dice_pruned", "val_dice_finetuned", "ft_skipped", "best_epoch",
+          "finetune_epochs"]
 
 # out_stem looks like:  <base>_prune-<method>-k<NN>_f<fold>
 STEM_RE = re.compile(r"^(?P<base>.+)_prune-(?P<method>[a-z0-9]+)-k(?P<kk>\d+)_f(?P<fold>\d+)$")
@@ -68,17 +69,27 @@ def main():
         print(f"\n=== {base}  fold {fold}  |  method={method} "
               f"===============================================")
         print(f"  {'keep':>5} {'params(M)':>10} {'off%':>6} "
-              f"{'unpruned':>9} {'pruned':>8} {'finetuned':>10} {'recover':>8}")
+              f"{'unpruned':>9} {'pruned':>8} {'finetuned':>10} {'final':>8} "
+              f"{'recover':>8} {'best@ep':>9}")
         for r in g:
             pa = r.get("params_after")
             base_d = r.get("val_dice_unpruned")
+            pr = r.get("val_dice_pruned")
             ft = r.get("val_dice_finetuned")
-            recover = (ft - base_d) if (ft is not None and base_d is not None) else None
+            # "final" = the model we actually keep: fine-tuned if it ran, else the pruned net as-is.
+            final = ft if ft is not None else pr
+            recover = (final - base_d) if (final is not None and base_d is not None) else None
+            # finetuned column: value if it ran, "skip" if we deliberately skipped it, else "-"
+            ft_cell = fmt(ft) if ft is not None else ("skip" if r.get("ft_skipped") else "  -  ")
+            be, fe = r.get("best_epoch"), r.get("finetune_epochs")
+            best_at = f"{be}/{fe}" if be is not None else ("skip" if r.get("ft_skipped") else "  -  ")
             print(f"  {r['keep_ratio']:>5.2f} "
                   f"{(pa/1e6 if pa else 0):>10.3f} "
                   f"{r.get('params_off_pct', 0):>6.1f} "
-                  f"{fmt(base_d):>9} {fmt(r.get('val_dice_pruned')):>8} "
-                  f"{fmt(ft):>10} {(fmt(recover) if recover is not None else '   -  '):>8}")
+                  f"{fmt(base_d):>9} {fmt(pr):>8} "
+                  f"{ft_cell:>10} {fmt(final):>8} "
+                  f"{(fmt(recover) if recover is not None else '   -  '):>8} "
+                  f"{best_at:>9}")
 
     # flat CSV for plotting
     with open(args.csv, "w", newline="") as f:

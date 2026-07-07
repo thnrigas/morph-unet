@@ -1,0 +1,5 @@
+[mpm_balanced_f0] device=cpu mode=morph-unet(balanced,k=3,beta=10.0,stem,bwarm) loss=dice+ce seed=42 fold=0 loader_in_ch=1 patch=128 iters/epoch=250 max-epochs=400 (<= 100000 updates) fg=0.33
+  SE param group: 8 block(s) @ lr=0.002 (x10); rest @ lr=0.0002
+[mpm_balanced_f0] mean scores written to /home/Kasimatis/Documents/kasimat/morph-unet/results/mpm_balanced_f0_scores.json
+  label Vessel: Dice=0.2634126790841761 ASSD=14.842758153039497
+  label Tumour: Dice=0.11204950158103827 ASSD=103.2655039873484

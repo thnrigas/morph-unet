@@ -138,6 +138,38 @@ class MorphUnit(nn.Module):
         return self.act(self.norm(self.proj(self.morph(x))))
 
 
+class ConvSepUnit(nn.Module):
+
+    # the plain-conv TWIN of MorphUnit: a DEPTHWISE 3x3 conv (one k*k linear filter per input
+    # channel -- the ordinary linear analogue of the depthwise soft morphology) followed by the
+    # SAME 1x1 projection to out_ch (+ norm + act). Identical separable factorisation and, to
+    # within a couple of params per channel, the SAME parameter budget as MorphUnit -- only the
+    # per-channel spatial operator differs (a learned linear 3x3 here vs. soft max-plus/min-plus
+    # morphology there). Running this at the same config isolates exactly what the morphology
+    # buys over an equally-sized depthwise conv, and it trains much faster (no unfold / logsumexp,
+    # a single cuDNN depthwise kernel, and no gradient-checkpointing needed).
+    #
+    # Param count per unit (k=3): depthwise = in*(k*k) + in bias = 10*in; MorphUnit's SoftMorph2d
+    # = in*(k*k) + 3*in (se + b_dil + b_ero + alpha) = 12*in. The 1x1 proj (in*out + out) is
+    # identical and dominates, so the two units match to well under 0.1% of total params.
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0, act="leaky"):
+        super().__init__()
+        # `beta` is accepted for signature parity with the Unit factory in Stage; a conv has no
+        # temperature, so it is ignored (set_beta / beta-warmup become no-ops on this unit).
+        self.dw = nn.Conv2d(in_ch, in_ch, k, padding=k // 2, groups=in_ch)   # depthwise spatial
+        self.proj = nn.Conv2d(in_ch, out_ch, 1)                              # 1x1 channel mix
+        self.norm = nn.InstanceNorm2d(out_ch)
+        self.act = make_act(act)
+        # same pruning hook as MorphUnit: surviving input-channel indices (buffer -> .to()/pickle
+        # safe). Pruning targets the depthwise filters dw.weight[keep] + proj.weight[:, keep].
+        self.register_buffer("_in_keep", None)
+
+    def forward(self, x):
+        if self._in_keep is not None:
+            x = x[:, self._in_keep]
+        return self.act(self.norm(self.proj(self.dw(x))))
+
+
 class HybridUnit(nn.Module):
 
     # half the *input* channels go through soft morphology, the other half through a
@@ -239,6 +271,7 @@ class Stage(nn.Module):
     def __init__(self, in_ch, out_ch, mode="conv", k=3, beta=10.0, impl="fast", act="leaky"):
         super().__init__()
         self.mode = mode
+        self.impl = impl
         self.use_ckpt = True            # toggled by MorphUNet.set_checkpointing
         if mode == "conv":
             self.sub1, self.sub2 = ConvUnit(in_ch, out_ch, act=act), ConvUnit(out_ch, out_ch, act=act)
@@ -246,7 +279,12 @@ class Stage(nn.Module):
             self.sub1 = HybridUnit(in_ch, out_ch, k=k, beta=beta, act=act)
             self.sub2 = HybridUnit(out_ch, out_ch, k=k, beta=beta, act=act)
         else:                            # "morph"
-            Unit = StrictMorphUnit if impl == "paper" else MorphUnit
+            if impl == "paper":
+                Unit = StrictMorphUnit
+            elif impl == "convsep":      # depthwise-conv twin (matched params, no morphology)
+                Unit = ConvSepUnit
+            else:
+                Unit = MorphUnit
             self.sub1 = Unit(in_ch, out_ch, k=k, beta=beta, act=act)
             self.sub2 = Unit(out_ch, out_ch, k=k, beta=beta, act=act)
 
@@ -262,7 +300,10 @@ class Stage(nn.Module):
         # (e.g. enc1's raw image) and bf16 autocast both work. Checkpointing is a pure
         # compute<->memory trade with NO effect on the maths, so it can be turned off
         # (set_checkpointing(False)) when there is enough VRAM to go faster.
-        if self.use_ckpt and self.mode in ("morph", "half") and self.training and torch.is_grad_enabled():
+        # convsep stages are cheap (a single depthwise cuDNN kernel, no (B,C,k*k,H,W) tensor),
+        # so they are NOT checkpointed -- checkpointing would only add a redundant recompute.
+        heavy = self.mode in ("morph", "half") and self.impl != "convsep"
+        if self.use_ckpt and heavy and self.training and torch.is_grad_enabled():
             return checkpoint(self._forward, x, use_reentrant=False)
         return self._forward(x)
 

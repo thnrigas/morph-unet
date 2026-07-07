@@ -6,16 +6,25 @@
 # test scores (so it can go straight into train_eval.py --compare / --fold-mean).
 #
 # Schemes (see networks/prune_morph.py and networks/prune_tropnnc.py):
-#   l1     : prune morph input channels by ||SE||        (paper-faithful magnitude)
 #   l1x1   : prune morph input channels by ||proj_col|| * |alpha| * spread(SE)   (1x1-weighted)
 #   morph  : prune morph input channels by morphology-native saliency (+ off-centre win-rate)
+#   lin    : prune by ||proj_col|| * |alpha|  -- morphology-AGNOSTIC output contribution; keeps
+#            inert-but-informative linear channels that "morph" would discard
+#   act    : prune by ||proj_col|| * E|morph_i(x)|  -- DATA-DRIVEN output contribution (real
+#            activation replaces the spread(SE) proxy; needs calibration batches, no gradients)
+#   fb     : GLOBAL importance via HMM forward-backward over the morph chain (L1-activation prior +
+#            co-activation transitions); posterior gamma=alpha*beta, then keep-ratio (no gradients)
 #   tropnnc: TropNNC structured merging of the conv/linear layers (tropical zonotope reduction)
+#
+# Allocation (--alloc): "local" = uniform keep_ratio per layer; "global" = one shared budget across
+# all layers (non-uniform sparsity, prunes redundant layers harder) with a --min-keep floor/layer.
 #
 # Usage:
 #   python prune.py --tag mpm_full_l2 --fold 0 --method l1x1 --keep-ratio 0.5
-#   python prune.py --tag mpm_full_l2 --fold 0 --method morph --keep-ratio 0.6 --finetune-epochs 40
+#   python prune.py --tag mpm_full_l2 --fold 0 --method lin  --keep-ratio 0.3
+#   python prune.py --tag mpm_full_l2 --fold 0 --method morph --keep-ratio 0.5 --alloc global --min-keep 4
 #   python prune.py --tag mpm_full_l2 --fold 0 --method tropnnc --keep-ratio 0.5
-#   python prune.py --tag mpm_full_l2 --fold 0 --method l1 --keep-ratio 0.5 --no-finetune
+#   python prune.py --tag mpm_full_l2 --fold 0 --method l1x1 --keep-ratio 0.5 --no-finetune
 #
 
 import argparse
@@ -64,7 +73,7 @@ def finetune(model, args, train_loader, val_loader, device, out_stem):
     dice_loss = SoftDiceLoss(batch_dice=True, do_bg=False)
     ce_loss = torch.nn.CrossEntropyLoss()
     optimizer = optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=6)
+    scheduler = ReduceLROnPlateau(optimizer, "min", factor=0.5, patience=args.sched_patience)
     results_dir = os.path.join(config.PROJECT_ROOT, "results")
     best_path = os.path.join(results_dir, f"{out_stem}_best.pth")
     best_dice, best_epoch, t0 = -1.0, 0, time.time()
@@ -87,7 +96,7 @@ def finetune(model, args, train_loader, val_loader, device, out_stem):
             break
     print(f"  fine-tune done in {(time.time()-t0)/60:.1f} min | best fg-Dice {best_dice:.4f} "
           f"@ep{best_epoch} -> {best_path}")
-    return best_path, best_dice
+    return best_path, best_dice, best_epoch
 
 
 def main():
@@ -97,15 +106,31 @@ def main():
     p.add_argument("--config", default="full_l2")
     p.add_argument("--impl", default="fast", choices=["fast", "paper"])
     p.add_argument("--no-conv-stem", action="store_true", help="model was trained WITHOUT conv stem")
-    p.add_argument("--method", required=True, choices=["l1", "l1x1", "morph", "tropnnc"])
+    p.add_argument("--method", required=True,
+                   choices=["l1x1", "morph", "lin", "act", "fb", "random", "tropnnc"])
     p.add_argument("--keep-ratio", type=float, default=0.5, help="fraction of channels to KEEP")
-    p.add_argument("--calib-batches", type=int, default=8)
-    p.add_argument("--calib-bs", type=int, default=2)
-    p.add_argument("--finetune-epochs", type=int, default=40)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--patience", type=int, default=15)
+    p.add_argument("--alloc", default="local", choices=["local", "global"],
+                   help="local = uniform keep_ratio per morph layer; global = one shared budget "
+                        "across layers (non-uniform sparsity) with a --min-keep floor per layer")
+    p.add_argument("--global-norm", default="max", choices=["none", "max", "mean", "l2", "zscore"],
+                   help="per-layer score normalisation before GLOBAL cross-layer ranking")
+    p.add_argument("--min-keep", type=int, default=1,
+                   help="minimum input channels guaranteed per morph layer (global alloc floor)")
+    p.add_argument("--calib-batches", type=int, default=64)
+    p.add_argument("--calib-bs", type=int, default=16)   # 64 x 16 = 1024 calibration patches
+    p.add_argument("--finetune-epochs", type=int, default=80)
+    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--patience", type=int, default=24,
+                   help="early-stop patience (epochs); must exceed sched-patience*val-every so the "
+                        "LR scheduler can actually fire before we stop")
+    p.add_argument("--sched-patience", type=int, default=3,
+                   help="ReduceLROnPlateau patience in *validation steps* (i.e. sched-patience*"
+                        "val-every epochs of no val gain -> halve LR)")
     p.add_argument("--val-every", type=int, default=3)
     p.add_argument("--no-finetune", action="store_true")
+    p.add_argument("--skip-ft-if-within", type=float, default=0.0,
+                   help="if the PRUNED net (before fine-tuning) is within this Dice of the unpruned "
+                        "baseline, keep it as-is and skip fine-tuning entirely (0 = always fine-tune)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
@@ -125,7 +150,10 @@ def main():
     train_loader, val_loader, test_loader, _ = build_loaders(args)
 
     kk = f"k{int(round(args.keep_ratio * 100)):02d}"
-    out_stem = f"{args.tag}_prune-{args.method}-{kk}_f{args.fold}"
+    # global allocation gets a "g" suffix on the method tag so its runs don't collide with / are
+    # grouped separately from the local ones (e.g. mpm_full_l2_prune-morphg-k50_f0).
+    method_tag = args.method + ("g" if args.alloc == "global" else "")
+    out_stem = f"{args.tag}_prune-{method_tag}-{kk}_f{args.fold}"
     results_dir = os.path.join(config.PROJECT_ROOT, "results")
     os.makedirs(results_dir, exist_ok=True)
 
@@ -140,9 +168,12 @@ def main():
         print(f"[prune] TropNNC structured merge, keep_ratio={args.keep_ratio}")
         tropnnc_compress(model, keep_ratio=args.keep_ratio, verbose=True)
     else:
-        print(f"[prune] morph-channel {args.method}, keep_ratio={args.keep_ratio}")
+        print(f"[prune] morph-channel {args.method}, keep_ratio={args.keep_ratio}, "
+              f"alloc={args.alloc}" + (f" (norm={args.global_norm}, min_keep={args.min_keep})"
+                                       if args.alloc == "global" else ""))
         prune_morph_channels(model, criterion=args.method, keep_ratio=args.keep_ratio,
-                             calib_batches=calib, device=device, verbose=True)
+                             calib_batches=calib, device=device, min_keep=args.min_keep,
+                             alloc=args.alloc, global_norm=args.global_norm, verbose=True)
     p_after = count_params(model)
     pruned_dice, _ = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
     print(f"[{out_stem}] pruned:   {p_after/1e6:.3f}M params "
@@ -150,19 +181,29 @@ def main():
           f"(drop {base_dice-pruned_dice:+.4f})")
     torch.save(model, os.path.join(results_dir, f"{out_stem}_pruned_init.pth"))
 
-    ft_dice = None
-    if not (args.no_finetune or args.test_only):
+    # "free-lunch" prune: if pruning barely dented Dice, keep the pruned net untouched.
+    ft_skipped = (args.skip_ft_if_within > 0.0
+                  and (base_dice - pruned_dice) <= args.skip_ft_if_within)
+    if ft_skipped:
+        print(f"[{out_stem}] pruned Dice within {args.skip_ft_if_within:.3f} of baseline "
+              f"(drop {base_dice-pruned_dice:+.4f}) -> skipping fine-tune, keeping pruned net")
+
+    ft_dice, ft_best_epoch = None, None
+    if not (args.no_finetune or args.test_only or ft_skipped):
         print(f"[{out_stem}] fine-tuning {args.finetune_epochs} ep @ lr={args.lr:g} ...")
-        best_path, ft_dice = finetune(model, args, train_loader, val_loader, device, out_stem)
+        best_path, ft_dice, ft_best_epoch = finetune(model, args, train_loader, val_loader, device, out_stem)
         model = torch.load(best_path, map_location=device, weights_only=False)
 
     json_path = os.path.join(results_dir, f"{out_stem}_scores.json")
     scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers)
-    summary = {"tag": out_stem, "method": args.method, "keep_ratio": args.keep_ratio,
+    summary = {"tag": out_stem, "method": method_tag, "keep_ratio": args.keep_ratio,
+               "alloc": args.alloc, "global_norm": args.global_norm, "min_keep": args.min_keep,
                "params_before": p_before, "params_after": p_after,
                "params_off_pct": round(100 * (1 - p_after / p_before), 2),
                "val_dice_unpruned": round(base_dice, 5), "val_dice_pruned": round(pruned_dice, 5),
-               "val_dice_finetuned": (round(ft_dice, 5) if ft_dice is not None else None)}
+               "val_dice_finetuned": (round(ft_dice, 5) if ft_dice is not None else None),
+               "ft_skipped": ft_skipped,
+               "best_epoch": ft_best_epoch, "finetune_epochs": args.finetune_epochs}
     with open(os.path.join(results_dir, f"{out_stem}_prune.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[{out_stem}] DONE  params {p_before/1e6:.3f}M -> {p_after/1e6:.3f}M | "

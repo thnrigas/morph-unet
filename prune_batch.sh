@@ -14,10 +14,12 @@
 # Usage:  ./prune_batch.sh            (foreground)
 #         nohup ./prune_batch.sh > prune_batch.log 2>&1 &   (background, then: tail -f prune_batch.log)
 #
-set -euo pipefail
+# NOTE: no `set -e` -> a single failed run logs and the sweep continues with the rest.
+set -uo pipefail
 cd /home/Kasimatis/Documents/kasimat/morph-unet
+RESULTS=results
 
-EPOCHS=40
+EPOCHS=80
 LR=5e-5
 
 # "tag config fold" triples
@@ -38,13 +40,20 @@ for entry in "${MODELS[@]}"; do
   for METHOD in "${METHODS[@]}"; do
     for KEEP in "${KEEPS[@]}"; do
       n=$((n + 1))
+      KK=$(printf "k%02d" "$(python -c "print(round($KEEP*100))")")
+      DONE_JSON="$RESULTS/${TAG}_prune-${METHOD}-${KK}_f${FOLD}_prune.json"
       echo "=================================================================="
       echo ">>> [$n/$total] $TAG (config=$CFG) fold=$FOLD  method=$METHOD  keep=$KEEP"
       echo "=================================================================="
+      if [[ -f "$DONE_JSON" ]]; then
+        echo "    already done ($DONE_JSON) -> skip"
+        continue
+      fi
       python prune.py \
           --tag "$TAG" --config "$CFG" --fold "$FOLD" \
           --method "$METHOD" --keep-ratio "$KEEP" \
-          --finetune-epochs "$EPOCHS" --lr "$LR"
+          --finetune-epochs "$EPOCHS" --lr "$LR" \
+        || echo "!!! run [$n/$total] $TAG $METHOD keep=$KEEP FAILED (exit $?) -- continuing"
     done
   done
 done

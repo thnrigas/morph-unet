@@ -317,10 +317,12 @@ def main():
                    help="replace conv stages with morphological-separable blocks (networks/morph_unet.py). "
                         "deep = enc4+center+dec4; full = all stages morph (18 layers); "
                         "full_l1/full_l2 = full but with level 1 / levels 1-2 kept linear (14 / 10 layers)")
-    p.add_argument("--morph-impl", choices=["fast", "paper"], default="fast",
+    p.add_argument("--morph-impl", choices=["fast", "paper", "convsep"], default="fast",
                    help="morph block: 'fast' = depthwise morph + 1x1 (efficient); "
                         "'paper' = strict full channel-mixing max-plus conv + depthwise 3x3 activation "
-                        "(Setting 1, faithful, prunes the paper's way, heavier)")
+                        "(Setting 1, faithful, prunes the paper's way, heavier); "
+                        "'convsep' = plain-conv TWIN of 'fast' -- depthwise 3x3 conv + 1x1 (no "
+                        "morphology, matched params, trains much faster; the ablation control)")
     p.add_argument("--morph-half", action="store_true",
                    help="morph stages use HybridUnit (half channels morphological, half plain conv) "
                         "-- ~2x faster training, lower memory")
