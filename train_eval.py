@@ -367,6 +367,11 @@ def main():
     p.add_argument("--morph-dropout", type=float, default=0.0,
                    help="spatial Dropout2d rate on every stage output (0 = off, the default). "
                         "e.g. 0.2 for a regularised deep/bottleneck variant")
+    p.add_argument("--lin-attn", action="store_true",
+                   help="train the linear-attention U-Net (networks/linear_attention.py): a "
+                        "plain-conv U-Net with LINEAR cross-attention gates on the skip connections")
+    p.add_argument("--lin-attn-heads", type=int, default=4,
+                   help="number of linear-attention heads per skip gate (--lin-attn)")
     p.add_argument("--freeze-se", action="store_true",
                    help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
@@ -422,7 +427,16 @@ def main():
         torch.backends.cudnn.benchmark = True
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
-    if args.morph_unet:
+    if args.lin_attn:
+        # plain-conv U-Net with LINEAR cross-attention gates on the skips (networks/
+        # linear_attention.py) -- the linear-attention counterpart to the morphological
+        # attention net. No morphology, so the SE/beta/impl flags do not apply here.
+        from networks.linear_attention import LinAttnUNet
+        model = LinAttnUNet(num_classes=args.num_classes, in_channels=in_channels,
+                            conv_stem=not args.morph_no_conv_stem,
+                            heads=args.lin_attn_heads,
+                            act="relu" if args.morph_relu else "leaky").to(device)
+    elif args.morph_unet:
         # morphological-separable U-Net: conv stages replaced by depthwise soft morphology
         # + 1x1 projection, per the chosen config. Its SEs end in ".se", so they pick up the
         # boosted SE lr and --freeze-se just like the bank/residual variants. --morph-attn
@@ -485,7 +499,9 @@ def main():
 
     # (<tag>_f<fold>_{best.pth,last.pth,scores.json}
     stem = f"{args.tag}_f{args.fold}"
-    if args.morph_unet:
+    if args.lin_attn:
+        mode = f"lin-attn(heads={args.lin_attn_heads},stem={not args.morph_no_conv_stem})"
+    elif args.morph_unet:
         extra = ("".join(f",{t}" for t, on in
                  [("attn", args.morph_attn), ("half", args.morph_half), ("tie", args.morph_tie_mirror),
                   ("stem", not args.morph_no_conv_stem), ("bwarm", args.morph_beta_warmup > 0),

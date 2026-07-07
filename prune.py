@@ -165,6 +165,7 @@ def main():
     print(f"[{out_stem}] unpruned: {p_before/1e6:.3f}M params | val fg-Dice {base_dice:.4f}")
 
     calib = make_calib(train_loader, device, args.calib_batches, args.calib_bs)
+    report = None
     if args.method == "tropnnc":
         from networks.prune_tropnnc import tropnnc_compress
         print(f"[prune] TropNNC structured merge, keep_ratio={args.keep_ratio}")
@@ -173,7 +174,7 @@ def main():
         print(f"[prune] morph-channel {args.method}, keep_ratio={args.keep_ratio}, "
               f"alloc={args.alloc}" + (f" (norm={args.global_norm}, min_keep={args.min_keep})"
                                        if args.alloc == "global" else ""))
-        prune_morph_channels(model, criterion=args.method, keep_ratio=args.keep_ratio,
+        report = prune_morph_channels(model, criterion=args.method, keep_ratio=args.keep_ratio,
                              calib_batches=calib, device=device, min_keep=args.min_keep,
                              alloc=args.alloc, global_norm=args.global_norm, verbose=True)
     p_after = count_params(model)
@@ -205,7 +206,12 @@ def main():
                "val_dice_unpruned": round(base_dice, 5), "val_dice_pruned": round(pruned_dice, 5),
                "val_dice_finetuned": (round(ft_dice, 5) if ft_dice is not None else None),
                "ft_skipped": ft_skipped,
-               "best_epoch": ft_best_epoch, "finetune_epochs": args.finetune_epochs}
+               "best_epoch": ft_best_epoch, "finetune_epochs": args.finetune_epochs,
+               # per-layer surviving input-channel width (which layers keep channels): with GLOBAL
+               # allocation this is non-uniform -> shows whether the budget concentrates in early,
+               # bottleneck, or late layers. Keyed by morph-unit name in forward order.
+               "layer_widths": ({n: r["in_after"] for n, r in report.items()} if report else None),
+               "layer_in_before": ({n: r["in_before"] for n, r in report.items()} if report else None)}
     with open(os.path.join(results_dir, f"{out_stem}_prune.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"[{out_stem}] DONE  params {p_before/1e6:.3f}M -> {p_after/1e6:.3f}M | "

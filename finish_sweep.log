@@ -1,0 +1,7 @@
+############ PHASE A: heavy global, keeps 0.1 & 0.5 (8 runs) ############
+== morphunet_heavy_prune-l1x1g-k10_f0 (global, keep=0.1) ==
+class-balanced sampling -> class 1: 33886 slices, class 2: 13163 slices
+[val] CUDA OOM at chunk 12 -> retry at 6
+[morphunet_heavy_prune-l1x1g-k10_f0] unpruned: 6.005M params | val fg-Dice 0.5517
+Reshuffle...
+Initializing... this might take a while...

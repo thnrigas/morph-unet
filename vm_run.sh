@@ -112,6 +112,19 @@ MORPH_SCHEMES=("l1x1 local" "lin local" "act local" "fb local" \
 echo "##### PHASE 1: prune convsep_heavy (best fold = f1) #####"
 prune_model convsep_heavy heavy convsep 1 "${CONVSEP_SCHEMES[@]}"
 
+# ================================================================== PHASE 1b
+echo "##### PHASE 1b: train LINEAR-ATTENTION U-Net (linear-attn skips), folds 0,1,2 #####"
+for FOLD in 0 1 2; do
+  TAG=linattn
+  if [[ -f "$RESULTS/${TAG}_f${FOLD}_best.pth" ]]; then
+    echo "    $TAG f$FOLD already trained -> skip"; n_skip=$((n_skip+1)); continue
+  fi
+  echo "== TRAIN $TAG f$FOLD (linear-attention U-Net, heads=4) =="
+  python train_eval.py --tag "$TAG" --lin-attn --lin-attn-heads 4 --fold "$FOLD" \
+    || echo "    !!! $TAG f$FOLD FAILED (exit $?) -- continuing"
+  n_run=$((n_run+1))
+done
+
 # ================================================================== PHASE 2
 echo "##### PHASE 2: prune deep & bottleneck, folds 1,2 #####"
 for FOLD in 1 2; do

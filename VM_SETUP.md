@@ -6,6 +6,7 @@ prune / fine-tune / dropout-training; all base models are already trained locall
 
 ## 0. What runs (vm_run.sh, in order)
 1. **Prune convsep_heavy** (best fold = **f1**): criteria `lin/act/fb` × local+global + `random` local.
+1b. **Train linear-attention U-Net** (`networks/linear_attention.py`, linear cross-attention on the skips), folds 0,1,2 (tag `linattn`, trains fresh — no checkpoint needed).
 2. **Prune deep & bottleneck**, folds **1,2**: `l1x1/lin/act/fb` × local+global + `random` local (escalation + free-lunch skip).
 3. **Train deep & bottleneck with dropout p=0.2**, folds 0,1,2 (tags `mpm_deep_do`, `mpm_bottleneck_do`).
 
