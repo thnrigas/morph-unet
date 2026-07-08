@@ -103,9 +103,11 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
 # augment_channels.py once; reuse only if the cached dir's manifest matches specs exactly (not
 # just the count). `suffix` disambiguates the dir (per-fold for survey, spec-hash for manual)
 #
-def _ensure_static_dir(specs, suffix):
+def _ensure_static_dir(specs, suffix, perturb="none", strength=0.0, seed=0):
     prep_dir = str(config.PREPROCESSED_DIR)
-    static_dir = prep_dir.rstrip("/") + f"_static_{suffix}"
+    # a perturbed dir gets its own name+cache so it never collides with the clean training dir
+    psuf = f"_{perturb}{strength:g}" if perturb != "none" else ""
+    static_dir = prep_dir.rstrip("/") + f"_static_{suffix}{psuf}"
     manifest = os.path.join(static_dir, "filters.json")
     if os.path.exists(manifest):
         with open(manifest) as f:
@@ -113,12 +115,15 @@ def _ensure_static_dir(specs, suffix):
     else:
         cached = None
     if cached == specs:
-        print(f"static dir exists: {static_dir} ({len(specs)} filters)", flush=True)
+        print(f"static dir exists (cached): {static_dir} ({len(specs)} filters)", flush=True)
     else:
-        print(f"precomputing static channels: {specs} -> {static_dir}", flush=True)
+        tag = f" perturb={perturb}{strength:g}" if perturb != "none" else ""
+        print(f"precomputing static channels: {specs}{tag} -> {static_dir}", flush=True)
         augment = os.path.join(config.PROJECT_ROOT, "datasets", "augment_channels.py")
-        subprocess.run([sys.executable, augment, "--filters"] + specs + [
-                        "--src", prep_dir, "--out", static_dir], check=True)
+        cmd = [sys.executable, augment, "--filters"] + specs + ["--src", prep_dir, "--out", static_dir]
+        if perturb != "none":
+            cmd += ["--perturb", perturb, "--perturb-strength", str(strength), "--perturb-seed", str(seed)]
+        subprocess.run(cmd, check=True)
     print(f"static -> {specs}  ({len(specs)} channels)", flush=True)
     return static_dir, len(specs)
 
@@ -658,6 +663,7 @@ def main():
     p.add_argument("--test-perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
     p.add_argument("--perturb-strength", type=float, default=0.0)
     p.add_argument("--fast-eval", action="store_true")   # Dice-only test (skip slow HD95/ASSD)
+    p.add_argument("--skip-existing", action="store_true")   # skip a point whose scores json already exists
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--seed", type=int, default=42)
@@ -671,6 +677,24 @@ def main():
         return
     if not args.tag:
         p.error("--tag is required")
+
+    # --skip-existing: if this exact point's scores json already exists, skip the whole run (no model
+    # build / augment / inference) and just refresh the plot so the curve stays complete. lets an
+    # interrupted sweep resume without recomputing done points.
+    if args.skip_existing:
+        rt = f"{args.tag}_n{args.train_cases}" if args.train_cases and args.train_cases > 0 else args.tag
+        st = rt if args.test_perturb == "none" else f"{rt}_{args.test_perturb}{args.perturb_strength:g}"
+        jp = os.path.join(config.PROJECT_ROOT, "results", config.TASK, f"{st}_f{args.fold}_scores.json")
+        if os.path.exists(jp):
+            print(f"[{st}_f{args.fold}] scores exist, skipping (--skip-existing): {jp}", flush=True)
+            if args.test_perturb != "none":
+                try:
+                    fold_mean(st)
+                    plot_perturb(args.test_perturb,
+                                 sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag}), "Dice")
+                except Exception as e:
+                    print(f"[viz] plot skipped: {e}", flush=True)
+            return
 
     set_seed(args.seed)
     device = pick_device()
@@ -697,6 +721,21 @@ def main():
         if n > 0:
             args.static_dir = sdir
             args.static_channels = n
+
+    # static channels + --test-perturb (staticbank robustness): the channel-0 hook would leave the
+    # precomputed filter channels clean (a leak), so instead REBUILD the channels on the perturbed
+    # image -- read the resolved clean dir's spec manifest, then ensure a cached perturbed dir and
+    # point the loader at it. perturb_baked tells evaluate_test not to perturb again in-loop.
+    perturb_baked = False
+    if args.test_perturb != "none" and (getattr(args, "static_channels", 0) or 0) > 0:
+        manifest = os.path.join(args.static_dir, "filters.json")
+        specs = json.load(open(manifest)) if os.path.exists(manifest) else None
+        if not specs:
+            p.error(f"--test-perturb with static channels needs a filters.json manifest in {args.static_dir}")
+        args.static_dir, args.static_channels = _ensure_static_dir(
+            specs, _spec_suffix(specs), perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed)
+        perturb_baked = True
+        print("static robustness: perturbation baked into channels (no in-loop perturb)", flush=True)
 
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
@@ -871,8 +910,10 @@ def main():
     # and `--fold-mean baseline_gamma0.5` / `--compare` pick it up unchanged
     score_tag = run_tag if args.test_perturb == "none" else f"{run_tag}_{args.test_perturb}{args.perturb_strength:g}"
     json_path = os.path.join(results_dir, f"{score_tag}_f{args.fold}_scores.json")
+    # if the perturbation is already baked into the input dir (staticbank), don't apply it again in-loop
+    loop_perturb = "none" if perturb_baked else args.test_perturb
     scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers,
-                           perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed,
+                           perturb=loop_perturb, strength=args.perturb_strength, seed=args.seed,
                            advanced=not args.fast_eval)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
@@ -885,7 +926,7 @@ def main():
         print(f"[{stem}] perturb={args.test_perturb} strength={args.perturb_strength:g}", flush=True)
         try:
             fold_mean(score_tag)
-            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            models = sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag})
             plot_perturb(args.test_perturb, models, "Dice")
         except Exception as e:
             print(f"[viz] perturb plot skipped: {e}", flush=True)
@@ -895,7 +936,7 @@ def main():
     elif args.train_cases and args.train_cases > 0:
         try:
             fold_mean(score_tag)
-            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            models = sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag})
             plot_data_efficiency(models, "Dice")
         except Exception as e:
             print(f"[viz] data-efficiency plot skipped: {e}", flush=True)

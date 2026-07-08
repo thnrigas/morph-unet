@@ -58,13 +58,28 @@ def build_filter(spec):
     return table[m]
 
 
-def _augment_case(fname, src, out, specs):
+def _augment_case(fname, src, out, specs, perturb="none", strength=0.0, seed=0):
     arr = np.load(os.path.join(src, fname))          # (C>=2, Z, H, W): image ... label
     if arr.shape[0] < 2:
         raise SystemExit(f"{fname}: expected >=2 channels (image,label), got {arr.shape}")
     image = arr[0].astype(np.float32)
     label = arr[-1].astype(np.float32)
     inorm = norm01(image)                            # filter input matches the survey's calibration
+    # robustness eval: apply the SAME intensity perturbation as train_eval._perturb_image, but HERE,
+    # before the filters run, so the static channels are recomputed from the perturbed image (not the
+    # clean one). ch0 also becomes the perturbed image, so the model gets a coherent
+    # [perturbed_image, filter(perturbed_image), ..., label] -- no clean-channel leak. gamma in the
+    # loader == gamma on norm01, so it's applied in this normalized domain then de-normalized back.
+    if perturb != "none" and strength:
+        lo, hi = float(image.min()), float(image.max())
+        if perturb == "gamma":
+            inorm = np.clip(inorm, 0.0, 1.0) ** strength
+        elif perturb == "contrast":
+            m = float(inorm.mean())
+            inorm = np.clip((inorm - m) * strength + m, 0.0, 1.0)
+        elif perturb == "noise":
+            inorm = np.clip(inorm + np.random.default_rng(seed).normal(0.0, strength, inorm.shape), 0.0, 1.0)
+        image = (inorm * (hi - lo) + lo).astype(np.float32)   # ch0 = perturbed image (raw units)
     filters = [build_filter(s) for s in specs]
     chans = [image]                                  # ch0 stays the original image (baseline input)
     for f in filters:
@@ -84,12 +99,18 @@ def main():
                     help="filter specs, e.g. recontophat:3 hdome:0.1 vdome:0.1:100 areaopen:150")
     ap.add_argument("--src", default=str(config.PREPROCESSED_DIR),
                     help="dir of (image,label) npys (default: config.PREPROCESSED_DIR)")
-    ap.add_argument("--out", default=None, help="output dir (default: <src>_static)")
+    ap.add_argument("--out", default=None, help="output dir (default: <src>_static[_<perturb><strength>])")
     ap.add_argument("--workers", type=int, default=min(os.cpu_count() or 1, 16))
+    # robustness eval: perturb the image before computing filters (recompute channels on the shifted
+    # image). default none = clean training-time behaviour, unchanged.
+    ap.add_argument("--perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
+    ap.add_argument("--perturb-strength", type=float, default=0.0)
+    ap.add_argument("--perturb-seed", type=int, default=0)
     args = ap.parse_args()
 
     src = args.src
-    out = args.out or (src.rstrip("/") + "_static")
+    psuffix = f"_{args.perturb}{args.perturb_strength:g}" if args.perturb != "none" else ""
+    out = args.out or (src.rstrip("/") + "_static" + psuffix)
     os.makedirs(out, exist_ok=True)
     for s in args.filters:                            # validate specs up front (fail fast)
         build_filter(s)
@@ -100,10 +121,14 @@ def main():
     n_ch = 1 + len(args.filters) + 1
     print(f"augmenting {len(cases)} cases from {src}")
     print(f"  filters: {args.filters}")
+    if args.perturb != "none":
+        print(f"  perturb: {args.perturb} strength={args.perturb_strength:g} "
+              f"(image + filters recomputed on the perturbed image)")
     print(f"  -> {out}   ({n_ch} channels: image + {len(args.filters)} filters + label)")
     print(f"  train with input_slice=(0..{len(args.filters)}), label_slice={n_ch - 1}")
 
-    worker = partial(_augment_case, src=src, out=out, specs=args.filters)
+    worker = partial(_augment_case, src=src, out=out, specs=args.filters,
+                     perturb=args.perturb, strength=args.perturb_strength, seed=args.perturb_seed)
     if args.workers > 1:
         with Pool(args.workers) as pool:
             for fname, shape in pool.imap_unordered(worker, cases):

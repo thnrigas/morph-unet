@@ -15,11 +15,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import argparse
+
 import config
 from datasets.preprocessing import preprocess_data
 from datasets.create_splits import create_splits
 
 if __name__ == "__main__":
-    preprocess_data(root_dir=str(config.DATA_DIR), modality=config.MODALITY, channel=config.CHANNEL)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--workers", type=int, default=None, help="parallel worker processes (default: min(cpu,16))")
+    args = ap.parse_args()
+    preprocess_data(root_dir=str(config.DATA_DIR), modality=config.MODALITY, channel=config.CHANNEL,
+                    num_workers=args.workers)
     create_splits(output_dir=str(config.DATA_DIR), image_dir=str(config.PREPROCESSED_DIR))
     print("Preprocessing done.")
