@@ -33,7 +33,7 @@ KEEPS=(0.1 0.3 0.5 0.7)
 
 # ------------------------------------------------------------------ helpers
 is_good() {  # $1=json  $2=ft_tol  $3=prune_tol   -> echoes "good"/"bad"
-  python - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
 path, ft_tol, prune_tol = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 try:
@@ -69,7 +69,7 @@ prune_model() {
     MTAG="${METHOD}${SUFFIX}"
     echo "------ $TAG f$FOLD  scheme=$MTAG ($METHOD/$ALLOC) ------"
     for KEEP in "${KEEPS[@]}"; do
-      KK=$(printf "k%02d" "$(python -c "print(round($KEEP*100))")")
+      KK=$(printf "k%02d" "$(python3 -c "print(round($KEEP*100))")")
       STEM="${TAG}_prune-${MTAG}-${KK}_f${FOLD}"
       JSON="$RESULTS/${STEM}_prune.json"
       if [[ -f "$JSON" ]]; then
@@ -79,7 +79,7 @@ prune_model() {
         echo "    keep=$KEEP RUNNING ($STEM)"
         FLAGS=(--alloc "$ALLOC" --min-keep "$MIN_KEEP")
         [[ "$ALLOC" == "global" ]] && FLAGS+=(--global-norm "$GLOBAL_NORM")
-        python prune.py --tag "$TAG" --config "$CFG" --impl "$IMPL" --fold "$FOLD" \
+        python3 prune.py --tag "$TAG" --config "$CFG" --impl "$IMPL" --fold "$FOLD" \
             --method "$METHOD" --keep-ratio "$KEEP" "${FLAGS[@]}" \
             --skip-ft-if-within "$PRUNE_TOL" --finetune-epochs "$EPOCHS" --lr "$LR" \
           || echo "    !!! $STEM FAILED (exit $?) -- continuing"
@@ -90,11 +90,11 @@ prune_model() {
   done
   # random baseline: local only, every keep-ratio, NO escalation, ALWAYS fine-tune
   for KEEP in "${KEEPS[@]}"; do
-    KK=$(printf "k%02d" "$(python -c "print(round($KEEP*100))")")
+    KK=$(printf "k%02d" "$(python3 -c "print(round($KEEP*100))")")
     STEM="${TAG}_prune-random-${KK}_f${FOLD}"
     [[ -f "$RESULTS/${STEM}_prune.json" ]] && { echo "    random keep=$KEEP done -> skip"; n_skip=$((n_skip+1)); continue; }
     echo "    random keep=$KEEP RUNNING ($STEM)"
-    python prune.py --tag "$TAG" --config "$CFG" --impl "$IMPL" --fold "$FOLD" \
+    python3 prune.py --tag "$TAG" --config "$CFG" --impl "$IMPL" --fold "$FOLD" \
         --method random --keep-ratio "$KEEP" --alloc local --min-keep "$MIN_KEEP" \
         --finetune-epochs "$EPOCHS" --lr "$LR" \
       || echo "    !!! $STEM FAILED (exit $?) -- continuing"
@@ -124,7 +124,7 @@ train_arm() {  # $1=tag  $2..=extra train_eval flags
       echo "    $TAG f$FOLD already trained -> skip"; n_skip=$((n_skip+1)); continue
     fi
     echo "== TRAIN $TAG f$FOLD =="
-    python train_eval.py --tag "$TAG" --fold "$FOLD" "$@" \
+    python3 train_eval.py --tag "$TAG" --fold "$FOLD" "$@" \
       || echo "    !!! $TAG f$FOLD FAILED (exit $?) -- continuing"
     n_run=$((n_run+1))
   done
@@ -149,7 +149,7 @@ for CFG in deep bottleneck; do
       echo "    $TAG f$FOLD already trained -> skip"; n_skip=$((n_skip+1)); continue
     fi
     echo "== TRAIN $TAG f$FOLD (config=$CFG dropout=0.2) =="
-    python train_eval.py --tag "$TAG" --morph-unet "$CFG" --morph-k 3 \
+    python3 train_eval.py --tag "$TAG" --morph-unet "$CFG" --morph-k 3 \
         --morph-dropout 0.2 --fold "$FOLD" \
       || echo "    !!! $TAG f$FOLD FAILED (exit $?) -- continuing"
     n_run=$((n_run+1))
@@ -162,4 +162,4 @@ done
 
 echo "=================================================================="
 echo "VM QUEUE DONE: $n_run runs, $n_skip skipped, in $(( ($(date +%s)-t_start)/60 )) min."
-python collate_prune.py || true
+python3 collate_prune.py || true
