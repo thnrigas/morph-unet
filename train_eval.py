@@ -157,6 +157,15 @@ def build_loaders(args):
     with open(config.SPLITS_FILE, "rb") as f:
         splits = pickle.load(f)
     tr, vl, ts = (splits[args.fold]["train"], splits[args.fold]["val"], splits[args.fold]["test"])
+    # data-efficiency sweep: keep only N training cases (val/test untouched). NESTED subsets across N
+    # (shuffle once with a fixed seed, take the first N) so N=5 ⊂ N=10 ⊂ ...; the only variable that
+    # moves between sweep points is training-set size, not which cases were drawn.
+    n_train = getattr(args, "train_cases", 0) or 0
+    if 0 < n_train < len(tr):
+        order = list(tr)
+        random.Random(args.seed).shuffle(order)
+        tr = sorted(order[:n_train])
+        print(f"data-efficiency: training on {n_train}/{len(splits[args.fold]['train'])} cases -> {tr}", flush=True)
     # --static-dir overrides to the augmented preprocessed dir, --static-channels sets the layout
     n_static = getattr(args, "static_channels", 0) or 0
     data_dir = getattr(args, "static_dir", None) or str(config.PREPROCESSED_DIR)
@@ -252,16 +261,44 @@ def run_val_dice(model, loader, device, num_classes):
     return mean, dice.tolist()
 
 #
+# test-time intensity perturbation, applied to the raw-image channel (0) only so any morph/static
+# front-end channels are recomputed from (or kept consistent with) the shifted image. eval-time
+# stress test for robustness: gamma (strictly monotonic -> rank-based morphology near-equivariant),
+# contrast (affine about the mean, monotonic), noise (additive gaussian, non-monotonic -> tests the
+# opening/closing denoising path). strength s: gamma/contrast are multiplicative factors (1 = id),
+# noise is a sigma in normalized (z-scored) units. seed keeps the noise draw reproducible.
+#
+def _perturb_image(data, kind, s, gen):
+    if kind == "none" or s == 0:
+        return data
+    x = data.clone()
+    img = x[:, :1]
+    if kind == "gamma":
+        mn = img.amin((2, 3), keepdim=True)
+        mx = img.amax((2, 3), keepdim=True)
+        u = ((img - mn) / (mx - mn + 1e-6)).clamp(0, 1)
+        img = u.pow(s) * (mx - mn) + mn
+    elif kind == "contrast":
+        m = img.mean((2, 3), keepdim=True)
+        img = (img - m) * s + m
+    elif kind == "noise":
+        img = img + torch.randn(img.shape, generator=gen).to(img.device) * s
+    x[:, :1] = img
+    return x
+
+#
 # test phase
 #
-def evaluate_test(model, loader, device, json_path, num_workers=1):
+def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0, seed=0):
     model.eval()
+    gen = torch.Generator().manual_seed(seed)   # cpu generator, device-agnostic reproducible noise
     # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
     # targets for the whole full-slice test set blew up CPU RAM and got the process OOM-killed.
     pred_dict, gt_dict = defaultdict(list), defaultdict(list)
     with torch.no_grad():
         for batch in loader:
             data = batch["data"][0].float().to(device)
+            data = _perturb_image(data, perturb, strength, gen)              # eval-time robustness stress
             target = batch["seg"][0][:, 0].to(torch.uint8).numpy()           # [b, H, W]
             pred = model(data).argmax(1).to(torch.uint8).cpu().numpy()       # [b, H, W]
             for i, fname in enumerate(batch["fnames"]):
@@ -368,6 +405,135 @@ def fold_mean(tag):
         json.dump({"tag": tag, "folds": paths, "mean": agg, "train": train_agg}, f, indent=2)
     print(f"written to {out}")
     return agg
+
+#
+# robustness curve: mean foreground <metric> vs perturbation strength, one line per model.
+# reads the fold-mean files fold_mean() writes for each (model, kind, strength):
+#   <model>_<kind><strength>_mean_scores.json   (+ the clean <model>_mean_scores.json as the
+#   identity anchor: strength 1.0 for gamma/contrast, 0.0 for noise). error bars are the
+#   across-fold std already stored in those files, averaged over the foreground labels.
+#
+def plot_perturb(kind, models, metric="Dice"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    results_dir = read_results_dir()
+
+    def fg_metric(path):   # mean (and mean-of-per-label-std) of <metric> over foreground labels
+        with open(path) as f:
+            mean = json.load(f)["mean"]
+        vals, stds = [], []
+        for label, mets in mean.items():
+            if str(label) == "0":            # skip background if present
+                continue
+            m = mets.get(metric)
+            if isinstance(m, dict):
+                vals.append(m["mean"]); stds.append(m.get("std", 0.0))
+        if not vals:
+            return None, None
+        return float(np.mean(vals)), float(np.mean(stds))
+
+    anchor = 1.0 if kind in ("gamma", "contrast") else 0.0   # identity strength for this kind
+    plt.figure(figsize=(6, 4))
+    for model in models:
+        pts = []
+        for p in glob.glob(os.path.join(results_dir, f"{model}_{kind}*_mean_scores.json")):
+            tail = os.path.basename(p)[len(f"{model}_{kind}"):-len("_mean_scores.json")]
+            try:
+                s = float(tail)
+            except ValueError:
+                continue
+            mv, sv = fg_metric(p)
+            if mv is not None:
+                pts.append((s, mv, sv))
+        clean = os.path.join(results_dir, f"{model}_mean_scores.json")   # identity anchor
+        if os.path.exists(clean) and not any(abs(s - anchor) < 1e-9 for s, _, _ in pts):
+            mv, sv = fg_metric(clean)
+            if mv is not None:
+                pts.append((anchor, mv, sv))
+        if not pts:
+            print(f"no files match {model}_{kind}*_mean_scores.json in {results_dir}")
+            continue
+        pts.sort()
+        xs, ys, es = zip(*pts)
+        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=model)
+        print(f"{model}: " + "  ".join(f"{s:g}->{y:.4f}" for s, y, _ in pts))
+    xlab = {"gamma": "gamma  (1 = identity)", "contrast": "contrast factor  (1 = identity)",
+            "noise": "gaussian sigma  (0 = clean)"}[kind]
+    plt.axvline(anchor, color="k", ls=":", lw=0.8, alpha=0.5)
+    plt.xlabel(xlab); plt.ylabel(f"mean foreground {metric}")
+    plt.title(f"{config.TASK}: {metric} vs {kind} perturbation")
+    plt.legend(); plt.grid(alpha=0.3)
+    out = os.path.join(results_dir, f"{kind}_robustness.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"written {out}")
+
+#
+# mean over foreground labels of a metric in a fold-mean file (+ mean of the per-label across-fold std)
+#
+def _fg_mean(path, metric):
+    with open(path) as f:
+        mean = json.load(f)["mean"]
+    vals, stds = [], []
+    for label, mets in mean.items():
+        if str(label) == "0":            # skip background if present
+            continue
+        m = mets.get(metric)
+        if isinstance(m, dict):
+            vals.append(m["mean"]); stds.append(m.get("std", 0.0))
+    if not vals:
+        return None, None
+    return float(np.mean(vals)), float(np.mean(stds))
+
+#
+# data-efficiency curve: mean foreground <metric> vs #training cases, one line per model. reads the
+# fold-mean files written for each (model, N): <model>_n<N>_mean_scores.json, plus the full-data run
+# <model>_mean_scores.json as the top anchor (placed at the full per-fold train size). log-x.
+#
+def plot_data_efficiency(models, metric="Dice"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    results_dir = read_results_dir()
+    full_n = None                        # full per-fold train size (for the n0/full anchor + x pos)
+    try:
+        with open(config.SPLITS_FILE, "rb") as f:
+            full_n = len(pickle.load(f)[0]["train"])
+    except Exception:
+        pass
+    plt.figure(figsize=(6, 4))
+    for model in models:
+        pts = []
+        for p in glob.glob(os.path.join(results_dir, f"{model}_n*_mean_scores.json")):
+            tail = os.path.basename(p)[len(f"{model}_n"):-len("_mean_scores.json")]
+            try:
+                n = int(tail)
+            except ValueError:
+                continue                 # skip e.g. _n5_gamma0.5 (perturbed) files
+            if n == 0:
+                n = full_n or 0
+            mv, sv = _fg_mean(p, metric)
+            if mv is not None and n:
+                pts.append((n, mv, sv))
+        full = os.path.join(results_dir, f"{model}_mean_scores.json")   # full-data anchor
+        if full_n and os.path.exists(full) and not any(n == full_n for n, _, _ in pts):
+            mv, sv = _fg_mean(full, metric)
+            if mv is not None:
+                pts.append((full_n, mv, sv))
+        if not pts:
+            print(f"no files match {model}_n*_mean_scores.json in {results_dir}")
+            continue
+        pts.sort()
+        xs, ys, es = zip(*pts)
+        plt.errorbar(xs, ys, yerr=es, marker="o", capsize=3, label=model)
+        print(f"{model}: " + "  ".join(f"N={n}->{y:.4f}" for n, y, _ in pts))
+    plt.xscale("log")
+    plt.xlabel("training cases (log scale)"); plt.ylabel(f"mean foreground {metric}")
+    plt.title(f"{config.TASK}: data efficiency ({metric} vs training-set size)")
+    plt.legend(); plt.grid(alpha=0.3, which="both")
+    out = os.path.join(results_dir, "data_efficiency.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"written {out}")
 
 #
 # per label metric deltas (and training stat deltas) of each run vs the baseline
@@ -481,8 +647,13 @@ def main():
     p.add_argument("--static-filters", nargs="+", metavar="SPEC")
     # other
     p.add_argument("--fold", type=int, default=0)
+    p.add_argument("--train-cases", type=int, default=0)   # 0 = full split; N>0 = data-efficiency point
     p.add_argument("--resume", action="store_true")
     p.add_argument("--test-only", action="store_true")
+    # eval-time robustness stress (reuses trained weights, no retraining): perturb the input image
+    # then re-score. scores are written under a perturb-suffixed tag so the clean run isn't clobbered
+    p.add_argument("--test-perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
+    p.add_argument("--perturb-strength", type=float, default=0.0)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--seed", type=int, default=42)
@@ -550,8 +721,10 @@ def main():
             if n.endswith(".se"):
                 p.requires_grad_(False)
 
-    # <tag>_f<fold>_{best.pth,last.pth,scores.json}
-    stem = f"{args.tag}_f{args.fold}"
+    # <tag>_f<fold>_{best.pth,last.pth,scores.json}; a data-efficiency point trains its own model,
+    # so fold N into the tag (run_tag) to keep its checkpoint/scores separate from the full-data run
+    run_tag = f"{args.tag}_n{args.train_cases}" if args.train_cases and args.train_cases > 0 else args.tag
+    stem = f"{run_tag}_f{args.fold}"
     if args.morph_unet:
         mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta})"
     elif args.morph_bank:
@@ -689,12 +862,38 @@ def main():
     if isinstance(state, dict) and "model" in state:   # last.pth is a full-state dict
         state = state["model"]
     model.load_state_dict(state)
-    json_path = os.path.join(results_dir, f"{stem}_scores.json")
-    scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers)
+    # checkpoint loads from the clean stem; scores get a perturb-suffixed tag so a run like
+    # `--tag baseline --test-perturb gamma --perturb-strength 0.5` writes baseline_gamma0.5_f<fold>
+    # and `--fold-mean baseline_gamma0.5` / `--compare` pick it up unchanged
+    score_tag = run_tag if args.test_perturb == "none" else f"{run_tag}_{args.test_perturb}{args.perturb_strength:g}"
+    json_path = os.path.join(results_dir, f"{score_tag}_f{args.fold}_scores.json")
+    scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers,
+                           perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
         print(f"  label {label}: Dice={md.get('Dice')} "
               f"ASSD={md.get('Avg. Symmetric Surface Distance')}")
+    # incremental robustness plot: after each perturbed run, refresh this point's across-fold mean
+    # and redraw <kind>_robustness.png from every model/strength scored so far. the curve fills in
+    # as runs complete; failures here never fail the eval.
+    if args.test_perturb != "none":
+        print(f"[{stem}] perturb={args.test_perturb} strength={args.perturb_strength:g}", flush=True)
+        try:
+            fold_mean(score_tag)
+            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            plot_perturb(args.test_perturb, models, "Dice")
+        except Exception as e:
+            print(f"[viz] perturb plot skipped: {e}", flush=True)
+    # incremental data-efficiency plot: after each subsample run, refresh this N's across-fold mean
+    # and redraw data_efficiency.png from every model/N trained so far (full-data anchor picked up
+    # from the plain <model>_mean_scores.json). the curve fills in as runs complete.
+    elif args.train_cases and args.train_cases > 0:
+        try:
+            fold_mean(score_tag)
+            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            plot_data_efficiency(models, "Dice")
+        except Exception as e:
+            print(f"[viz] data-efficiency plot skipped: {e}", flush=True)
 
 
 if __name__ == "__main__":
