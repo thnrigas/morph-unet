@@ -267,3 +267,87 @@ Reshuffle...
 Initializing... this might take a while...
   ft epoch  80/80  train=-0.0351  val_fgDice=0.1282  [per 0.253 0.004]
   fine-tune done in 57.9 min | best fg-Dice 0.1370 @ep69 -> /home/Kasimatis/Documents/kasimat/morph-unet/results/morphunet_heavy_prune-l1x1g-k10_f0_best.pth
+[morphunet_heavy_prune-l1x1g-k10_f0] DONE  params 6.005M -> 3.016M | Dice 0.5517 -> pruned 0.0000 -> finetuned 0.1370
+  scores: /home/Kasimatis/Documents/kasimat/morph-unet/results/morphunet_heavy_prune-l1x1g-k10_f0_scores.json
+== morphunet_heavy_prune-l1x1g-k50_f0 (global, keep=0.5) ==
+class-balanced sampling -> class 1: 33886 slices, class 2: 13163 slices
+[val] CUDA OOM at chunk 12 -> retry at 6
+[morphunet_heavy_prune-l1x1g-k50_f0] unpruned: 6.005M params | val fg-Dice 0.5517
+Reshuffle...
+Initializing... this might take a while...
+[prune] morph-channel l1x1, keep_ratio=0.5, alloc=global (norm=max, min_keep=4)
+  enc1.sub1              in   64 ->   61  (l1x1, global)
+  enc1.sub2              in   64 ->   62  (l1x1, global)
+  enc2.sub1              in   64 ->   54  (l1x1, global)
+  enc2.sub2              in  128 ->  102  (l1x1, global)
+  enc3.sub1              in  128 ->  109  (l1x1, global)
+  enc3.sub2              in  256 ->  175  (l1x1, global)
+  enc4.sub1              in  256 ->  205  (l1x1, global)
+  enc4.sub2              in  512 ->  460  (l1x1, global)
+  center.sub1            in  512 ->  254  (l1x1, global)
+  center.sub2            in 1024 ->  125  (l1x1, global)
+  dec4.sub1              in 1024 ->  479  (l1x1, global)
+  dec4.sub2              in  512 ->  241  (l1x1, global)
+  dec3.sub1              in  512 ->  129  (l1x1, global)
+  dec3.sub2              in  256 ->  150  (l1x1, global)
+  dec2.sub1              in  256 ->  114  (l1x1, global)
+  dec2.sub2              in  128 ->  114  (l1x1, global)
+  dec1.sub1              in  128 ->   62  (l1x1, global)
+  dec1.sub2              in   64 ->   48  (l1x1, global)
+[morphunet_heavy_prune-l1x1g-k50_f0] pruned:   4.134M params (31.2% off) | val fg-Dice 0.0932 (drop +0.4585)
+[morphunet_heavy_prune-l1x1g-k50_f0] fine-tuning 80 ep @ lr=5e-05 ...
+Reshuffle...
+Initializing... this might take a while...
+Traceback (most recent call last):
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/prune.py", line 224, in <module>
+    main()
+    ~~~~^^
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/prune.py", line 197, in main
+    best_path, ft_dice, ft_best_epoch = finetune(model, args, train_loader, val_loader, device, out_stem)
+                                        ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/prune.py", line 81, in finetune
+    tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer)
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/train_eval.py", line 139, in run_epoch
+    pred = model(data)
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/networks/morph_unet.py", line 421, in forward
+    d1 = self.dec1(torch.cat([self.up1(d2), e1], 1))
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/networks/morph_unet.py", line 313, in forward
+    return self.drop(self._forward(x))
+                     ~~~~~~~~~~~~~^^^
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/networks/morph_unet.py", line 298, in _forward
+    return x + self.sub2(x)     # sub2 is out->out, so the residual shapes match
+               ~~~~~~~~~^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/networks/morph_unet.py", line 138, in forward
+    return self.act(self.norm(self.proj(self.morph(x))))
+                                        ~~~~~~~~~~^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1778, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "/home/Kasimatis/.local/lib/python3.14/site-packages/torch/nn/modules/module.py", line 1789, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/Kasimatis/Documents/kasimat/morph-unet/networks/morph_unet.py", line 100, in forward
+    dil = torch.logaddexp(torch.logsumexp(b * n, dim=2), b * self.b_dil) / b
+                          ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 648.00 MiB. GPU 0 has a total capacity of 15.50 GiB of which 38.94 MiB is free. Process 128606 has 337.09 MiB memory in use. Including non-PyTorch memory, this process has 14.10 GiB memory in use. Of the allocated memory 13.12 GiB is allocated by PyTorch, and 671.90 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+  !!! morphunet_heavy_prune-l1x1g-k50_f0 FAILED (exit 1) -- continuing
+== morphunet_heavy_prune-ling-k10_f0 (global, keep=0.1) ==
+class-balanced sampling -> class 1: 33886 slices, class 2: 13163 slices
+[val] CUDA OOM at chunk 12 -> retry at 6
+[morphunet_heavy_prune-ling-k10_f0] unpruned: 6.005M params | val fg-Dice 0.5517
+Reshuffle...
+Initializing... this might take a while...
