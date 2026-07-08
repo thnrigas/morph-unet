@@ -103,10 +103,11 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
 # augment_channels.py once; reuse only if the cached dir's manifest matches specs exactly (not
 # just the count). `suffix` disambiguates the dir (per-fold for survey, spec-hash for manual)
 #
-def _ensure_static_dir(specs, suffix, perturb="none", strength=0.0, seed=0):
+def _ensure_static_dir(specs, suffix, perturb="none", strength=0.0, seed=0, fold=0):
     prep_dir = str(config.PREPROCESSED_DIR)
-    # a perturbed dir gets its own name+cache so it never collides with the clean training dir
-    psuf = f"_{perturb}{strength:g}" if perturb != "none" else ""
+    # a perturbed dir gets its own name+cache: keyed by perturb+strength AND fold, because it only
+    # holds that fold's TEST split (augment restricts to it), so it must not be shared across folds
+    psuf = f"_{perturb}{strength:g}_f{fold}" if perturb != "none" else ""
     static_dir = prep_dir.rstrip("/") + f"_static_{suffix}{psuf}"
     manifest = os.path.join(static_dir, "filters.json")
     if os.path.exists(manifest):
@@ -117,12 +118,13 @@ def _ensure_static_dir(specs, suffix, perturb="none", strength=0.0, seed=0):
     if cached == specs:
         print(f"static dir exists (cached): {static_dir} ({len(specs)} filters)", flush=True)
     else:
-        tag = f" perturb={perturb}{strength:g}" if perturb != "none" else ""
+        tag = f" perturb={perturb}{strength:g} fold={fold}(test)" if perturb != "none" else ""
         print(f"precomputing static channels: {specs}{tag} -> {static_dir}", flush=True)
         augment = os.path.join(config.PROJECT_ROOT, "datasets", "augment_channels.py")
         cmd = [sys.executable, augment, "--filters"] + specs + ["--src", prep_dir, "--out", static_dir]
         if perturb != "none":
-            cmd += ["--perturb", perturb, "--perturb-strength", str(strength), "--perturb-seed", str(seed)]
+            cmd += ["--perturb", perturb, "--perturb-strength", str(strength),
+                    "--perturb-seed", str(seed), "--fold", str(fold)]
         subprocess.run(cmd, check=True)
     print(f"static -> {specs}  ({len(specs)} channels)", flush=True)
     return static_dir, len(specs)
@@ -716,24 +718,39 @@ def main():
     if args.static_filters and not args.static_dir and args.static_channels == 0:
         args.static_dir, args.static_channels = ensure_static_filters(args.static_filters)
     if args.static_auto and not args.static_dir and args.static_channels == 0:
-        sdir, n = ensure_static_channels(config.TASK, args.fold, config.DATA_DIR,
-                                         args.survey_top_k, args.survey_workers, n=args.survey_n)
-        if n > 0:
-            args.static_dir = sdir
-            args.static_channels = n
+        if args.test_perturb != "none":
+            # test-only perturbed eval: the clean full augmented dir is never used, so DON'T build it
+            # (484 cases of slow dome filters) -- just resolve the survey specs; the perturb block
+            # below builds only this fold's perturbed TEST split.
+            specs = _read_static_spec(config.TASK, args.fold)
+            if specs is None:
+                _run_survey(config.TASK, args.fold, config.DATA_DIR,
+                            args.survey_top_k, args.survey_workers, "results/explore", args.survey_n)
+                specs = _read_static_spec(config.TASK, args.fold)
+            if specs:
+                args.static_channels = len(specs)   # static_dir stays unset; set by perturb block
+        else:
+            sdir, n = ensure_static_channels(config.TASK, args.fold, config.DATA_DIR,
+                                             args.survey_top_k, args.survey_workers, n=args.survey_n)
+            if n > 0:
+                args.static_dir = sdir
+                args.static_channels = n
 
-    # static channels + --test-perturb (staticbank robustness): the channel-0 hook would leave the
-    # precomputed filter channels clean (a leak), so instead REBUILD the channels on the perturbed
-    # image -- read the resolved clean dir's spec manifest, then ensure a cached perturbed dir and
-    # point the loader at it. perturb_baked tells evaluate_test not to perturb again in-loop.
+    # static channels + --test-perturb (staticbank robustness): rebuild channels on the PERTURBED
+    # image (recompute -> no clean-channel leak), restricted to this fold's test split. specs come
+    # from an explicit --static-dir manifest if present, else the survey (--static-auto/--static-filters).
     perturb_baked = False
     if args.test_perturb != "none" and (getattr(args, "static_channels", 0) or 0) > 0:
-        manifest = os.path.join(args.static_dir, "filters.json")
-        specs = json.load(open(manifest)) if os.path.exists(manifest) else None
+        manifest = os.path.join(args.static_dir, "filters.json") if args.static_dir else None
+        if manifest and os.path.exists(manifest):
+            specs = json.load(open(manifest))
+        else:
+            specs = _read_static_spec(config.TASK, args.fold) or args.static_filters
         if not specs:
-            p.error(f"--test-perturb with static channels needs a filters.json manifest in {args.static_dir}")
+            p.error("--test-perturb with static channels: could not resolve filter specs")
         args.static_dir, args.static_channels = _ensure_static_dir(
-            specs, _spec_suffix(specs), perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed)
+            specs, _spec_suffix(specs), perturb=args.test_perturb, strength=args.perturb_strength,
+            seed=args.seed, fold=args.fold)
         perturb_baked = True
         print("static robustness: perturbation baked into channels (no in-loop perturb)", flush=True)
 

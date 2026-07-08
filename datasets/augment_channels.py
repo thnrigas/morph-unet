@@ -22,6 +22,7 @@
 import argparse
 import json
 import os
+import pickle
 import sys
 from functools import partial
 from multiprocessing import Pool
@@ -106,6 +107,7 @@ def main():
     ap.add_argument("--perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
     ap.add_argument("--perturb-strength", type=float, default=0.0)
     ap.add_argument("--perturb-seed", type=int, default=0)
+    ap.add_argument("--fold", type=int, default=0, help="fold whose TEST split to restrict to when perturbing")
     args = ap.parse_args()
 
     src = args.src
@@ -115,6 +117,12 @@ def main():
     for s in args.filters:                            # validate specs up front (fail fast)
         build_filter(s)
     cases = sorted(f for f in os.listdir(src) if f.endswith(".npy"))
+    # perturbation is only ever for a test-only robustness eval, so restrict to this fold's TEST split
+    # -- no point augmenting train/val cases the eval never loads
+    if args.perturb != "none":
+        with open(config.SPLITS_FILE, "rb") as f:
+            test_keys = set(pickle.load(f)[args.fold]["test"])
+        cases = [c for c in cases if c[:-4] in test_keys]
     if not cases:
         raise SystemExit(f"no .npy files in {src}")
 
