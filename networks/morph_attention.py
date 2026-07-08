@@ -111,10 +111,11 @@ class MorphAttentionUNet(MorphUNet):
 
     def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy",
                  half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast",
-                 act="leaky", attn_k=3, attn_beta=10.0):
+                 act="leaky", attn_k=3, attn_beta=10.0, dropout=0.0):
         super().__init__(num_classes, in_channels=in_channels, fs=fs, k=k, beta=beta,
                          config=config, half_morph=half_morph, tie_mirror=tie_mirror,
-                         conv_stem=conv_stem, checkpoint=checkpoint, impl=impl, act=act)
+                         conv_stem=conv_stem, checkpoint=checkpoint, impl=impl, act=act,
+                         dropout=dropout)
         # one gate per skip, sized to that encoder stage's channel count
         self.att1 = MorphAttentionGate(fs,     k=attn_k, beta=attn_beta)
         self.att2 = MorphAttentionGate(fs * 2, k=attn_k, beta=attn_beta)
