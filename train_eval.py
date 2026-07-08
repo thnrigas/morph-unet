@@ -666,6 +666,7 @@ def main():
     p.add_argument("--perturb-strength", type=float, default=0.0)
     p.add_argument("--fast-eval", action="store_true")   # Dice-only test (skip slow HD95/ASSD)
     p.add_argument("--skip-existing", action="store_true")   # skip a point whose scores json already exists
+    p.add_argument("--keep-static", action="store_true")   # keep the perturbed static dir (default: delete after eval)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--seed", type=int, default=42)
@@ -957,6 +958,14 @@ def main():
             plot_data_efficiency(models, "Dice")
         except Exception as e:
             print(f"[viz] data-efficiency plot skipped: {e}", flush=True)
+
+    # a perturbed static dir is a throwaway (test-split only, fully rebuildable) and each is ~GBs of
+    # uncropped volumes, so delete it here rather than relying on a fragile shell glob. --keep-static
+    # opts out. only fires for perturb_baked so a clean/training dir is never touched.
+    if perturb_baked and args.static_dir and not args.keep_static:
+        import shutil
+        shutil.rmtree(args.static_dir, ignore_errors=True)
+        print(f"[cleanup] removed perturbed static dir {args.static_dir}", flush=True)
 
 
 if __name__ == "__main__":
