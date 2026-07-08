@@ -17,6 +17,10 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 RESULTS=results
+# heavy at keep=0.5 keeps a big model -> OOM'd during fine-tune at batch 24 on the 16 GB GPU.
+# expandable_segments cuts fragmentation; HEAVY_BATCH halves the fine-tune batch so k50 fits.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+HEAVY_BATCH=12
 EPOCHS=80; LR=5e-5; MIN_KEEP=4; GLOBAL_NORM=max; PRUNE_TOL=0.015
 t0=$(date +%s); n=0
 
@@ -33,6 +37,7 @@ for METHOD in l1x1 lin act fb; do
         --method "$METHOD" --keep-ratio "$KEEP" \
         --alloc global --global-norm "$GLOBAL_NORM" --min-keep "$MIN_KEEP" \
         --skip-ft-if-within "$PRUNE_TOL" --finetune-epochs "$EPOCHS" --lr "$LR" \
+        --batch-size "$HEAVY_BATCH" \
       || echo "  !!! $STEM FAILED (exit $?) -- continuing"
     n=$((n+1))
   done

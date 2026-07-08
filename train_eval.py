@@ -313,8 +313,9 @@ def main():
     p.add_argument("--bottomhat", action="store_true")
     p.add_argument("--morph-block", action="store_true")
     p.add_argument("--morph-unet",
-                   choices=["heavy", "balanced", "bottleneck", "deep", "full", "full_l1", "full_l2"],
+                   choices=["none", "heavy", "balanced", "bottleneck", "deep", "full", "full_l1", "full_l2"],
                    help="replace conv stages with morphological-separable blocks (networks/morph_unet.py). "
+                        "none = all-conv backbone (used with --morph-attn for the attention baseline); "
                         "deep = enc4+center+dec4; full = all stages morph (18 layers); "
                         "full_l1/full_l2 = full but with level 1 / levels 1-2 kept linear (14 / 10 layers)")
     p.add_argument("--morph-impl", choices=["fast", "paper", "convsep"], default="fast",
