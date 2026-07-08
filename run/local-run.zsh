@@ -11,19 +11,33 @@ export TASK=Task10_Colon
 # preprocessing
 python3 run_preprocessing.py
 
-# experiment 1 (noise on test)
+# experiment 1 (noise on test) VM
+export TASK=Task01_BrainTumour
 for kind in gamma contrast noise; do \
-    if [ "$kind" = noise ]; then STR="0.05 0.1 0.2 0.3"; else STR="1.0 0.7 0.5 1.5 2.0"; fi; \
-    for s in $STR; do for f in 0 1 2; do \
-        python3 train_eval.py --tag baseline --fold $f --test-only --test-perturb $kind --perturb-strength $s; \
-        python3 train_eval.py --tag convctrl --fold $f --test-only --test-perturb $kind --perturb-strength $s --morph-bank auto --conv-control; \
-        python3 train_eval.py --tag morphbank --fold $f --test-only --test-perturb $kind --perturb-strength $s --morph-bank auto; \
+    if [ "$kind" = noise ]; then STR="0.05 0.1 0.2 0.3"; else STR="0.7 0.5 1.5 2.0"; fi; \
+    for s in $STR; do for f in 0; do \
+        python3 train_eval.py --tag baseline --fold $f --test-only --fast-eval --test-perturb $kind --perturb-strength $s; \
+        python3 train_eval.py --tag morphbank --fold $f --test-only --fast-eval --test-perturb $kind --perturb-strength $s --morph-bank auto; \
+        python3 train_eval.py --tag convctrl --fold $f --test-only --fast-eval --test-perturb $kind --perturb-strength $s --morph-bank auto --conv-control; \
     done; done; \
 done
 
-# experiment 2 (limited train set)
-for N in 5 15 30 60; do for f in 0 1 2; do \
+# experiment 1 (noise on test) M1
+export TASK=Task08_HepaticVessel
+for kind in gamma contrast noise; do \
+    if [ "$kind" = noise ]; then STR="0.05 0.1 0.2 0.3"; else STR="0.7 0.5 1.5 2.0"; fi; \
+    for s in ${=STR}; do for f in 0 1 2; do \
+        python3 train_eval.py --tag baseline --fold $f --test-only --fast-eval --num-workers 8 --test-perturb $kind --perturb-strength $s; \
+        python3 train_eval.py --tag morphbank --fold $f --test-only --fast-eval --num-workers 8 --test-perturb $kind --perturb-strength $s --morph-bank auto; \
+        python3 train_eval.py --tag convctrl --fold $f --test-only --fast-eval --num-workers 8 --test-perturb $kind --perturb-strength $s --morph-bank auto --conv-control; \
+    done; done; \
+done
+
+# experiment 2 (limited train set) VM
+export TASK=Task01_BrainTumour
+for N in 5 15 30 60; do for f in 0; do \
   python3 train_eval.py --tag baseline --fold $f --train-cases $N; \
+  python3 train_eval.py --tag staticbank --fold $f --train-cases $N --static-auto; \
   python3 train_eval.py --tag convctrl --fold $f --train-cases $N --morph-bank auto --conv-control; \
   python3 train_eval.py --tag morphbank --fold $f --train-cases $N --morph-bank auto; \
 done; done

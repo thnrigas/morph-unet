@@ -289,7 +289,8 @@ def _perturb_image(data, kind, s, gen):
 #
 # test phase
 #
-def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0, seed=0):
+def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0,
+                  seed=0, advanced=True):
     model.eval()
     gen = torch.Generator().manual_seed(seed)   # cpu generator, device-agnostic reproducible noise
     # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
@@ -305,9 +306,11 @@ def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none
                 pred_dict[fname[0]].append(pred[i])
                 gt_dict[fname[0]].append(target[i])
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
+    # advanced=False drops the surface-distance metrics (HD95/ASSD) — the slow, scipy-bound part —
+    # leaving Dice/precision/recall, which is all the robustness/data-efficiency curves need
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        json_task=config.TASK, num_workers=num_workers, advanced=True,
+        json_task=config.TASK, num_workers=num_workers, advanced=advanced,
     )
     return scores
 
@@ -654,6 +657,7 @@ def main():
     # then re-score. scores are written under a perturb-suffixed tag so the clean run isn't clobbered
     p.add_argument("--test-perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
     p.add_argument("--perturb-strength", type=float, default=0.0)
+    p.add_argument("--fast-eval", action="store_true")   # Dice-only test (skip slow HD95/ASSD)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--seed", type=int, default=42)
@@ -868,7 +872,8 @@ def main():
     score_tag = run_tag if args.test_perturb == "none" else f"{run_tag}_{args.test_perturb}{args.perturb_strength:g}"
     json_path = os.path.join(results_dir, f"{score_tag}_f{args.fold}_scores.json")
     scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers,
-                           perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed)
+                           perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed,
+                           advanced=not args.fast_eval)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
         print(f"  label {label}: Dice={md.get('Dice')} "
