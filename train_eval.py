@@ -318,12 +318,19 @@ def main():
                         "none = all-conv backbone (used with --morph-attn for the attention baseline); "
                         "deep = enc4+center+dec4; full = all stages morph (18 layers); "
                         "full_l1/full_l2 = full but with level 1 / levels 1-2 kept linear (14 / 10 layers)")
-    p.add_argument("--morph-impl", choices=["fast", "paper", "convsep"], default="fast",
+    p.add_argument("--morph-impl", choices=["fast", "paper", "convsep", "convmpm"], default="fast",
                    help="morph block: 'fast' = depthwise morph + 1x1 (efficient); "
                         "'paper' = strict full channel-mixing max-plus conv + depthwise 3x3 activation "
                         "(Setting 1, faithful, prunes the paper's way, heavier); "
                         "'convsep' = plain-conv TWIN of 'fast' -- depthwise 3x3 conv + 1x1 (no "
-                        "morphology, matched params, trains much faster; the ablation control)")
+                        "morphology, matched params, trains much faster; the ablation control); "
+                        "'convmpm' = convsep but the 1x1 channel mixer is a MORPHOLOGICAL MPM neuron "
+                        "(depthwise 3x3 conv + 1x1 max-plus/min-plus channel mix -- morphology placed "
+                        "where channel sparsity/pruning happens)")
+    p.add_argument("--fs", type=int, default=64,
+                   help="base feature width of the (morph) U-Net; channel counts are fs, 2fs, 4fs, "
+                        "8fs, 16fs across the levels. Default 64. A smaller fs (e.g. 13 ~ 1/5 width) "
+                        "shrinks every layer proportionally for a much faster/cheaper model")
     p.add_argument("--morph-half", action="store_true",
                    help="morph stages use HybridUnit (half channels morphological, half plain conv) "
                         "-- ~2x faster training, lower memory")
@@ -333,6 +340,10 @@ def main():
     p.add_argument("--morph-attn", action="store_true",
                    help="morphological Attention-U-Net: gate skip connections with soft top-hat/bottom-hat "
                         "attention (networks/morph_attention.py)")
+    p.add_argument("--morph-attn-warm", type=float, default=0.0,
+                   help="warm-start the morph-attention skip gate half-active (--morph-attn). 0.0 (default) "
+                        "= identity start (plain U-Net skip); 0.5 = top-hat/bottom-hat morphology influences "
+                        "the skip at half strength from step 0 (analogue of the linear gate's gamma=0.5 init)")
     p.add_argument("--morph-no-conv-stem", action="store_true",
                    help="disable the default 3x3 denoising conv stem (raw input goes straight into "
                         "morphology instead of conv features)")
@@ -373,6 +384,10 @@ def main():
                         "plain-conv U-Net with LINEAR cross-attention gates on the skip connections")
     p.add_argument("--lin-attn-heads", type=int, default=4,
                    help="number of linear-attention heads per skip gate (--lin-attn)")
+    p.add_argument("--lin-attn-gamma-init", type=float, default=0.0,
+                   help="initial value of the ReZero skip gate gamma (--lin-attn). 0.0 (default) = "
+                        "skips start as the plain U-Net skip and ramp attention in; 0.5 = attention "
+                        "contributes at half strength from the start")
     p.add_argument("--freeze-se", action="store_true",
                    help="freeze the SE weights (fixed structuring element = static residual)")
     p.add_argument("--morph-loss", action="store_true")
@@ -436,6 +451,7 @@ def main():
         model = LinAttnUNet(num_classes=args.num_classes, in_channels=in_channels,
                             conv_stem=not args.morph_no_conv_stem,
                             heads=args.lin_attn_heads,
+                            gamma_init=args.lin_attn_gamma_init,
                             act="relu" if args.morph_relu else "leaky").to(device)
     elif args.morph_unet:
         # morphological-separable U-Net: conv stages replaced by depthwise soft morphology
@@ -443,13 +459,16 @@ def main():
         # boosted SE lr and --freeze-se just like the bank/residual variants. --morph-attn
         # swaps in the morphological Attention-U-Net (gated skips); the other flags apply to both.
         Net = MorphAttentionUNet if args.morph_attn else MorphUNet
-        model = Net(num_classes=args.num_classes, in_channels=in_channels,
+        net_kwargs = dict(num_classes=args.num_classes, in_channels=in_channels, fs=args.fs,
                     k=args.morph_k, beta=args.morph_beta, config=args.morph_unet,
                     half_morph=args.morph_half, tie_mirror=args.morph_tie_mirror,
                     conv_stem=not args.morph_no_conv_stem,
                     checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl,
                     act="relu" if args.morph_relu else "leaky",
-                    dropout=args.morph_dropout).to(device)
+                    dropout=args.morph_dropout)
+        if args.morph_attn:
+            net_kwargs["attn_warm"] = args.morph_attn_warm   # >0 -> warm-start the skip gate half-active
+        model = Net(**net_kwargs).to(device)
     elif args.morph_bank:
         # bank of trainable-SE residual channels (or a matched conv control)
         if args.morph_bank == "auto":

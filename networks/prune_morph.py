@@ -40,7 +40,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from networks.morph_unet import MorphUNet, MorphUnit, SoftMorph2d, Stage, ConvSepUnit
+from networks.morph_unet import (MorphUNet, MorphUnit, SoftMorph2d, Stage, ConvSepUnit,
+                                  ConvMPMUnit, StrictMorph2d)
 
 
 # --------------------------------------------------------------------------------------
@@ -53,11 +54,18 @@ from networks.morph_unet import MorphUNet, MorphUnit, SoftMorph2d, Stage, ConvSe
 # cascade -- identical for both. The morphology-native criteria (l1x1/morph) need the SE and
 # are morph-only; the agnostic ones (lin=weight-norm, act, fb, random) transfer to convsep.
 # --------------------------------------------------------------------------------------
-_PRUNABLE = (MorphUnit, ConvSepUnit)
+# Three unit types share the per-INPUT-channel spatial-op + 1x1-mixer contract, so the whole
+# pipeline is generic once a few helpers dispatch on type: MorphUnit (depthwise soft morphology +
+# linear 1x1 `proj`), ConvSepUnit (depthwise 3x3 + linear 1x1 `proj`), and ConvMPMUnit (depthwise
+# 3x3 + MORPHOLOGICAL 1x1 `mix`, a StrictMorph2d(k=1) max-plus/min-plus channel MPM). Pruning an
+# input channel drops that channel's spatial filter AND the matching 1x1 input column -> LOCAL, no
+# cascade, identical for all three. The morphology-native criteria (l1x1/morph) need the SoftMorph2d
+# SE, so they are MorphUnit-only; the agnostic ones (lin/act/fb/fbnew/random) transfer to both twins.
+_PRUNABLE = (MorphUnit, ConvSepUnit, ConvMPMUnit)
 
 
 def morph_units(model):
-    """name -> prunable unit (MorphUnit or ConvSepUnit), in call order."""
+    """name -> prunable unit (MorphUnit / ConvSepUnit / ConvMPMUnit), in call order."""
     return {n: m for n, m in model.named_modules() if isinstance(m, _PRUNABLE)}
 
 
@@ -65,21 +73,31 @@ def _is_conv(unit):
     return isinstance(unit, ConvSepUnit)
 
 
+def _is_convmpm(unit):
+    return isinstance(unit, ConvMPMUnit)
+
+
+def _is_morph(unit):
+    # the soft-morph unit (per-channel SE); the ONLY unit the morphology-native criteria apply to
+    return isinstance(unit, MorphUnit)
+
+
 def _spatial(unit):
     # the per-input-channel spatial sub-module (calibration hook target):
-    #   convsep -> the depthwise 3x3 conv `dw`;  morph -> the SoftMorph2d `morph`.
-    # Both output one activation map per INPUT channel, so act/fb read the same quantity.
-    return unit.dw if _is_conv(unit) else unit.morph
+    #   convsep/convmpm -> the depthwise 3x3 conv `dw`;  morph -> the SoftMorph2d `morph`.
+    # Each outputs one activation map per INPUT channel, so act/fb/fbnew read the same quantity.
+    return unit.morph if _is_morph(unit) else unit.dw
 
 
 def _dev(unit):
-    return unit.proj.weight.device                    # proj exists on both unit types
+    # convmpm's 1x1 mixer is a StrictMorph2d (`mix`); the other two have a linear 1x1 `proj`
+    return unit.mix.weight.device if _is_convmpm(unit) else unit.proj.weight.device
 
 
 def _in_ch(unit):
-    if _is_conv(unit):
-        return unit.dw.weight.shape[0]                # depthwise conv weight: (in, 1, k, k)
-    return unit.morph.se.shape[1]
+    if _is_morph(unit):
+        return unit.morph.se.shape[1]
+    return unit.dw.weight.shape[0]                    # depthwise conv weight: (in, 1, k, k)
 
 
 def _dw_norm(unit):
@@ -102,7 +120,13 @@ def _alpha_abs(unit):
 
 
 def _proj_in_norm(unit):
-    # ||proj[:, i]|| : the 1x1 weight mass that reads input channel i -> (in,)
+    # ||mixer[:, i]|| : the 1x1 weight mass that reads input channel i -> (in,). For convmpm the
+    # mixer is a StrictMorph2d(k=1) whose structuring weight is (out, in*1*1) = (out, in), so the
+    # per-input-channel fan-out is the column norm exactly as for the linear 1x1 -- a large column
+    # means channel i is a strong max-plus/min-plus contributor (can win) for some output.
+    if _is_convmpm(unit):
+        W = unit.mix.weight                           # (out, in)
+        return W.norm(dim=0)
     W = unit.proj.weight[:, :, 0, 0]                  # (out, in)
     return W.norm(dim=0)
 
@@ -114,14 +138,15 @@ def score_unit(unit, criterion, act_rate=None, act_mag=None):
     act_mag : optional (in_ch,) mean |morph output| from calibration (used by "act").
     """
     if criterion == "l1x1":
-        if _is_conv(unit):
-            # no SE/alpha on a conv; use the depthwise-filter energy as the spatial-effect proxy
+        if not _is_morph(unit):
+            # no SoftMorph SE/alpha on a conv/convmpm unit; use the depthwise-filter energy as the
+            # spatial-effect proxy (the 1x1-mixer column norm x depthwise 3x3 filter norm)
             return _proj_in_norm(unit) * _dw_norm(unit)
         s = _proj_in_norm(unit) * _alpha_abs(unit) * _se_spread(unit)
         return s
     if criterion == "morph":
-        if _is_conv(unit):
-            raise ValueError("criterion 'morph' is morphology-specific; not valid for ConvSepUnit")
+        if not _is_morph(unit):
+            raise ValueError("criterion 'morph' is SoftMorph-specific; not valid for conv/convmpm units")
         s = _alpha_abs(unit) * _se_spread(unit)
         if act_rate is not None:
             s = s * (act_rate.to(s.device) + 1e-6)    # win-rate is gathered on CPU; match the score's device
@@ -142,8 +167,8 @@ def score_unit(unit, criterion, act_rate=None, act_mag=None):
         # complement of "morph": it PRESERVES inert-but-informative linear pathways instead of
         # discarding them -- an identity morph followed by its proj column is still a useful linear
         # projection of the input channel.
-        if _is_conv(unit):
-            return _proj_in_norm(unit)                # no alpha on a conv -> pure 1x1 weight norm
+        if not _is_morph(unit):
+            return _proj_in_norm(unit)                # no alpha on conv/convmpm -> pure 1x1 mixer norm
         return _proj_in_norm(unit) * _alpha_abs(unit)
     if criterion == "random":
         # SANITY BASELINE: ignore every weight/activation and score channels at random, so top-k
@@ -238,68 +263,171 @@ def collect_act_mag(model, calib_batches, device):
 
 
 # --------------------------------------------------------------------------------------
-# HMM forward-backward global channel importance (for the "fb" criterion)
+# foreground-restricted mean |morph output| per input channel (for the "fbnew" criterion)
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
-def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8):
-    """{unit_name: (in_ch,) gamma} -- GLOBAL per-channel posterior occupancy via HMM forward-backward.
+def collect_fg_act_mag(model, calib_batches, device, eps=1e-8):
+    """{unit_name: (in_ch,) mean |morph output| over foreground positions} -- the "act" quantity
+    but averaged ONLY over the feature-map positions whose receptive field covers a foreground
+    (vessel/tumour) voxel, instead of over the whole map.
 
-    Morph units are treated as an HMM chain in forward order. For unit L, patch n, input channel i:
-        s[L][n,i] = spatial mean |morph output|      (per-patch L1 activation prevalence; the Part-1
-                                                       quantity, == the data-driven factor of "act")
-    Prior      pi[L]_i        proportional to  E_n s[L][n,i]                       (unigram prob)
-    Transition T[L]_{i->j}    proportional to  E_n s[L][n,i]*s[L+1][n,j]  (row-normalised co-activation;
-                              a per-patch SCALAR statistic, so it is resolution- and graph-agnostic --
-                              it survives the pool/concat/residual/skip routing between morph units).
-    Forward alpha (upstream reachability), backward beta (downstream influence), and the posterior
-    gamma = alpha*beta give one GLOBAL importance per channel -- then pruned as a plain unigram score
-    through the usual local/global keep-ratio machinery. Seeding beta at the last layer with the LOSS
-    gradient instead of uniform would turn this into the cross-layer Taylor propagation (NISP-style);
-    kept uniform here to stay strictly no-grad.
+    The receptive field of a feature-map pixel is approximated by its footprint at the unit's own
+    spatial resolution: the label's foreground mask (seg>0) is max-pooled down to the feature map
+    size (H_L, W_L), so a position counts iff ANY foreground voxel falls in the input region that
+    feeds it. Because the mask is derived purely from the resolution, an encoder unit and its
+    symmetric decoder unit (same resolution in a U-Net) see the IDENTICAL foreground mask -- i.e.
+    the decoder inherits the receptive field of its mirror encoder layer, as intended.
+
+    calib_batches: list of (data, seg) pairs; seg is the integer label map [b,1,H0,W0].
     """
     units = morph_units(model)
-    names = list(units.keys())                          # named_modules() == forward/registration order
-    traces = {n: [] for n in names}
+    num = {n: None for n in units}                       # sum |act| over fg positions -> (in,)
+    den = {n: 0.0 for n in units}                        # count of fg positions (channel-agnostic)
+    cur = {"fg": None}                                   # current batch fg mask, set before forward
     handles = []
 
     def mk_hook(name):
         def hook(mod, inp, out):
-            traces[name].append(out.abs().mean(dim=(2, 3)).cpu())    # (B,in,H,W) -> (B,in)
+            B, C, H, W = out.shape
+            m = F.adaptive_max_pool2d(cur["fg"], (H, W))          # (B,1,H,W) in {0,1}, RF footprint
+            a = (out.abs() * m).sum(dim=(0, 2, 3)).cpu()          # (in,) fg-weighted activation mass
+            num[name] = a if num[name] is None else num[name] + a
+            den[name] += float(m.sum().item())
+        return hook
+
+    for n, u in units.items():
+        handles.append(_spatial(u).register_forward_hook(mk_hook(n)))
+    model.eval()
+    for data, seg in calib_batches:
+        cur["fg"] = (seg > 0).float().to(device)                  # (B,1,H0,W0) foreground mask
+        model(data.to(device))
+    for h in handles:
+        h.remove()
+    return {n: (num[n] / (den[n] + eps)) for n in units}          # mean |act| over fg positions
+
+
+# --------------------------------------------------------------------------------------
+# HMM forward-backward global channel importance (for the "fb" criterion)
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8,
+                                        use_skips=True, emission_backward=True,
+                                        residual_smooth=1.0, fg_restrict=False):
+    """{unit_name: (in_ch,) gamma} -- GLOBAL per-channel posterior occupancy via HMM forward-backward,
+    now run over the U-Net's REAL routing instead of a bare linear chain.
+
+    States = each morph unit's input channels. For unit L, patch n, channel i:
+        s[L][n,i] = spatial mean |morph output|.
+    Emission / prior  pi[L]_i  is proportional to  E_n s[L][n,i]  ( = E[morph(i)] ).  It is applied in
+    BOTH passes. This matters: with a row-stochastic transition T, the bare backward recursion
+    beta = T @ beta keeps beta uniform (T @ const = const), so beta collapses to 1 and gamma degenerates
+    to alpha. Carrying the DOWNSTREAM emission pi through the backward step, beta = T @ (pi * beta), is
+    what makes "downstream influence" actually vary per channel (emission_backward=True).
+
+    Graph (use_skips=True):
+      * BACKBONE : consecutive morph units L -> L+1 (encoder down / bottleneck / decoder up).
+      * SKIP     : enc_k.sub2 -> dec_k.sub1, the U-Net skip. The skip INJECTS the encoder stage's
+                   channels into the decoder as new inputs, so the encoder's importance reaches the
+                   decoder directly, not only diffused through the bottleneck.
+    Transition  T_{i->j} propto E_n s[L][n,i]*s[L+1][n,j], row-normalised. RESIDUAL add-one (Laplace)
+    smoothing (residual_smooth>0) is added ONLY on the stage-boundary edges X.sub2 -> Y.sub1, the exact
+    edges the Stage residual out=sub1(x)+sub2(sub1(x)) feeds -- a guaranteed baseline flow there, and
+    left alone on within-stage and skip edges.
+
+    Messages: alpha[L] = pi[L] * sum_in(alpha_src @ T) ; beta[L] = sum_out(T @ (pi_tgt * beta_tgt)) ;
+    gamma = alpha*beta renormalised per layer. Because every edge points forward in registration order
+    (skips included), one topological sweep each way is exact. Set use_skips=False,
+    emission_backward=False, residual_smooth=0 to recover the legacy linear-chain fb.
+
+    fg_restrict=True ("fbfg" = foreground forward-backward): the per-patch state s[L][n,i] is the mean
+    |morph output| over ONLY the foreground receptive-field positions (seg>0 max-pooled to the unit's
+    resolution, exactly as in collect_fg_act_mag) instead of the whole map. Everything downstream --
+    pi, co-activation transitions, skips, residual smoothing, alpha/beta -- is unchanged; it is the
+    fixed fb driven by foreground-only statistics. Then calib_batches must be (data, seg) pairs.
+    """
+    units = morph_units(model)
+    names = list(units.keys())                          # named_modules() == forward/registration order
+    idx = {n: i for i, n in enumerate(names)}
+    traces = {n: [] for n in names}
+    cur = {"fg": None}                                  # current-batch fg mask (fg_restrict only)
+    handles = []
+
+    def mk_hook(name):
+        def hook(mod, inp, out):
+            if fg_restrict:                             # mean |morph| over foreground positions only
+                _, _, H, W = out.shape
+                m = F.adaptive_max_pool2d(cur["fg"], (H, W))         # (B,1,H,W) RF footprint in {0,1}
+                s = (out.abs() * m).sum(dim=(2, 3)) / (m.sum(dim=(2, 3)) + eps)   # (B,in)
+            else:
+                s = out.abs().mean(dim=(2, 3))          # (B,in,H,W) -> (B,in) full-map mean
+            traces[name].append(s.cpu())
         return hook
 
     for n in names:
         handles.append(_spatial(units[n]).register_forward_hook(mk_hook(n)))
     model.eval()
-    for xb in calib_batches:
-        model(xb.to(device))
+    if fg_restrict:
+        for data, seg in calib_batches:
+            cur["fg"] = (seg > 0).float().to(device)    # (B,1,H0,W0) foreground mask
+            model(data.to(device))
+    else:
+        for xb in calib_batches:
+            model(xb.to(device))
     for h in handles:
         h.remove()
 
     S = [torch.cat(traces[n], dim=0) for n in names]    # each (N, C_L); rows aligned by patch across L
     L, N = len(S), S[0].shape[0]
-    pi = [(s.mean(dim=0) + eps) for s in S]
+    pi = [(s.mean(dim=0) + eps) for s in S]             # emission / prior  pi_i propto E[morph(i)]
     pi = [p / p.sum() for p in pi]
-    T = []                                              # row-stochastic co-activation transitions
-    for l in range(L - 1):
-        M = (S[l].t() @ S[l + 1]) / N + eps             # (C_l, C_{l+1})
-        T.append(M / M.sum(dim=1, keepdim=True))
 
-    alpha = [pi[0].clone()]                             # forward messages (renormalised each step)
-    for l in range(1, L):
-        a = pi[l] * (alpha[l - 1] @ T[l - 1])
-        alpha.append(a / (a.sum() + eps))
-    beta = [None] * L                                   # backward messages
-    beta[L - 1] = torch.ones_like(pi[L - 1]) / pi[L - 1].numel()
-    for l in range(L - 2, -1, -1):
-        b = T[l] @ beta[l + 1]
+    def transition(a, b, smooth):
+        M = (S[a].t() @ S[b]) / N                       # (C_a, C_b) co-activation
+        if smooth > 0:                                  # residual ~ add-one (Laplace) smoothing:
+            M = M + smooth * M.mean()                   #   a guaranteed baseline flow on THIS edge
+        M = M + eps
+        return M / M.sum(dim=1, keepdim=True)           # row-stochastic
+
+    edges_in = {l: [] for l in range(L)}                # target -> [(source, T)]
+    edges_out = {l: [] for l in range(L)}               # source -> [(target, T)]
+    def add_edge(a, b, smooth):
+        T = transition(a, b, smooth)
+        edges_out[a].append((b, T)); edges_in[b].append((a, T))
+
+    # A Stage is  out = sub1(x) + sub2(sub1(x))  -- the ONLY residual in the net, an identity around
+    # sub2 whose skip feeds the NEXT stage. So a residual lives on exactly one kind of backbone edge:
+    # X.sub2 -> Y.sub1 (a stage boundary). Within-stage edges (sub1 -> sub2) carry no residual, and the
+    # U-Net skips are a separate concat -- so add-one smoothing is applied ONLY where a residual exists.
+    for l in range(L - 1):                              # backbone chain
+        is_residual = names[l].endswith(".sub2") and names[l + 1].endswith(".sub1")
+        add_edge(l, l + 1, residual_smooth if is_residual else 0.0)
+    if use_skips:                                       # U-Net skips: enc_k.sub2 -> dec_k.sub1 (injects
+        for n in names:                                 # the encoder's channels; a skip, NOT a residual)
+            if n.startswith("dec") and n.endswith(".sub1"):
+                enc = "enc" + n[3:n.index(".")] + ".sub2"
+                if enc in idx:
+                    add_edge(idx[enc], idx[n], 0.0)
+
+    alpha = [None] * L                                  # forward: emission * incoming messages
+    for l in range(L):
+        if edges_in[l]:
+            a = pi[l] * sum(alpha[s] @ T for (s, T) in edges_in[l])
+        else:
+            a = pi[l].clone()                           # source node -> just the prior
+        alpha[l] = a / (a.sum() + eps)
+
+    beta = [None] * L                                   # backward: outgoing messages carry downstream pi
+    for l in range(L - 1, -1, -1):
+        if edges_out[l]:
+            b = sum(T @ ((pi[t] * beta[t]) if emission_backward else beta[t])
+                    for (t, T) in edges_out[l])
+        else:
+            b = torch.ones_like(pi[l])                  # sink node -> uniform
         beta[l] = b / (b.sum() + eps)
 
     dev = _dev(units[names[0]])
-    gamma = {}
-    for l, n in enumerate(names):
-        g = alpha[l] * beta[l]
-        gamma[n] = (g / (g.sum() + eps)).to(dev)        # per-layer posterior, on the model's device
-    return gamma
+    return {n: ((alpha[i] * beta[i]) / ((alpha[i] * beta[i]).sum() + eps)).to(dev)
+            for i, n in enumerate(names)}
 
 
 # --------------------------------------------------------------------------------------
@@ -312,7 +440,28 @@ def prune_unit(unit, keep):
     keep = keep.to(torch.long).sort().values
     dev = _dev(unit)
     new_in = keep.numel()
-    out_ch = unit.proj.weight.shape[0]
+    out_ch = unit.mix.out_ch if _is_convmpm(unit) else unit.proj.weight.shape[0]
+
+    if _is_convmpm(unit):
+        # shrink the depthwise 3x3 (keep surviving per-channel filters) + drop the morph mixer's
+        # input columns. mix is StrictMorph2d(k=1): weight (out, in*1*1)=(out, in), so column i is
+        # input channel i; the per-output join/meet biases are unchanged (output width untouched).
+        old_dw = unit.dw
+        k, pad = old_dw.kernel_size[0], old_dw.padding[0]
+        new_dw = nn.Conv2d(new_in, new_in, k, padding=pad, groups=new_in).to(dev)
+        with torch.no_grad():
+            new_dw.weight.copy_(old_dw.weight[keep])
+            new_dw.bias.copy_(old_dw.bias[keep])
+        unit.dw = new_dw
+        old_mix = unit.mix
+        new_mix = StrictMorph2d(new_in, out_ch, k=old_mix.k, beta=float(old_mix.beta)).to(dev)
+        with torch.no_grad():
+            new_mix.weight.copy_(old_mix.weight[:, keep])
+            new_mix.b_dil.copy_(old_mix.b_dil)
+            new_mix.b_ero.copy_(old_mix.b_ero)
+        unit.mix = new_mix
+        unit.register_buffer("_in_keep", keep.to(dev))
+        return unit
 
     if _is_conv(unit):
         # shrink the depthwise 3x3 (keep the surviving per-channel filters) + drop proj columns
@@ -373,14 +522,25 @@ def _normalize(s, mode):
     raise ValueError(f"unknown global-norm {mode!r}")
 
 
-def _all_scores(model, criterion, calib_batches, device):
+def _all_scores(model, criterion, calib_batches, device, fb_opts=None):
     """({unit_name: MorphUnit}, {unit_name: (in_ch,) score}) under `criterion` -- computed ONCE,
     before any surgery, so global allocation ranks all channels on the unpruned model."""
     units = morph_units(model)
     if criterion == "fb":                               # global posterior, computed for all units at once
         if calib_batches is None:
             raise ValueError("criterion 'fb' needs calibration batches")
-        return units, collect_forward_backward_importance(model, calib_batches, device)
+        return units, collect_forward_backward_importance(model, calib_batches, device, **(fb_opts or {}))
+    if criterion == "fbfg":                             # the fixed fb, but foreground-restricted stats
+        if calib_batches is None:
+            raise ValueError("criterion 'fbfg' needs (data, seg) calibration batches")
+        return units, collect_forward_backward_importance(model, calib_batches, device,
+                                                          fg_restrict=True, **(fb_opts or {}))
+    if criterion == "fbnew":                            # act, but restricted to foreground receptive fields
+        if calib_batches is None:
+            raise ValueError("criterion 'fbnew' needs (data, seg) calibration batches")
+        fg_mag = collect_fg_act_mag(model, calib_batches, device)
+        scores = {n: score_unit(u, "act", act_mag=fg_mag.get(n)) for n, u in units.items()}
+        return units, scores
     rates = act_mag = None
     if calib_batches is not None:
         if criterion == "morph":
@@ -434,14 +594,16 @@ def _global_keep(units, scores, keep_ratio, min_keep, global_norm):
 # --------------------------------------------------------------------------------------
 @torch.no_grad()
 def prune_morph_channels(model, criterion="l1x1", keep_ratio=0.5, calib_batches=None, device="cpu",
-                         min_keep=1, alloc="local", global_norm="max", verbose=True):
+                         min_keep=1, alloc="local", global_norm="max", verbose=True, fb_opts=None):
     """Structurally prune input channels of every MorphUnit. Returns a per-unit report dict.
 
     alloc="local"  : each unit keeps keep_ratio of ITS OWN channels (uniform sparsity).
     alloc="global" : one keep_ratio*TOTAL budget shared across units (non-uniform sparsity), with a
                      guaranteed `min_keep` floor per unit and per-layer `global_norm` for ranking.
+    fb_opts        : dict forwarded to the 'fb' forward-backward (use_skips/emission_backward/
+                     residual_smooth); ignored by the other criteria.
     """
-    units, scores = _all_scores(model, criterion, calib_batches, device)
+    units, scores = _all_scores(model, criterion, calib_batches, device, fb_opts=fb_opts)
     keep_idx = (_global_keep(units, scores, keep_ratio, min_keep, global_norm)
                 if alloc == "global" else _local_keep(units, scores, keep_ratio, min_keep))
     report = {}

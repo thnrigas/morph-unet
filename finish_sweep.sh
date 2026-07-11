@@ -43,11 +43,16 @@ for METHOD in l1x1 lin act fb; do
   done
 done
 
-echo "############ PHASE B: random baseline, deep/bottleneck/full_l2 (local) ############"
-declare -A CFG=( [mpm_deep]=deep [mpm_bottleneck]=bottleneck [mpm_full_l2]=full_l2 )
-declare -A FLD=( [mpm_deep]=2   [mpm_bottleneck]=2         [mpm_full_l2]=0 )
-for TAG in mpm_deep mpm_bottleneck mpm_full_l2; do
-  for KEEP in 0.1 0.3 0.5 0.7; do
+echo "############ PHASE B: random baseline (local) ############"
+# per-architecture keep ratios: heavy & full_l2 probe 0.1/0.3/0.5; deep & bottleneck stop at 0.3
+# (they're small models -- past keep 0.5 the random baseline is already good enough, not informative).
+# heavy fine-tunes the big model -> reuse HEAVY_BATCH (12) so keep 0.5 fits the 16 GB GPU.
+declare -A CFG=(   [mpm_deep]=deep      [mpm_bottleneck]=bottleneck [mpm_full_l2]=full_l2 [morphunet_heavy]=heavy )
+declare -A FLD=(   [mpm_deep]=2         [mpm_bottleneck]=2          [mpm_full_l2]=0        [morphunet_heavy]=0 )
+declare -A KEEPS=( [mpm_deep]="0.1 0.3" [mpm_bottleneck]="0.1 0.3"  [mpm_full_l2]="0.1 0.3" [morphunet_heavy]="0.1 0.3" )
+declare -A BATCH=( [mpm_deep]=""        [mpm_bottleneck]=""         [mpm_full_l2]=""       [morphunet_heavy]="--batch-size $HEAVY_BATCH" )
+for TAG in mpm_deep mpm_bottleneck mpm_full_l2 morphunet_heavy; do
+  for KEEP in ${KEEPS[$TAG]}; do
     KK=$(printf "k%02d" "$(python -c "print(round($KEEP*100))")")
     STEM="${TAG}_prune-random-${KK}_f${FLD[$TAG]}"
     if [[ -f "$RESULTS/${STEM}_prune.json" ]]; then
@@ -56,7 +61,7 @@ for TAG in mpm_deep mpm_bottleneck mpm_full_l2; do
     echo "== $STEM (random local, keep=$KEEP) =="
     python prune.py --tag "$TAG" --config "${CFG[$TAG]}" --impl fast --fold "${FLD[$TAG]}" \
         --method random --keep-ratio "$KEEP" --alloc local --min-keep "$MIN_KEEP" \
-        --finetune-epochs "$EPOCHS" --lr "$LR" \
+        --finetune-epochs "$EPOCHS" --lr "$LR" ${BATCH[$TAG]} \
       || echo "  !!! $STEM FAILED (exit $?) -- continuing"
     n=$((n+1))
   done

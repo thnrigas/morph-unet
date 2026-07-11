@@ -9,6 +9,8 @@ papers
 **__init__.py
 results
 log_*.txt
+*.log
+*.pptx
 
 Archive.7z
 *.7z

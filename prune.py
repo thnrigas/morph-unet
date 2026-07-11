@@ -44,9 +44,9 @@ from train_eval import build_loaders, run_epoch, run_val_dice, evaluate_test, pi
 from networks.prune_morph import prune_morph_channels, count_params
 
 
-def load_model(tag, fold, device, cfg, impl, conv_stem):
+def load_model(tag, fold, device, cfg, impl, conv_stem, fs=64):
     """Rebuild the MorphUNet exactly as trained and load its best checkpoint (eval/prune mode)."""
-    model = MorphUNet(num_classes=config.NUM_CLASSES, in_channels=1, k=3, beta=10.0,
+    model = MorphUNet(num_classes=config.NUM_CLASSES, in_channels=1, fs=fs, k=3, beta=10.0,
                       config=cfg, impl=impl, conv_stem=conv_stem, checkpoint=False).to(device)
     ckpt = os.path.join(config.PROJECT_ROOT, "results", f"{tag}_f{fold}_best.pth")
     if not os.path.exists(ckpt):
@@ -66,6 +66,17 @@ def make_calib(train_loader, device, n_batches, bs):
         if i >= n_batches:
             break
         calib.append(batch["data"][0][:bs].float())
+    return calib
+
+
+def make_calib_seg(train_loader, device, n_batches, bs):
+    """(input, seg) calibration pairs for the foreground-aware 'fbnew' criterion. seg is the integer
+    label map [b,1,H,W] (0=bg, 1=vessel, 2=tumour); fbnew turns it into a foreground mask."""
+    calib = []
+    for i, batch in enumerate(train_loader):
+        if i >= n_batches:
+            break
+        calib.append((batch["data"][0][:bs].float(), batch["seg"][0][:bs]))
     return calib
 
 
@@ -104,12 +115,15 @@ def main():
     p.add_argument("--tag", required=True, help="base tag of the trained model (e.g. mpm_full_l2)")
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--config", default="full_l2")
-    p.add_argument("--impl", default="fast", choices=["fast", "paper", "convsep"],
+    p.add_argument("--fs", type=int, default=64,
+                   help="base feature width the model was trained with (must match training; e.g. 13 "
+                        "for a 1/5-width net). channel counts are fs,2fs,4fs,8fs,16fs across levels")
+    p.add_argument("--impl", default="fast", choices=["fast", "paper", "convsep", "convmpm"],
                    help="'convsep' prunes the depthwise-conv twin (lin/act/fb/random criteria; "
                         "l1x1 falls back to depthwise-filter norm, 'morph' is not valid)")
     p.add_argument("--no-conv-stem", action="store_true", help="model was trained WITHOUT conv stem")
     p.add_argument("--method", required=True,
-                   choices=["l1x1", "morph", "lin", "act", "fb", "random", "tropnnc"])
+                   choices=["l1x1", "morph", "lin", "act", "fb", "fbnew", "fbfg", "random", "tropnnc"])
     p.add_argument("--keep-ratio", type=float, default=0.5, help="fraction of channels to KEEP")
     p.add_argument("--alloc", default="local", choices=["local", "global"],
                    help="local = uniform keep_ratio per morph layer; global = one shared budget "
@@ -118,6 +132,17 @@ def main():
                    help="per-layer score normalisation before GLOBAL cross-layer ranking")
     p.add_argument("--min-keep", type=int, default=1,
                    help="minimum input channels guaranteed per morph layer (global alloc floor)")
+    # --- 'fb' forward-backward graph options (ignored by the other methods) ---
+    p.add_argument("--fb-no-skips", action="store_true",
+                   help="fb: DROP the U-Net skip edges (enc_k.sub2 -> dec_k.sub1); use only the backbone chain")
+    p.add_argument("--fb-no-emission", action="store_true",
+                   help="fb: do NOT carry the downstream emission pi through the backward pass (beta then "
+                        "collapses to uniform -- the legacy behaviour)")
+    p.add_argument("--fb-residual-smooth", type=float, default=1.0,
+                   help="fb: residual add-one (Laplace) smoothing strength on transitions (0 = off)")
+    p.add_argument("--fb-legacy", action="store_true",
+                   help="fb: reproduce the old linear-chain fb exactly (no skips, no backward emission, "
+                        "no residual smoothing)")
     p.add_argument("--calib-batches", type=int, default=64)
     p.add_argument("--calib-bs", type=int, default=16)   # 64 x 16 = 1024 calibration patches
     p.add_argument("--finetune-epochs", type=int, default=80)
@@ -159,12 +184,15 @@ def main():
     results_dir = os.path.join(config.PROJECT_ROOT, "results")
     os.makedirs(results_dir, exist_ok=True)
 
-    model = load_model(args.tag, args.fold, device, args.config, args.impl, not args.no_conv_stem)
+    model = load_model(args.tag, args.fold, device, args.config, args.impl, not args.no_conv_stem,
+                       fs=args.fs)
     p_before = count_params(model)
     base_dice, _ = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
     print(f"[{out_stem}] unpruned: {p_before/1e6:.3f}M params | val fg-Dice {base_dice:.4f}")
 
-    calib = make_calib(train_loader, device, args.calib_batches, args.calib_bs)
+    calib = (make_calib_seg(train_loader, device, args.calib_batches, args.calib_bs)
+             if args.method in ("fbnew", "fbfg") else
+             make_calib(train_loader, device, args.calib_batches, args.calib_bs))
     report = None
     if args.method == "tropnnc":
         from networks.prune_tropnnc import tropnnc_compress
@@ -174,9 +202,20 @@ def main():
         print(f"[prune] morph-channel {args.method}, keep_ratio={args.keep_ratio}, "
               f"alloc={args.alloc}" + (f" (norm={args.global_norm}, min_keep={args.min_keep})"
                                        if args.alloc == "global" else ""))
+        fb_opts = dict(use_skips=not args.fb_no_skips,
+                       emission_backward=not args.fb_no_emission,
+                       residual_smooth=args.fb_residual_smooth)
+        if args.fb_legacy:                              # reproduce the old linear-chain fb exactly
+            fb_opts = dict(use_skips=False, emission_backward=False, residual_smooth=0.0)
+        if args.method in ("fb", "fbfg"):
+            print(f"[prune] {args.method} graph: skips={fb_opts['use_skips']} "
+                  f"emission_backward={fb_opts['emission_backward']} "
+                  f"residual_smooth={fb_opts['residual_smooth']}"
+                  + ("  (foreground-restricted stats)" if args.method == "fbfg" else ""))
         report = prune_morph_channels(model, criterion=args.method, keep_ratio=args.keep_ratio,
                              calib_batches=calib, device=device, min_keep=args.min_keep,
-                             alloc=args.alloc, global_norm=args.global_norm, verbose=True)
+                             alloc=args.alloc, global_norm=args.global_norm, verbose=True,
+                             fb_opts=fb_opts)
     p_after = count_params(model)
     pruned_dice, _ = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
     print(f"[{out_stem}] pruned:   {p_after/1e6:.3f}M params "

@@ -74,10 +74,10 @@ class LinAttnGate(nn.Module):
     # residually with a ReZero gate. Returns a skip of the SAME shape as `x` (so the usual
     # skip-concat in the decoder is unchanged). gamma init 0 -> starts as the plain skip.
     #
-    def __init__(self, ch, heads=4):
+    def __init__(self, ch, heads=4, gamma_init=0.0):
         super().__init__()
         self.attn = LinearAttention2d(ch, heads=heads)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.full((1,), float(gamma_init)))
 
     def forward(self, g, x):
         return x + self.gamma * self.attn(g, x)
@@ -89,10 +89,13 @@ class LinAttnUNet(nn.Module):
     # conv_stem lifts the raw input to fs before enc1 (matches morph_unet's conv_stem option).
     # heads : number of linear-attention heads per skip gate.
     #
-    def __init__(self, num_classes, in_channels=1, fs=64, conv_stem=True, heads=4, act="leaky"):
+    def __init__(self, num_classes, in_channels=1, fs=64, conv_stem=True, heads=4, act="leaky",
+                 gamma_init=0.0):
         super().__init__()
         def cstage(i, o):
             return Stage(i, o, mode="conv", act=act)
+        def gate(ch):
+            return LinAttnGate(ch, heads=heads, gamma_init=gamma_init)
 
         self.stem = ConvUnit(in_channels, fs, act=act) if conv_stem else nn.Identity()
         enc1_in = fs if conv_stem else in_channels
@@ -106,16 +109,16 @@ class LinAttnUNet(nn.Module):
         self.center = cstage(fs * 8, fs * 16)
         # decoder (transpose-conv up, linear-attention-gated skip, conv stage)
         self.up4 = nn.ConvTranspose2d(fs * 16, fs * 8, 2, stride=2)
-        self.gate4 = LinAttnGate(fs * 8, heads=heads)
+        self.gate4 = gate(fs * 8)
         self.dec4 = cstage(fs * 16, fs * 8)
         self.up3 = nn.ConvTranspose2d(fs * 8, fs * 4, 2, stride=2)
-        self.gate3 = LinAttnGate(fs * 4, heads=heads)
+        self.gate3 = gate(fs * 4)
         self.dec3 = cstage(fs * 8, fs * 4)
         self.up2 = nn.ConvTranspose2d(fs * 4, fs * 2, 2, stride=2)
-        self.gate2 = LinAttnGate(fs * 2, heads=heads)
+        self.gate2 = gate(fs * 2)
         self.dec2 = cstage(fs * 4, fs * 2)
         self.up1 = nn.ConvTranspose2d(fs * 2, fs, 2, stride=2)
-        self.gate1 = LinAttnGate(fs, heads=heads)
+        self.gate1 = gate(fs)
         self.dec1 = cstage(fs * 2, fs)
         self.final = nn.Conv2d(fs, num_classes, 1)
 

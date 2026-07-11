@@ -75,25 +75,37 @@ class GreyMorph2d(nn.Module):
 #
 class MorphAttentionGate(nn.Module):
 
-    def __init__(self, channels, k=3, beta=10.0):
+    def __init__(self, channels, k=3, beta=10.0, warm=0.0):
         super().__init__()
         self.use_ckpt = True                       # toggled by MorphUNet.set_checkpointing
         self.morph = GreyMorph2d(channels, k=k, beta=beta)
-        # mix the two hat responses (2*C) back to a per-channel gate; zero-init the conv so
-        # the gate starts at sigmoid(0)=0.5 (mild, unbiased) and learns its saliency from there
         self.gate = nn.Conv2d(2 * channels, channels, 1)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.zeros_(self.gate.bias)
+        self.warm = float(warm)
+        if self.warm > 0:
+            # WARM-START (--morph-attn-warm): the gate reads the top-hat MINUS bottom-hat morphological
+            # contrast from step 0 (identity-mapped conv), applied at a learnable strength g (init = warm).
+            # gate = 1 + g*tanh(contrast) in [1-g, 1+g] -> morphology is HALF-ACTIVE at init instead of the
+            # plain identity start; the morphological analogue of the linear gate's gamma=0.5 warm init.
+            with torch.no_grad():
+                self.gate.weight.zero_(); self.gate.bias.zero_()
+                idx = torch.arange(channels)
+                self.gate.weight[idx, idx, 0, 0] = 1.0              # + top-hat channel c
+                self.gate.weight[idx, channels + idx, 0, 0] = -1.0  # - bottom-hat channel c
+            self.g = nn.Parameter(torch.tensor(self.warm))
+        else:
+            # IDENTITY init: zero-init conv -> gate = 2*sigmoid(0) = 1 -> skip passes through unchanged
+            # (the ReZero gamma=0 analogue, a plain-U-Net start).
+            nn.init.zeros_(self.gate.weight)
+            nn.init.zeros_(self.gate.bias)
 
     def _forward(self, x):
         tophat = x - self.morph.opening(x)         # bright thin structures
         bothat = self.morph.closing(x) - x         # dark  thin structures
-        # IDENTITY init: gate = 2*sigmoid(logits) so zero-init logits -> 2*sigmoid(0)=1 -> the
-        # skip passes through UNCHANGED at start (a plain U-Net), and the model learns deviations
-        # from there. (Plain sigmoid would start at 0.5 and HALVE every skip.) This matches the
-        # ReZero gamma=0 identity init of the linear-attention gate, so the two attention variants
-        # start from the SAME plain-U-Net baseline -- a prerequisite for a fair comparison.
-        gate = 2.0 * torch.sigmoid(self.gate(torch.cat([tophat, bothat], dim=1)))
+        z = self.gate(torch.cat([tophat, bothat], dim=1))
+        if self.warm > 0:
+            gate = 1.0 + self.g * torch.tanh(z)    # half-active morphology at init (see __init__)
+        else:
+            gate = 2.0 * torch.sigmoid(z)          # identity at init
         return x * gate
 
     def forward(self, x):
@@ -111,16 +123,16 @@ class MorphAttentionUNet(MorphUNet):
 
     def __init__(self, num_classes, in_channels=1, fs=64, k=3, beta=10.0, config="heavy",
                  half_morph=False, tie_mirror=False, conv_stem=False, checkpoint=True, impl="fast",
-                 act="leaky", attn_k=3, attn_beta=10.0, dropout=0.0):
+                 act="leaky", attn_k=3, attn_beta=10.0, dropout=0.0, attn_warm=0.0):
         super().__init__(num_classes, in_channels=in_channels, fs=fs, k=k, beta=beta,
                          config=config, half_morph=half_morph, tie_mirror=tie_mirror,
                          conv_stem=conv_stem, checkpoint=checkpoint, impl=impl, act=act,
                          dropout=dropout)
         # one gate per skip, sized to that encoder stage's channel count
-        self.att1 = MorphAttentionGate(fs,     k=attn_k, beta=attn_beta)
-        self.att2 = MorphAttentionGate(fs * 2, k=attn_k, beta=attn_beta)
-        self.att3 = MorphAttentionGate(fs * 4, k=attn_k, beta=attn_beta)
-        self.att4 = MorphAttentionGate(fs * 8, k=attn_k, beta=attn_beta)
+        self.att1 = MorphAttentionGate(fs,     k=attn_k, beta=attn_beta, warm=attn_warm)
+        self.att2 = MorphAttentionGate(fs * 2, k=attn_k, beta=attn_beta, warm=attn_warm)
+        self.att3 = MorphAttentionGate(fs * 4, k=attn_k, beta=attn_beta, warm=attn_warm)
+        self.att4 = MorphAttentionGate(fs * 8, k=attn_k, beta=attn_beta, warm=attn_warm)
         self.set_checkpointing(self.ckpt_enabled)  # re-apply so the new gates pick up the flag
 
     def set_beta(self, beta):

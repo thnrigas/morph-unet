@@ -260,6 +260,37 @@ class StrictMorphUnit(nn.Module):
         return self.act(self.norm(self.act_conv(self.morph(x))))
 
 
+class ConvMPMUnit(nn.Module):
+
+    # ConvSep's twin with a MORPHOLOGICAL channel mixer. The spatial op is the SAME depthwise 3x3
+    # LINEAR conv as ConvSepUnit, but the 1x1 LINEAR channel projection is replaced by a 1x1 MPM
+    # neuron -- a soft max-plus (join) + min-plus (meet) mix over the input channels, i.e.
+    # StrictMorph2d with k=1 (no spatial extent, pure channel mixing). Motivation: in ConvSep /
+    # MorphUnit the channel mixing is a dense linear sum -- every input channel feeds every output
+    # a little -- so channel usage is inherently NON-sparse. A max-plus mixer's output is instead
+    # dominated by the single winning input channel per neuron (soft-argmax), so a channel that
+    # never wins contributes nothing and is prunable: the morphology now lives exactly where
+    # channel selection / structured sparsity happens. Same param budget class as ConvSep (the 1x1
+    # mixer has in*out weights either way; the MPM adds only 2*out bias params). beta is the
+    # LogSumExp temperature (soft -> hard as it grows; follows set_beta / beta-warmup like the
+    # other soft-morph units). No (B,C,k*k,H,W) neighbourhood tensor (k=1), so like ConvSep it does
+    # NOT need gradient checkpointing.
+    def __init__(self, in_ch, out_ch, k=3, beta=10.0, act="leaky"):
+        super().__init__()
+        self.dw = nn.Conv2d(in_ch, in_ch, k, padding=k // 2, groups=in_ch)   # depthwise spatial (linear)
+        self.mix = StrictMorph2d(in_ch, out_ch, k=1, beta=beta)              # 1x1 max-plus/min-plus channel MPM
+        self.norm = nn.InstanceNorm2d(out_ch)
+        self.act = make_act(act)
+        # pruning hook parity with MorphUnit/ConvSepUnit: surviving input-channel indices. Pruning
+        # this unit drops dw.weight[keep] AND the mix's input columns mix.weight[:, keep].
+        self.register_buffer("_in_keep", None)
+
+    def forward(self, x):
+        if self._in_keep is not None:
+            x = x[:, self._in_keep]
+        return self.act(self.norm(self.mix(self.dw(x))))
+
+
 #
 # a U-Net stage = two sublayers (in->out, out->out) with a residual on the second
 # (residual connections improve generalisation of morphological nets -- the RMPM trick).
@@ -288,6 +319,8 @@ class Stage(nn.Module):
                 Unit = StrictMorphUnit
             elif impl == "convsep":      # depthwise-conv twin (matched params, no morphology)
                 Unit = ConvSepUnit
+            elif impl == "convmpm":      # depthwise 3x3 conv + MORPHOLOGICAL 1x1 (MPM) channel mixer
+                Unit = ConvMPMUnit
             else:
                 Unit = MorphUnit
             self.sub1 = Unit(in_ch, out_ch, k=k, beta=beta, act=act)
@@ -307,6 +340,8 @@ class Stage(nn.Module):
         # (set_checkpointing(False)) when there is enough VRAM to go faster.
         # convsep stages are cheap (a single depthwise cuDNN kernel, no (B,C,k*k,H,W) tensor),
         # so they are NOT checkpointed -- checkpointing would only add a redundant recompute.
+        # convmpm's log-domain channel matmul stores large (B,out,L) intermediates, so like the
+        # soft-morph units it is checkpointed; only the cheap depthwise-conv twin (convsep) is not.
         heavy = self.mode in ("morph", "half") and self.impl != "convsep"
         if self.use_ckpt and heavy and self.training and torch.is_grad_enabled():
             return self.drop(checkpoint(self._forward, x, use_reentrant=False))
