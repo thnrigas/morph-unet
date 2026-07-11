@@ -431,6 +431,157 @@ def collect_forward_backward_importance(model, calib_batches, device, eps=1e-8,
 
 
 # --------------------------------------------------------------------------------------
+# fb-MORPH: foreground forward-backward whose TRANSITIONS come from the morphological 1x1
+# neuron's actual channel selection, not co-activation ("fbmorph" criterion, ConvMPM only).
+# --------------------------------------------------------------------------------------
+@torch.no_grad()
+def collect_morph_routing_importance(model, calib_batches, device, eps=1e-8, use_skips=True,
+                                     emission_backward=True, residual_smooth=1.0,
+                                     max_pos_per_batch=20000):
+    """{unit_name: (in_ch,) gamma} -- same foreground forward-backward as fbfg, but the transition
+    T_{i->j} between successive states is the ROUTING FREQUENCY of the morphological 1x1 mixer instead
+    of channel co-activation. ConvMPM only (needs the StrictMorph2d `mix`).
+
+    For a ConvMPM unit, mix = StrictMorph2d(k=1): output j is a soft max-plus JOIN and min-plus MEET
+    over the input channels, both of the SAME score  U_i + W_ji  (U = the depthwise-conv output that
+    feeds the mixer, W = mix.weight (out,in)). So per position, output j has two winners:
+        max-winner(j) = argmax_i (U_i + W_ji)   (the join / dilation choice)
+        min-winner(j) = argmin_i (U_i + W_ji)   (the meet / erosion choice)
+    Counting, over FOREGROUND positions only, how often input channel i wins (either choice) for output
+    j gives R[i,j] = how strongly channel i routes to output j through the morphological neuron. That is
+    the transition, row-normalised. This is causal routing ("j actually picked i"), unlike fbfg's
+    correlation ("i and j were co-active").
+
+    Where routing is well defined vs. not:
+      * CLEAN (use mix routing R): within-stage sub1->sub2, encoder backbone (pool keeps channels),
+        enc4.sub2->center, and the U-Net SKIP enc_k.sub2->dec_k.sub1 (the encoder output is concatenated
+        verbatim into the decoder's skip columns, so enc's own R maps straight in).
+      * NON-CLEAN (fall back to fbfg co-activation): every backbone edge that lands on a decoder sub1,
+        because that input is `cat[ConvTranspose(up), skip]` -- the up path is a LINEAR channel-mixing
+        transpose-conv, not a morphological selection, so no single MPM neuron routes it.
+    Residual add-one smoothing is applied only on the stage-boundary edges X.sub2->Y.sub1, and the
+    downstream emission pi (foreground E[morph]) is carried through the backward pass, exactly as in fb.
+    """
+    units = morph_units(model)
+    names = list(units.keys())
+    for n in names:
+        if not _is_convmpm(units[n]):
+            raise ValueError(f"fbmorph needs ConvMPM units (morphological 1x1 mixer); {n} is "
+                             f"{type(units[n]).__name__}. Use it on a --morph-impl convmpm model.")
+    idx = {n: i for i, n in enumerate(names)}
+    traces = {n: [] for n in names}                      # per-patch fg-mean |U| per input ch (co-act + pi)
+    Rmax = {n: None for n in names}                      # (in,out) max-plus join win counts
+    Rmin = {n: None for n in names}                      # (in,out) min-plus meet win counts
+    cur = {"fg": None}
+    handles = []
+
+    def count_routing(name, U, W):                       # U:(B,in,H,W)  W:(out,in)
+        B, C, H, W_ = U.shape
+        m = F.adaptive_max_pool2d(cur["fg"], (H, W_)) > 0.5              # (B,1,H,W) fg footprint
+        sel = U.permute(0, 2, 3, 1)[m[:, 0]]             # (P, in) foreground positions only
+        traces[name].append(((U.abs() * m).sum(dim=(2, 3))              # (B,in) fg-mean |U| for co-act/pi
+                             / (m.sum(dim=(2, 3)) + eps)).cpu())
+        P, inC = sel.shape
+        outC = W.shape[0]
+        if P == 0:
+            z = torch.zeros(inC, outC)
+            Rmax[name] = z.clone() if Rmax[name] is None else Rmax[name]
+            Rmin[name] = z.clone() if Rmin[name] is None else Rmin[name]
+            return
+        if P > max_pos_per_batch:                        # cap positions to bound the argmax cost
+            sel = sel[torch.randperm(P, device=sel.device)[:max_pos_per_batch]]
+            P = sel.shape[0]
+        cmax = torch.zeros(inC * outC, device=sel.device)
+        cmin = torch.zeros(inC * outC, device=sel.device)
+        ar = torch.arange(outC, device=sel.device)
+        step = max(1, int(1e8 // (outC * inC)))          # chunk rows so (chunk,out,in) stays ~1e8 floats
+        for s in range(0, P, step):
+            sc = sel[s:s + step].unsqueeze(1) + W.unsqueeze(0)          # (p,out,in) = U_i + W_ji
+            wmax = sc.argmax(dim=2); wmin = sc.argmin(dim=2)            # (p,out) winning input channel
+            cmax += torch.bincount((wmax * outC + ar).flatten(), minlength=inC * outC).float()
+            cmin += torch.bincount((wmin * outC + ar).flatten(), minlength=inC * outC).float()
+        cmax = cmax.view(inC, outC).cpu(); cmin = cmin.view(inC, outC).cpu()
+        Rmax[name] = cmax if Rmax[name] is None else Rmax[name] + cmax
+        Rmin[name] = cmin if Rmin[name] is None else Rmin[name] + cmin
+
+    def mk_pre(name):
+        def hook(mod, inp):
+            count_routing(name, inp[0], mod.weight)      # inp[0] = dw output = mixer input; mod.weight (out,in)
+        return hook
+
+    for n in names:
+        handles.append(units[n].mix.register_forward_pre_hook(mk_pre(n)))
+    model.eval()
+    for data, seg in calib_batches:
+        cur["fg"] = (seg > 0).float().to(device)
+        model(data.to(device))
+    for h in handles:
+        h.remove()
+
+    S = [torch.cat(traces[n], dim=0) for n in names]     # (N, in) fg-mean per patch
+    N = S[0].shape[0]
+    L = len(names)
+    pi = [(s.mean(dim=0) + eps) for s in S]
+    pi = [p / p.sum() for p in pi]
+    R = [(Rmax[n] + Rmin[n]) for n in names]             # (in,out) combined join+meet routing counts
+
+    def norm_rows(M, smooth):
+        if smooth > 0:
+            M = M + smooth * M.mean()
+        M = M + eps
+        return M / M.sum(dim=1, keepdim=True)
+
+    def coact(a, b, smooth):                             # fbfg-style co-activation transition
+        return norm_rows((S[a].t() @ S[b]) / N, smooth)
+
+    edges_in = {l: [] for l in range(L)}
+    edges_out = {l: [] for l in range(L)}
+    def add_edge(a, b, T):
+        edges_out[a].append((b, T)); edges_in[b].append((a, T))
+
+    for l in range(L - 1):
+        dest = names[l + 1]
+        is_boundary = names[l].endswith(".sub2") and dest.endswith(".sub1")
+        smooth = residual_smooth if is_boundary else 0.0
+        if dest.startswith("dec") and dest.endswith(".sub1"):           # up path: ConvTranspose+concat
+            add_edge(l, l + 1, coact(l, l + 1, smooth))                 # -> co-activation fallback
+        else:                                                          # clean: source mix routing
+            assert R[l].shape[1] == _in_ch(units[dest]), \
+                f"routing edge {names[l]}->{dest}: out {R[l].shape[1]} != in {_in_ch(units[dest])}"
+            add_edge(l, l + 1, norm_rows(R[l].clone(), smooth))
+    if use_skips:                                        # skip: enc_k.sub2 routing into dec skip columns
+        for n in names:
+            if n.startswith("dec") and n.endswith(".sub1"):
+                enc = "enc" + n[3:n.index(".")] + ".sub2"
+                if enc in idx:
+                    in_dec = _in_ch(units[n]); out_enc = R[idx[enc]].shape[1]
+                    up = in_dec - out_enc                                # concat = [up, skip]; skip is last
+                    T = torch.zeros(_in_ch(units[enc]), in_dec)
+                    T[:, up:] = R[idx[enc]]                              # enc output == dec skip columns
+                    add_edge(idx[enc], idx[n], norm_rows(T, 0.0))
+
+    alpha = [None] * L
+    for l in range(L):
+        if edges_in[l]:
+            a = pi[l] * sum(alpha[s] @ T for (s, T) in edges_in[l])
+        else:
+            a = pi[l].clone()
+        alpha[l] = a / (a.sum() + eps)
+    beta = [None] * L
+    for l in range(L - 1, -1, -1):
+        if edges_out[l]:
+            b = sum(T @ ((pi[t] * beta[t]) if emission_backward else beta[t])
+                    for (t, T) in edges_out[l])
+        else:
+            b = torch.ones_like(pi[l])
+        beta[l] = b / (b.sum() + eps)
+
+    dev = _dev(units[names[0]])
+    return {n: ((alpha[i] * beta[i]) / ((alpha[i] * beta[i]).sum() + eps)).to(dev)
+            for i, n in enumerate(names)}
+
+
+# --------------------------------------------------------------------------------------
 # structural surgery: rebuild a MorphUnit keeping only `keep` input channels
 # --------------------------------------------------------------------------------------
 def prune_unit(unit, keep):
@@ -535,6 +686,10 @@ def _all_scores(model, criterion, calib_batches, device, fb_opts=None):
             raise ValueError("criterion 'fbfg' needs (data, seg) calibration batches")
         return units, collect_forward_backward_importance(model, calib_batches, device,
                                                           fg_restrict=True, **(fb_opts or {}))
+    if criterion == "fbmorph":                          # fg fb with morphological-selection transitions
+        if calib_batches is None:
+            raise ValueError("criterion 'fbmorph' needs (data, seg) calibration batches")
+        return units, collect_morph_routing_importance(model, calib_batches, device, **(fb_opts or {}))
     if criterion == "fbnew":                            # act, but restricted to foreground receptive fields
         if calib_batches is None:
             raise ValueError("criterion 'fbnew' needs (data, seg) calibration batches")

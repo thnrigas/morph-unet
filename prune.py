@@ -123,7 +123,8 @@ def main():
                         "l1x1 falls back to depthwise-filter norm, 'morph' is not valid)")
     p.add_argument("--no-conv-stem", action="store_true", help="model was trained WITHOUT conv stem")
     p.add_argument("--method", required=True,
-                   choices=["l1x1", "morph", "lin", "act", "fb", "fbnew", "fbfg", "random", "tropnnc"])
+                   choices=["l1x1", "morph", "lin", "act", "fb", "fbnew", "fbfg", "fbmorph",
+                            "random", "tropnnc"])
     p.add_argument("--keep-ratio", type=float, default=0.5, help="fraction of channels to KEEP")
     p.add_argument("--alloc", default="local", choices=["local", "global"],
                    help="local = uniform keep_ratio per morph layer; global = one shared budget "
@@ -191,7 +192,7 @@ def main():
     print(f"[{out_stem}] unpruned: {p_before/1e6:.3f}M params | val fg-Dice {base_dice:.4f}")
 
     calib = (make_calib_seg(train_loader, device, args.calib_batches, args.calib_bs)
-             if args.method in ("fbnew", "fbfg") else
+             if args.method in ("fbnew", "fbfg", "fbmorph") else
              make_calib(train_loader, device, args.calib_batches, args.calib_bs))
     report = None
     if args.method == "tropnnc":
@@ -207,11 +208,12 @@ def main():
                        residual_smooth=args.fb_residual_smooth)
         if args.fb_legacy:                              # reproduce the old linear-chain fb exactly
             fb_opts = dict(use_skips=False, emission_backward=False, residual_smooth=0.0)
-        if args.method in ("fb", "fbfg"):
+        if args.method in ("fb", "fbfg", "fbmorph"):
+            note = {"fbfg": "  (foreground-restricted stats)",
+                    "fbmorph": "  (foreground + morphological-selection transitions)"}.get(args.method, "")
             print(f"[prune] {args.method} graph: skips={fb_opts['use_skips']} "
                   f"emission_backward={fb_opts['emission_backward']} "
-                  f"residual_smooth={fb_opts['residual_smooth']}"
-                  + ("  (foreground-restricted stats)" if args.method == "fbfg" else ""))
+                  f"residual_smooth={fb_opts['residual_smooth']}{note}")
         report = prune_morph_channels(model, criterion=args.method, keep_ratio=args.keep_ratio,
                              calib_batches=calib, device=device, min_keep=args.min_keep,
                              alloc=args.alloc, global_norm=args.global_norm, verbose=True,
