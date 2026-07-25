@@ -25,6 +25,8 @@ import config
 from networks.UNET import UNet
 from networks.morph_block import MorphBankUNet, ConvBankUNet
 from networks.morph_unet import MorphUNet
+from networks.morph_attention import MorphAttentionUNet
+from networks.linear_attention import LinAttnUNet
 from loss_functions.dice_loss import SoftDiceLoss
 from loss_functions.morph_loss import MorphConsistencyLoss
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
@@ -103,9 +105,12 @@ def ensure_bank_spec(task, fold, dataset_dir, top_k, workers, root="results/expl
 # augment_channels.py once; reuse only if the cached dir's manifest matches specs exactly (not
 # just the count). `suffix` disambiguates the dir (per-fold for survey, spec-hash for manual)
 #
-def _ensure_static_dir(specs, suffix):
+def _ensure_static_dir(specs, suffix, perturb="none", strength=0.0, seed=0, fold=0):
     prep_dir = str(config.PREPROCESSED_DIR)
-    static_dir = prep_dir.rstrip("/") + f"_static_{suffix}"
+    # a perturbed dir gets its own name+cache: keyed by perturb+strength AND fold, because it only
+    # holds that fold's TEST split (augment restricts to it), so it must not be shared across folds
+    psuf = f"_{perturb}{strength:g}_f{fold}" if perturb != "none" else ""
+    static_dir = prep_dir.rstrip("/") + f"_static_{suffix}{psuf}"
     manifest = os.path.join(static_dir, "filters.json")
     if os.path.exists(manifest):
         with open(manifest) as f:
@@ -113,12 +118,16 @@ def _ensure_static_dir(specs, suffix):
     else:
         cached = None
     if cached == specs:
-        print(f"static dir exists: {static_dir} ({len(specs)} filters)", flush=True)
+        print(f"static dir exists (cached): {static_dir} ({len(specs)} filters)", flush=True)
     else:
-        print(f"precomputing static channels: {specs} -> {static_dir}", flush=True)
+        tag = f" perturb={perturb}{strength:g} fold={fold}(test)" if perturb != "none" else ""
+        print(f"precomputing static channels: {specs}{tag} -> {static_dir}", flush=True)
         augment = os.path.join(config.PROJECT_ROOT, "datasets", "augment_channels.py")
-        subprocess.run([sys.executable, augment, "--filters"] + specs + [
-                        "--src", prep_dir, "--out", static_dir], check=True)
+        cmd = [sys.executable, augment, "--filters"] + specs + ["--src", prep_dir, "--out", static_dir]
+        if perturb != "none":
+            cmd += ["--perturb", perturb, "--perturb-strength", str(strength),
+                    "--perturb-seed", str(seed), "--fold", str(fold)]
+        subprocess.run(cmd, check=True)
     print(f"static -> {specs}  ({len(specs)} channels)", flush=True)
     return static_dir, len(specs)
 
@@ -289,7 +298,8 @@ def _perturb_image(data, kind, s, gen):
 #
 # test phase
 #
-def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0, seed=0):
+def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0,
+                  seed=0, advanced=True):
     model.eval()
     gen = torch.Generator().manual_seed(seed)   # cpu generator, device-agnostic reproducible noise
     # accumulate per-case pred/GT as uint8 (labels are small ints). Storing int64 preds + float
@@ -305,9 +315,11 @@ def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none
                 pred_dict[fname[0]].append(pred[i])
                 gt_dict[fname[0]].append(target[i])
     pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
+    # advanced=False drops the surface-distance metrics (HD95/ASSD) — the slow, scipy-bound part —
+    # leaving Dice/precision/recall, which is all the robustness/data-efficiency curves need
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
-        json_task=config.TASK, num_workers=num_workers, advanced=True,
+        json_task=config.TASK, num_workers=num_workers, advanced=advanced,
     )
     return scores
 
@@ -616,12 +628,40 @@ def main():
     p.add_argument("--morph-loss", action="store_true")
     p.add_argument("--morph-bank", metavar="SPEC")
     p.add_argument("--conv-control", action="store_true")
-    p.add_argument("--morph-unet", choices=["heavy", "balanced", "bottleneck"])
+    p.add_argument("--morph-unet",
+                   choices=["none", "heavy", "balanced", "bottleneck", "deep",
+                            "full", "full_l1", "full_l2"],
+                   help="which stages become morphological (STAGE_CONFIGS in networks/morph_unet.py); "
+                        "none = all-conv backbone, the ablation control")
+    p.add_argument("--morph-attn", action="store_true")     # gate the skips with soft top/bottom-hat
+    p.add_argument("--morph-attn-warm", type=float, default=0.0,
+                   help="warm-start the morph-attention gate: 0 = identity (plain skip), "
+                        "0.5 = morphology at half strength from step 0")
+    p.add_argument("--lin-attn", action="store_true")       # plain-conv U-Net, linear-attention skips
+    p.add_argument("--lin-attn-heads", type=int, default=4)
+    p.add_argument("--lin-attn-gamma-init", type=float, default=0.0)   # ReZero skip gate init
     # morph parameters
     p.add_argument("--morph-k", type=int, default=5)
     p.add_argument("--morph-k-max", type=int, default=11)
     p.add_argument("--morph-beta", type=float, default=10.0)
     p.add_argument("--morph-beta-final", type=float, default=30.0)
+    p.add_argument("--morph-impl", choices=["fast", "paper", "convsep", "convmpm"], default="fast",
+                   help="'fast' = depthwise morph + 1x1; 'paper' = strict channel-mixing max-plus; "
+                        "'convsep' = plain-conv twin of 'fast' (matched params, no morphology) -- "
+                        "the architecture-matched control; 'convmpm' = convsep but the 1x1 channel "
+                        "mixer is a max-plus/min-plus neuron -- morphology placed where channel "
+                        "sparsity/pruning happens")
+    p.add_argument("--fs", type=int, default=64,
+                   help="base feature width; channels are fs, 2fs, 4fs, 8fs, 16fs across levels. "
+                        "fs=13 is ~1/5 width, a much cheaper model")
+    # NOTE: the conv stem is opt-IN here, unlike the kasimatis branch where it defaults on. Keeping it
+    # off by default is what makes the existing mpm_* results in results/results.md reproducible.
+    p.add_argument("--morph-conv-stem", action="store_true")
+    p.add_argument("--morph-half", action="store_true")      # HybridUnit stages: half morph, half conv
+    p.add_argument("--morph-tie-mirror", action="store_true")   # enc<->dec mirror stages share SE init
+    p.add_argument("--morph-no-checkpoint", action="store_true")   # more VRAM, identical maths
+    p.add_argument("--morph-relu", action="store_true")      # plain ReLU (TropNNC pruning theory)
+    p.add_argument("--morph-dropout", type=float, default=0.0)   # Dropout2d on every stage output
     p.add_argument("--survey-top-k", type=int, default=5)
     p.add_argument("--survey-n", type=int, default=25)
     p.add_argument("--survey-workers", type=int, default=min(os.cpu_count() or 1, 16))
@@ -654,6 +694,9 @@ def main():
     # then re-score. scores are written under a perturb-suffixed tag so the clean run isn't clobbered
     p.add_argument("--test-perturb", choices=["none", "gamma", "contrast", "noise"], default="none")
     p.add_argument("--perturb-strength", type=float, default=0.0)
+    p.add_argument("--fast-eval", action="store_true")   # Dice-only test (skip slow HD95/ASSD)
+    p.add_argument("--skip-existing", action="store_true")   # skip a point whose scores json already exists
+    p.add_argument("--keep-static", action="store_true")   # keep the perturbed static dir (default: delete after eval)
     p.add_argument("--fold-mean", metavar="TAG")
     p.add_argument("--compare", nargs="+", metavar="JSON")
     p.add_argument("--seed", type=int, default=42)
@@ -667,6 +710,28 @@ def main():
         return
     if not args.tag:
         p.error("--tag is required")
+    # ReLU runs write to a *_relu tag so the LeakyReLU checkpoints/scores are never overwritten
+    if args.morph_relu and not args.tag.endswith("_relu"):
+        args.tag += "_relu"
+        print(f"[--morph-relu] output tag -> {args.tag}")
+
+    # --skip-existing: if this exact point's scores json already exists, skip the whole run (no model
+    # build / augment / inference) and just refresh the plot so the curve stays complete. lets an
+    # interrupted sweep resume without recomputing done points.
+    if args.skip_existing:
+        rt = f"{args.tag}_n{args.train_cases}" if args.train_cases and args.train_cases > 0 else args.tag
+        st = rt if args.test_perturb == "none" else f"{rt}_{args.test_perturb}{args.perturb_strength:g}"
+        jp = os.path.join(config.PROJECT_ROOT, "results", config.TASK, f"{st}_f{args.fold}_scores.json")
+        if os.path.exists(jp):
+            print(f"[{st}_f{args.fold}] scores exist, skipping (--skip-existing): {jp}", flush=True)
+            if args.test_perturb != "none":
+                try:
+                    fold_mean(st)
+                    plot_perturb(args.test_perturb,
+                                 sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag}), "Dice")
+                except Exception as e:
+                    print(f"[viz] plot skipped: {e}", flush=True)
+            return
 
     set_seed(args.seed)
     device = pick_device()
@@ -688,20 +753,67 @@ def main():
     if args.static_filters and not args.static_dir and args.static_channels == 0:
         args.static_dir, args.static_channels = ensure_static_filters(args.static_filters)
     if args.static_auto and not args.static_dir and args.static_channels == 0:
-        sdir, n = ensure_static_channels(config.TASK, args.fold, config.DATA_DIR,
-                                         args.survey_top_k, args.survey_workers, n=args.survey_n)
-        if n > 0:
-            args.static_dir = sdir
-            args.static_channels = n
+        if args.test_perturb != "none":
+            # test-only perturbed eval: the clean full augmented dir is never used, so DON'T build it
+            # (484 cases of slow dome filters) -- just resolve the survey specs; the perturb block
+            # below builds only this fold's perturbed TEST split.
+            specs = _read_static_spec(config.TASK, args.fold)
+            if specs is None:
+                _run_survey(config.TASK, args.fold, config.DATA_DIR,
+                            args.survey_top_k, args.survey_workers, "results/explore", args.survey_n)
+                specs = _read_static_spec(config.TASK, args.fold)
+            if specs:
+                args.static_channels = len(specs)   # static_dir stays unset; set by perturb block
+        else:
+            sdir, n = ensure_static_channels(config.TASK, args.fold, config.DATA_DIR,
+                                             args.survey_top_k, args.survey_workers, n=args.survey_n)
+            if n > 0:
+                args.static_dir = sdir
+                args.static_channels = n
+
+    # static channels + --test-perturb (staticbank robustness): rebuild channels on the PERTURBED
+    # image (recompute -> no clean-channel leak), restricted to this fold's test split. specs come
+    # from an explicit --static-dir manifest if present, else the survey (--static-auto/--static-filters).
+    perturb_baked = False
+    if args.test_perturb != "none" and (getattr(args, "static_channels", 0) or 0) > 0:
+        manifest = os.path.join(args.static_dir, "filters.json") if args.static_dir else None
+        if manifest and os.path.exists(manifest):
+            specs = json.load(open(manifest))
+        else:
+            specs = _read_static_spec(config.TASK, args.fold) or args.static_filters
+        if not specs:
+            p.error("--test-perturb with static channels: could not resolve filter specs")
+        args.static_dir, args.static_channels = _ensure_static_dir(
+            specs, _spec_suffix(specs), perturb=args.test_perturb, strength=args.perturb_strength,
+            seed=args.seed, fold=args.fold)
+        perturb_baked = True
+        print("static robustness: perturbation baked into channels (no in-loop perturb)", flush=True)
 
     train_loader, val_loader, test_loader, in_channels = build_loaders(args)
 
-    if args.morph_unet:
+    if args.lin_attn:
+        # plain-conv U-Net with LINEAR cross-attention gates on the skips, the linear counterpart
+        # to the morphological attention net. No morphology, so the SE/beta/impl flags don't apply
+        model = LinAttnUNet(num_classes=config.NUM_CLASSES, in_channels=in_channels,
+                            conv_stem=args.morph_conv_stem, heads=args.lin_attn_heads,
+                            gamma_init=args.lin_attn_gamma_init,
+                            act="relu" if args.morph_relu else "leaky").to(device)
+    elif args.morph_unet:
         # morphological-separable U-Net, conv stages replaced by depthwise soft morphology
         # and 1x1 projection, per the chosen config, its SEs end in ".se", so they pick up the
-        # boosted SE lr and --freeze-se just like the bank, residual variants
-        model = MorphUNet(num_classes=config.NUM_CLASSES, in_channels=in_channels,
-                          k=args.morph_k, beta=args.morph_beta, config=args.morph_unet).to(device)
+        # boosted SE lr and --freeze-se just like the bank, residual variants. --morph-attn swaps
+        # in the gated-skip variant; --morph-impl convsep swaps the morphology for matched convs
+        Net = MorphAttentionUNet if args.morph_attn else MorphUNet
+        net_kwargs = dict(num_classes=config.NUM_CLASSES, in_channels=in_channels, fs=args.fs,
+                          k=args.morph_k, beta=args.morph_beta, config=args.morph_unet,
+                          half_morph=args.morph_half, tie_mirror=args.morph_tie_mirror,
+                          conv_stem=args.morph_conv_stem,
+                          checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl,
+                          act="relu" if args.morph_relu else "leaky",
+                          dropout=args.morph_dropout)
+        if args.morph_attn:                                  # attn_warm only exists on the attention net
+            net_kwargs["attn_warm"] = args.morph_attn_warm
+        model = Net(**net_kwargs).to(device)
     elif args.morph_bank:
         # trainable morph bank spanning the full library (exact / reconstruction / vdome-
         # surrogate ops); one extra input channel per spec token. --conv-control swaps the
@@ -725,8 +837,21 @@ def main():
     # so fold N into the tag (run_tag) to keep its checkpoint/scores separate from the full-data run
     run_tag = f"{args.tag}_n{args.train_cases}" if args.train_cases and args.train_cases > 0 else args.tag
     stem = f"{run_tag}_f{args.fold}"
-    if args.morph_unet:
-        mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta})"
+    if args.lin_attn:
+        mode = (f"lin-attn(heads={args.lin_attn_heads},stem={args.morph_conv_stem},"
+                f"gamma0={args.lin_attn_gamma_init:g})")
+    elif args.morph_unet:
+        # record every switch that changes the model, two runs sharing a tag but differing in
+        # impl/stem are different models and the banner is what tells them apart in the logs
+        extra = "".join(f",{t}" for t, on in
+                        [("attn", args.morph_attn), ("half", args.morph_half),
+                         ("tie", args.morph_tie_mirror), ("stem", args.morph_conv_stem),
+                         ("relu", args.morph_relu),
+                         (f"drop={args.morph_dropout:g}", args.morph_dropout > 0),
+                         (f"warm={args.morph_attn_warm:g}", args.morph_attn and args.morph_attn_warm > 0),
+                         (f"fs={args.fs}", args.fs != 64),
+                         (f"impl={args.morph_impl}", args.morph_impl != "fast")] if on)
+        mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta}{extra})"
     elif args.morph_bank:
         kind = "conv-control" if args.conv_control else "morph-bank"
         mode = f"{kind}([{args.morph_bank}],beta={args.morph_beta})"
@@ -867,8 +992,11 @@ def main():
     # and `--fold-mean baseline_gamma0.5` / `--compare` pick it up unchanged
     score_tag = run_tag if args.test_perturb == "none" else f"{run_tag}_{args.test_perturb}{args.perturb_strength:g}"
     json_path = os.path.join(results_dir, f"{score_tag}_f{args.fold}_scores.json")
+    # if the perturbation is already baked into the input dir (staticbank), don't apply it again in-loop
+    loop_perturb = "none" if perturb_baked else args.test_perturb
     scores = evaluate_test(model, test_loader, device, json_path, num_workers=args.num_workers,
-                           perturb=args.test_perturb, strength=args.perturb_strength, seed=args.seed)
+                           perturb=loop_perturb, strength=args.perturb_strength, seed=args.seed,
+                           advanced=not args.fast_eval)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
         print(f"  label {label}: Dice={md.get('Dice')} "
@@ -880,7 +1008,7 @@ def main():
         print(f"[{stem}] perturb={args.test_perturb} strength={args.perturb_strength:g}", flush=True)
         try:
             fold_mean(score_tag)
-            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            models = sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag})
             plot_perturb(args.test_perturb, models, "Dice")
         except Exception as e:
             print(f"[viz] perturb plot skipped: {e}", flush=True)
@@ -890,11 +1018,24 @@ def main():
     elif args.train_cases and args.train_cases > 0:
         try:
             fold_mean(score_tag)
-            models = sorted({"baseline", "convctrl", "morphbank", args.tag})
+            models = sorted({"baseline", "convctrl", "morphbank", "staticbank", args.tag})
             plot_data_efficiency(models, "Dice")
         except Exception as e:
             print(f"[viz] data-efficiency plot skipped: {e}", flush=True)
 
+    # a perturbed static dir is a throwaway (test-split only, fully rebuildable) and each is ~GBs of
+    # uncropped volumes, so delete it here rather than relying on a fragile shell glob. --keep-static
+    # opts out. only fires for perturb_baked so a clean/training dir is never touched.
+    if perturb_baked and args.static_dir and not args.keep_static:
+        import shutil
+        shutil.rmtree(args.static_dir, ignore_errors=True)
+        print(f"[cleanup] removed perturbed static dir {args.static_dir}", flush=True)
+
 
 if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn')
+    except RuntimeError:
+        pass
     main()

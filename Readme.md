@@ -1,8 +1,14 @@
-﻿# Morphological U-Net
+# Morphological U-Net
 
-The project investigates whether morphological variations of the U-Net improve segmentation over the unaltered baseline, in the context of the Medical Segmentation Decathlon. We implement a standard U-Net and inject morphology at the input, with residuals as extra channels, either precomputed with a fixed structuring element or computed with a trainable structuring element by a morphological block, selected by a per task survey that ranks a library of classical filters (top/bottom-hat, gradient, reconstruction and h-/volume-dome, alternating-sequential and leveling residuals) and autoselects the top channels or custom selection. We also implement a morphological U-Net that replaces the convolution itself with morphological layers, whose stages use depthwise soft erosion/dilation followed by a 1x1 projection, in configurations that morphologise the whole network, only the high-resolution stages or only the bottleneck. All soft-morphology blocks approximate dilation/erosion via logsumexp with a temperature that is annealed during training to avoid the dead gradient problem. The pipeline runs 3-fold cross-validation with segmentation and training-cost/convergence metrics, and includes an MC-Dropout branch for predictive uncertainty.
+The project investigates whether morphological variations of the U-Net improve segmentation over the unaltered baseline, in the context of the Medical Segmentation Decathlon.
 
-## Setup & Run
+Morphology is injected at three levels. At the input, residuals are added as extra channels, either precomputed with a fixed structuring element or computed with a trainable structuring element by a morphological block, selected by a per task survey that ranks a library of classical filters (top/bottom-hat, gradient, reconstruction and h-/volume-dome, alternating-sequential and leveling residuals) and autoselects the top channels or custom selection. **Inside the network**, a morphological U-Net replaces the convolution itself with morphological layers, whose stages use depthwise soft erosion/dilation followed by a 1x1 projection, in configurations that morphologise the whole network, only the high-resolution stages or only the bottleneck. On the skip connections, attention gates are built either morphologically (top-hat/bottom-hat saliency) or linearly (kernel cross-attention), so the two can be compared on the same backbone.
+
+All soft-morphology blocks approximate dilation/erosion via logsumexp with a temperature that is annealed during training to avoid the dead gradient problem. Every morphological block ships with a parameter-matched linear control (`convsep`, `convctrl`) so that gains can be attributed to morphology rather than to extra capacity. The pipeline reports segmentation and training-cost/convergence metrics, includes an MC-Dropout branch for predictive uncertainty, and a structural channel-pruning suite for measuring how much of a morphological network is actually load-bearing.
+
+Splits are a seeded 5-fold cross validation (`datasets/create_splits.py`); the reported experiments use folds 0-2, and most of the block/pruning exploration ran on fold 0 only. The main task throughout is MSD **Task08 Hepatic Vessel** (vessel + tumour); select another with the `TASK` environment variable.
+
+## Setup
 
 Data available in http://medicaldecathlon.com. Place in `./data/` or add path to config.
 
@@ -13,6 +19,12 @@ pip install -r requirements.txt
 ```
 python3 run_preprocessing.py
 ```
+
+Training writes `results/<TASK>/<tag>_f<fold>_best.pth` and, after the final test pass,
+`results/<TASK>/<tag>_f<fold>_scores.json`. Everything under `data/` and `results/` is gitignored
+(the dataset and the checkpoints are large and stay local).
+
+## 1. Input-level morphology
 
 Baseline Model:
 ```
@@ -35,7 +47,36 @@ for f in 0 1 2; do
 done
 ```
 
-Morphological Variants:
+Parameter-matched conv control for the trainable bank, which isolates "extra learned input channels"
+from "morphology":
+```
+for f in 0 1 2; do
+    python3 train_eval.py --tag convctrl --morph-bank auto --conv-control --fold $f
+done
+```
+
+## 2. Morphological U-Net variants
+
+All variants share the same training loop, loss (Dice + CE), and evaluation; the architecture is
+selected with flags. `--morph-unet none` gives a plain-conv U-Net (the base for the attention nets);
+any other value places morphology at that capacity `config`.
+
+| flag | meaning |
+|---|---|
+| `--morph-unet {none,heavy,balanced,bottleneck,deep,full,full_l1,full_l2}` | which U-Net / where morphology sits |
+| `--morph-impl {fast,paper,convsep,convmpm}` | the morphological block implementation |
+| `--fs N` | base feature width (channels are `N,2N,4N,8N,16N` across levels; default 64) |
+| `--morph-k K` | structuring-element / kernel size (we used 3) |
+| `--morph-conv-stem` | 3x3 conv stem before any morphology (**off by default**, see note) |
+| `--lin-attn`, `--lin-attn-gamma-init G` | linear cross-attention gates on the skips, ReZero init `G` |
+| `--morph-attn`, `--morph-attn-warm W` | morphological self-gating on the skips, warm-start strength `W` |
+
+> **Note on `--morph-conv-stem`.** The stem is opt-in here. Runs recorded in `results/results.md`
+> predate it and were trained without it, so leaving it off keeps them reproducible. The banner printed
+> at the start of each run records every switch that changes the model (`impl=`, `stem`, `fs=`, `attn`,
+> `warm=`, `drop=`), which is what distinguishes two runs sharing a tag.
+
+Configurations:
 ```
 for cfg in bottleneck balanced deep; do
     for f in 0 1 2; do
@@ -44,16 +85,212 @@ for cfg in bottleneck balanced deep; do
 done
 ```
 
+### MPM morphological block (`--morph-impl fast`)
+
+The MPM neuron is a per-channel soft-morphology (max-plus dilation + min-plus erosion) followed by a
+1x1 projection. `config` decides how many stages are morphological. `heavy` makes all nine stages
+morphological; `full_l2` is the full variant with levels 1-2 kept linear.
+
 ```
-for t in baseline staticbank morphbank bottleneck balanced deep; do
+python3 train_eval.py --tag mpm_full_l2 --fold 0 --morph-unet full_l2
+```
+
+### ConvSep twin (`--morph-impl convsep`)
+
+The linear control for the MPM block: same per-channel-spatial then 1x1-mixer shape, but the spatial op
+is a depthwise 3x3 convolution instead of morphology. This isolates what morphology buys over a plain
+separable conv of identical structure.
+
+```
+python3 train_eval.py --tag convsep_heavy --fold 0 --morph-unet heavy --morph-impl convsep
+```
+
+### ConvMPM twin (`--morph-impl convmpm`)
+
+ConvSep's other twin: keep the depthwise 3x3 spatial op, but make the 1x1 **channel mixer** a
+morphological MPM neuron (a `StrictMorph2d` with k=1, max-plus join and min-plus meet). This puts the
+morphology in the channel-mixing step. `--fs` is the width knob used to probe capacity.
+
+```
+# full width (fs=64, ~6M params)
+python3 train_eval.py --tag convmpm_heavy   --fold 0 --morph-unet heavy --morph-impl convmpm --morph-k 3
+
+# 1/5 width (fs=13, ~0.26M params) -- the capacity-floor ablation
+python3 train_eval.py --tag convmpm_small   --fold 0 --morph-unet heavy --morph-impl convmpm --morph-k 3 --fs 13
+
+# ~2M params (fs=37)
+python3 train_eval.py --tag convmpm_small2m --fold 0 --morph-unet heavy --morph-impl convmpm --morph-k 3 --fs 37
+```
+
+Note: the tiny fs=13 ConvMPM does **not** collapse to zero Dice the way a same-width plain morph block
+does. The morphological channel mixer is what keeps a floor-width net trainable.
+
+## 3. Attention variants
+
+Both gates start as the identity, so all three arms share the plain-U-Net starting point and the only
+difference is the skip gate.
+
+### Linear-attention U-Net (`--lin-attn`)
+
+A plain-conv U-Net with linear (kernel) cross-attention gates on each skip. The gate is a ReZero
+residual `y = x + gamma * attn(g, x)`; `--lin-attn-gamma-init` sets the initial `gamma`. `0.0` starts as
+a plain U-Net (identity skips); `0.5` warm-starts the gate half-active.
+
+```
+# identity start (gamma = 0)
+python3 train_eval.py --tag unet_linattn     --fold 0 --morph-unet none --lin-attn
+
+# half-active warm start (gamma = 0.5)
+python3 train_eval.py --tag unet_linattn_g05 --fold 0 --morph-unet none --lin-attn --lin-attn-gamma-init 0.5
+```
+
+### Morphological-attention U-Net (`--morph-attn`)
+
+The morphological analogue: each skip is gated by its own top-hat / bottom-hat saliency.
+`--morph-attn-warm` is the counterpart of the linear `gamma` init; `0.0` starts as identity, `0.5` reads
+the top-hat minus bottom-hat contrast at half strength from step 0.
+
+```
+# identity-init gate
+python3 train_eval.py --tag unet_morphattn     --fold 0 --morph-unet none --morph-attn --morph-k 3
+
+# warm-started gate (analogue of gamma = 0.5)
+python3 train_eval.py --tag unet_morphattn_g05 --fold 0 --morph-unet none --morph-attn --morph-k 3 --morph-attn-warm 0.5
+```
+
+## 4. Channel pruning (`prune.py`)
+
+`prune.py` loads a trained checkpoint, structurally prunes the input channels of every morphological /
+separable unit, reports the Dice drop, fine-tunes to recover, and writes a new pruned model plus test
+scores. Pruning an input channel drops that channel's spatial filter and the matching 1x1 mixer column,
+so it is local and cascade-free; the reported params/FLOP savings are real.
+
+The load flags must match how the model was trained:
+
+```
+python3 prune.py --tag <model> --fold 0 --config <cfg> --impl <impl> --fs <width> \
+    --method <criterion> --keep-ratio <k> --alloc global --global-norm max --min-keep <n>
+```
+
+Criteria (`--method`):
+
+| method | idea |
+|---|---|
+| `l1x1` | `\|proj_col\|` x `\|alpha\|` x SE-spread (morph blocks) / depthwise-filter norm (conv twins) |
+| `morph` | morphology-native saliency (+ off-centre win-rate); MPM only |
+| `lin` | `\|proj_col\|` x `\|alpha\|`, morphology-agnostic output contribution |
+| `act` | `\|proj_col\|` x mean\|activation\|, data-driven output contribution |
+| `fb` | global HMM forward-backward posterior over the unit chain (details below) |
+| `fbfg` | the same fixed `fb`, but statistics restricted to foreground receptive fields |
+| `fbnew` | foreground-restricted `act` (the earlier foreground criterion) |
+| `random` | uniform-random keep, sanity baseline |
+
+Allocation: `--alloc local` keeps `keep_ratio` of each layer's own channels (uniform sparsity);
+`--alloc global` shares one `keep_ratio * total` budget across layers (non-uniform, prunes redundant
+layers harder) with a per-layer `--min-keep` floor and `--global-norm` for cross-layer comparability.
+
+Two pruning back-ends exist, selected by which block implementation the checkpoint uses:
+`networks/prune_morph.py` handles the `fast` / `convsep` / `convmpm` units (channel-level scoring), and
+`networks/morph_prune.py` handles the strict `paper` max-plus layers (path/chain composition).
+
+### The forward-backward criterion (`fb`) and its fixed form
+
+`fb` treats each unit's input channels as HMM states and runs forward-backward over the U-Net's real
+routing. The current (fixed) version differs from the first implementation in three ways, all on by
+default:
+
+- **Skip edges.** The U-Net skips `enc_k.sub2 -> dec_k.sub1` are added to the graph, so an encoder
+  channel's importance reaches the decoder directly, not only through the bottleneck.
+- **Emission in the backward pass.** Each state carries a prior/emission `pi_i` proportional to
+  `E[morph(i)]`, applied in both passes. Without it the backward messages collapse to uniform and the
+  posterior degenerates to the forward pass alone.
+- **Residual smoothing where residuals exist.** Add-one (Laplace) smoothing is applied only on the
+  stage-boundary edges `X.sub2 -> Y.sub1`, the exact edges the residual `out = sub1(x) + sub2(sub1(x))`
+  feeds, and left off on within-stage and skip edges.
+
+Flags to control or revert this:
+
+```
+--fb-no-skips           # drop the skip edges
+--fb-no-emission        # do not carry pi through the backward pass
+--fb-residual-smooth S  # residual add-one strength (default 1.0, 0 = off)
+--fb-legacy             # reproduce the old linear-chain fb exactly (no skips, no emission, no smoothing)
+```
+
+`fbfg` is `fb` with the state statistics measured only over foreground positions (the `seg > 0` mask
+max-pooled to each unit's resolution). It accepts the same `--fb-*` flags. On the floor-width ConvMPM
+this holds real Dice at 38 to 50 percent of params removed where plain `fb` collapses to zero, since the
+foreground restriction keeps the vessel-relevant channels.
+
+### Example sweeps
+
+Global sweep on the linear ConvSep (fold 0), with the fixed `fb` and its foreground form:
+
+```
+for m in fb fbfg; do
+  for k in 0.01 0.03 0.05 0.10 0.50; do
+    python3 prune.py --tag convsep_heavy --fold 0 --config heavy --impl convsep --fs 64 \
+        --method $m --keep-ratio $k --alloc global --global-norm max --min-keep 4
+  done
+done
+```
+
+Global sweep on the MPM full_l2 model:
+
+```
+for m in fb fbfg; do
+  for k in 0.01 0.03 0.05 0.10 0.30 0.50 0.70; do
+    python3 prune.py --tag mpm_full_l2 --fold 0 --config full_l2 --impl fast --fs 64 \
+        --method $m --keep-ratio $k --alloc global --global-norm max --min-keep 4
+  done
+done
+```
+
+Pruning the floor-width ConvMPM (fold 0), `fb` vs `fbfg` at three keep ratios:
+
+```
+for m in fb fbfg; do
+  for k in 0.5 0.3 0.1; do
+    python3 prune.py --tag convmpm_small --fold 0 --config heavy --impl convmpm --fs 13 \
+        --method $m --keep-ratio $k --alloc global --global-norm max --min-keep 2
+  done
+done
+```
+
+## 5. Robustness and data efficiency
+
+Eval-time stress tests reuse trained weights (no retraining) and write to a perturb-suffixed tag so the
+clean run is not clobbered:
+
+```
+for s in 0.05 0.1 0.2 0.3; do
+    python3 train_eval.py --tag baseline --fold 0 --test-only --fast-eval \
+        --test-perturb noise --perturb-strength $s
+done
+```
+
+`--test-perturb` also accepts `gamma` and `contrast`. Data-efficiency points retrain on a nested subset
+of the training split:
+
+```
+for N in 5 15 30 60; do
+    python3 train_eval.py --tag baseline --fold 0 --train-cases $N
+done
+```
+
+## 6. Aggregating and comparing results
+
+```
+for t in baseline staticbank morphbank convctrl morphunet_bottleneck morphunet_balanced morphunet_deep; do
     python3 train_eval.py --fold-mean $t
 done
 ```
 
 ```
 python3 train_eval.py --compare baseline_mean_scores.json staticbank_mean_scores.json \
-    morphbank_mean_scores.json bottleneck_mean_scores.json balanced_mean_scores.json \
-    deep_mean_scores.json
+    morphbank_mean_scores.json convctrl_mean_scores.json \
+    morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json \
+    morphunet_deep_mean_scores.json
 ```
 
 ## Attribution & License

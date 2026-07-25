@@ -8,4 +8,5 @@ docs
 papers
 **__init__.py
 results
-log_*.txt
+*.log
+**__pycache__
