@@ -6,15 +6,15 @@
 # uncertainty time (uncertainty_mc.py). The best checkpoint (lowest val loss) is
 # saved so test/uncertainty can reuse the weights without re-training.
 #
-# Reuses the baseline plumbing by IMPORT (no existing file is modified):
-#   run_epoch / set_seed / pick_device        <- train_eval.py
+# Reuses the shared uncertainty plumbing by IMPORT:
+#   run_epoch / set_seed / pick_device          <- mc_common.py
 #   build_plain_loaders (2-channel image+label) <- mc_common.py
 #
 # Kaggle: the preprocessed data + splits are located via config, which reads the
 # DATA_DIR / TASK env vars. Point DATA_DIR at your (read-only) input dataset and
 # keep --out-dir on a writable path, e.g.
 #   !DATA_DIR=/kaggle/input/msd-prep/Task08_HepaticVessel TASK=Task08_HepaticVessel \
-#        python uncertainty/train_mc.py --fold 0 --out-dir /kaggle/working/results
+#        python train_mc.py --fold 0 --out-dir /kaggle/working/results
 #
 
 import argparse
@@ -30,8 +30,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from train_eval import run_epoch, set_seed, pick_device
-from mc_common import build_plain_loaders
+from mc_common import build_plain_loaders, run_epoch, set_seed, pick_device
 from networks.UNET_mc import MCDropoutUNet
 from loss_functions.dice_loss import SoftDiceLoss
 
@@ -45,9 +44,9 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--dropout-p", type=float, default=0.2)
+    p.add_argument("--dropout-p", type=float, default=0.4)
     p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--out-dir", default=os.path.join(config.PROJECT_ROOT, "results"))
     args = p.parse_args()

@@ -1,0 +1,13 @@
+# Standalone traditional-segmentation toolkit (Tier 1+). CPU-only; no GPU needed.
+# NOTE: numpy<2 to stay compatible with the baseline stack (batchgenerators==0.21)
+#       when running on the same GCP Deep Learning VM.
+numpy<2
+scipy
+scikit-image
+scikit-learn
+PyMaxflow          # Tier-2 graph cut (Boykov-Kolmogorov max-flow)
+medpy
+nibabel
+SimpleITK
+pandas
+matplotlib

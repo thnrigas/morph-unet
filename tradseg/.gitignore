@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# generated data / outputs (created on the VM, never committed)
+data/
+results/
+*.log
+*.npy
+*.pkl
+
+# OS
+.DS_Store
+Thumbs.db

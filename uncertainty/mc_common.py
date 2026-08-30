@@ -1,14 +1,32 @@
 #
-# Shared data plumbing for the MC-Dropout scripts
+# Shared data + train/eval plumbing for the Hippocampus MC-Dropout scripts
 #
 # The MC-Dropout track uses the 2-channel (image, label) npy produced by
-# run_preprocessing_mc.py -> the label lives at slice index 1 (not 3 as in the
-# morphological 4-channel format). That is the only reason train_mc / test_mc /
-# uncertainty_mc cannot reuse train_eval.build_loaders (which hardcodes
-# label_slice=3); everything else (run_epoch, evaluate_test) is reused by import.
+# run_preprocessing_mc.py -> the label lives at slice index 1 (not 3 as in
+# the morphological 4-channel format), so build_plain_loaders sets label_slice=1.
+#
+# The tiny training/eval helpers (set_seed, pick_device, run_epoch, evaluate_test)
+# are implemented HERE (mirroring mc_common_spleen) on purpose: the morphological
+# baseline train_eval.py imported the morph modules at module load, and this
+# uncertainty project must NOT pull those in. Everything here depends only on
+# config, the loaders and (lazily) the non-morphological evaluation.evaluator.
+#
+# NOTE (merged repo): the shared NumpyDataLoader gained class-balanced foreground
+# oversampling, default fg_fraction=0.33. This track was measured WITHOUT it, and it
+# reweights the training class prior -- which is the very thing an ECE/temperature
+# study measures -- so build_plain_loaders pins fg_fraction=0.0 (as mc_common_spleen
+# does). Geometry is unaffected: the npy is already 64x64 and --patch-size is 64, so
+# the loader's native-resolution crop/pad is a no-op against the old resize.
 #
 
+import contextlib
 import pickle
+import random
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn.functional as F
 
 import config
 from datasets.two_dim.NumpyDataLoader import NumpyDataSet
@@ -30,10 +48,76 @@ def build_plain_loaders(args):
 
     data_dir = str(config.PREPROCESSED_DIR)
     common = dict(target_size=args.patch_size, batch_size=args.batch_size,
-                  input_slice=(0,), label_slice=1, num_processes=args.num_workers)
+                  input_slice=(0,), label_slice=1, num_processes=args.num_workers,
+                  fg_fraction=0.0)   # no class-balanced oversampling: see the header note
 
     train = NumpyDataSet(data_dir, keys=tr, **common)
     val = NumpyDataSet(data_dir, keys=vl, mode="val", do_reshuffle=False, **common)
     test = NumpyDataSet(data_dir, keys=ts, mode="test", do_reshuffle=False, **common)
     in_channels = 1
     return train, val, test, in_channels
+
+
+# ----------------------------- train/eval engine -----------------------------
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None):
+    """One Dice+CE epoch (bf16 autocast on CUDA). optimizer=None -> eval pass."""
+    train_mode = optimizer is not None
+    model.train() if train_mode else model.eval()
+    losses = []
+    amp = device.type == "cuda"
+    ctx = torch.enable_grad() if train_mode else torch.no_grad()
+    with ctx:
+        for batch in loader:
+            data = batch["data"][0].float().to(device, non_blocking=True)   # [b, c, H, W]
+            target = batch["seg"][0].long().to(device, non_blocking=True)   # [b, 1, H, W]
+            if train_mode:
+                optimizer.zero_grad()
+            with (torch.autocast("cuda", dtype=torch.bfloat16) if amp else contextlib.nullcontext()):
+                pred = model(data)
+                pred_softmax = F.softmax(pred, dim=1)
+                loss = dice_loss(pred_softmax, target.squeeze()) + ce_loss(pred, target.squeeze())
+            if train_mode:
+                loss.backward()
+                optimizer.step()
+            losses.append(loss.item())
+    return float(np.mean(losses)) if losses else float("nan")
+
+
+def evaluate_test(model, loader, device, json_path):
+    """Deterministic per-case metrics -> <json_path> (same schema as the baseline).
+    aggregate_scores/Evaluator are imported lazily so training does not pay for
+    pandas / SimpleITK, and so this module stays free of any morph import."""
+    from evaluation.evaluator import aggregate_scores, Evaluator
+
+    model.eval()
+    pred_dict, gt_dict = defaultdict(list), defaultdict(list)
+    with torch.no_grad():
+        for batch in loader:
+            data = batch["data"][0].float().to(device)
+            target = batch["seg"][0].float().to(device)
+            pred = model(data)
+            pred_argmax = torch.argmax(pred.data.cpu(), dim=1, keepdim=True)
+            for i, fname in enumerate(batch["fnames"]):
+                pred_dict[fname[0]].append(pred_argmax[i].numpy())
+                gt_dict[fname[0]].append(target[i].detach().cpu().numpy())
+    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]
+    scores = aggregate_scores(pairs, evaluator=Evaluator, labels=config.LABELS,
+                              json_output_file=json_path, json_author="cv-project",
+                              json_task=config.TASK, advanced=True)
+    return scores

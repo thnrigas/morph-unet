@@ -6,6 +6,8 @@ Morphology is injected at three levels. At the input, residuals are added as ext
 
 All soft-morphology blocks approximate dilation/erosion via logsumexp with a temperature that is annealed during training to avoid the dead gradient problem. Every morphological block ships with a parameter-matched linear control (`convsep`, `convctrl`) so that gains can be attributed to morphology rather than to extra capacity. The pipeline reports segmentation and training-cost/convergence metrics, includes an MC-Dropout branch for predictive uncertainty, and a structural channel-pruning suite for measuring how much of a morphological network is actually load-bearing.
 
+Three further experiment tracks share this codebase and are documented in sections 7-9: **uncertainty quantification and calibration** with MC-Dropout on Hippocampus and Spleen (`uncertainty/`), **loss-function experiments** on Hepatic Vessel (`train_losses.py`), and **traditional (non-neural) segmentation plus U-Net hybrids** on Spleen (`tradseg/`). They share the preprocessing utilities, the seeded split generation (`datasets/create_splits.py`) and the evaluator, so scores are computed the same way. Only the loss track runs on the same MSD task as the morphological experiments, and each track keeps its own training loop and sampling policy — so read each track's comparisons internally rather than against the morphological tables.
+
 Splits are a seeded 5-fold cross validation (`datasets/create_splits.py`); the reported experiments use folds 0-2, and most of the block/pruning exploration ran on fold 0 only. The main task throughout is MSD **Task08 Hepatic Vessel** (vessel + tumour); select another with the `TASK` environment variable.
 
 ## Setup
@@ -291,6 +293,120 @@ python3 train_eval.py --compare baseline_mean_scores.json staticbank_mean_scores
     morphbank_mean_scores.json convctrl_mean_scores.json \
     morphunet_bottleneck_mean_scores.json morphunet_balanced_mean_scores.json \
     morphunet_deep_mean_scores.json
+```
+
+## 7. Uncertainty quantification and calibration (`uncertainty/`)
+
+Predictive uncertainty of a plain U-Net via **MC-Dropout**, and whether **calibration** improves it.
+Two MSD datasets run independently: **Hippocampus** (Task04, the un-suffixed scripts) and
+**Spleen** (Task09, the `_spleen` scripts). For each, two models are compared:
+
+- `mcdropout` — baseline MC-Dropout U-Net (Dice + CE)
+- `mcdropout_cal` — train-time calibrated variant (Dice + CE + λ·soft-binned-ECE)
+
+Both are reported as **Dice** (deterministic) plus foreground/macro **ECE**, before and after
+post-hoc **temperature scaling**. The network is `networks/UNET_mc.py` (baseline depth/filters,
+`nn.Dropout2d` at the two deep encoder skips, the bottleneck and the two deep decoder blocks,
+kept active at inference).
+
+Training runs on this track's own loop (`uncertainty/mc_common.py`), not `train_eval.py`'s: no
+gradient clipping and no class-balanced foreground oversampling, so the reported calibration
+numbers are not perturbed by a training class prior that differs from the test one. That also
+keeps the track free of any morphological import.
+
+One command per dataset:
+
+```
+nohup bash run/run_all_hippocampus.sh &
+nohup bash run/run_all_spleen.sh &
+```
+
+Manual, one fold (swap the `_spleen` scripts and `TASK` for spleen):
+
+```
+export TASK=Task04_Hippocampus
+
+python3 uncertainty/run_preprocessing_mc.py
+
+python3 uncertainty/train_mc.py --fold 0 --tag mcdropout --dropout-p 0.4 --out-dir results
+python3 uncertainty/train_mc_recalibrate.py --fold 0 --tag mcdropout_cal --dropout-p 0.4 --cal-weight 1.0 --out-dir results
+
+python3 uncertainty/test_mc.py --fold 0 --tag mcdropout --out-dir results
+python3 uncertainty/uncertainty_mc.py --fold 0 --tag mcdropout --out-dir results --mc-samples 30 --temperature 1.0 --save-volumes
+python3 uncertainty/calibrate_mc.py --fold 0 --tag mcdropout --out-dir results
+python3 uncertainty/uncertainty_mc.py --fold 0 --tag mcdropout --out-dir results --mc-samples 30 --save-volumes
+```
+
+`calibrate_mc*.py` fits a single temperature on the val fold (with a `[0.5, 10]` safety rail,
+`utilities/mc_calibration.py`) and writes `<tag>_f<fold>_temperature.json`; `uncertainty_mc*.py`
+auto-loads it and writes a separate `_cal` output set, so raw and recalibrated sit side by side.
+The spleen track adds `datasets/two_dim/NumpyDataLoader_spleen.py`, which trains only on
+organ-bearing slices (widened by `--fg-margin` neighbours) — most abdominal CT slices contain no
+spleen — while val/test still score every slice.
+
+## 8. Loss-function experiments (`train_losses.py`)
+
+Does swapping **only the loss** beat Dice + CE on the thin, tree-like structures of Task08
+Hepatic Vessel? Same network (`networks/UNET.py`), budget, seed and data across combos.
+Reported before and after 3D connected-component post-processing.
+
+- `dice_ce` — baseline (Soft Dice + CE)
+- `ftversky_ce_boundary` — Focal-Tversky + CE + λ·Boundary (SDF)
+- `cldice_dice_ce` — clDice + Dice + CE (shipped; not in the default driver)
+
+```
+nohup bash run/run_losses.sh &
+```
+
+Manual, one fold:
+
+```
+export TASK=Task08_HepaticVessel
+
+python3 run_preprocessing_losses.py
+
+python3 train_losses.py --loss dice_ce --fold 0 --out-dir results
+python3 train_losses.py --loss ftversky_ce_boundary --fold 0 --out-dir results
+
+python3 test_losses.py --tag dice_ce --fold 0 --pp-min-size 50 --out-dir results
+python3 test_losses.py --tag ftversky_ce_boundary --fold 0 --pp-min-size 50 --out-dir results
+
+python3 losses_fold_eval.py --fold-mean dice_ce
+python3 losses_fold_eval.py --fold-mean ftversky_ce_boundary
+python3 losses_fold_eval.py --compare dice_ce_mean_scores.json ftversky_ce_boundary_mean_scores.json
+```
+
+Shared plumbing is `pipeline_loss.py` (loaders, train/val/test engine); the losses are
+`loss_functions/{boundary,cldice,tversky}_loss.py`. `losses_fold_eval.py` is the aggregator for
+this track — it reads the flat `results/`, unlike `train_eval.py --fold-mean`, which reads
+`results/<TASK>/`.
+
+This track shares the task, network, image preprocessing, splits and evaluator with the
+morphological experiments, and `run_losses.sh` uses matching hyperparameters (patch 128,
+batch 16, lr 2e-4, 400 epochs, patience 30, grad clip 5.0, fg-fraction 0.33). It still trains
+on its own engine and its own loader fork, whose foreground crop puts the target at a random
+position in the patch instead of centring it, so the training crops are not the same draws as
+`train_eval.py`'s. Read the loss comparisons against this track's own `dice_ce` row rather
+than against the morphological tables.
+
+## 9. Traditional segmentation, U-Net comparison and hybrids (`tradseg/`)
+
+Classical (non-neural) segmentation for MSD Task09 Spleen, scored per volume in the **same
+256×256 space and 5-fold CV** as the baseline U-Net, so the numbers are directly comparable —
+plus **hybrids** where the U-Net is refined by a traditional method (random walker / level set)
+inside an uncertainty- or morphology-anchored band. Self-contained subfolder with its own
+`config.py` and `requirements.txt`; run the scripts from inside it. Full detail in
+[`tradseg/README.md`](tradseg/README.md).
+
+```
+pip install -r tradseg/requirements.txt # + tradseg/unets/requirements-unet.txt for B/C
+cd tradseg
+
+nohup bash run_tier1.sh & # otsu, multiotsu, kmeans, gmm, region_growing, watershed
+nohup bash run_tier2.sh & # chanvese, morphgac, graphcut, random_walker
+nohup bash run_tier3.sh & # gabor, amfm, granulometry
+
+nohup bash unets/run_all.sh & # U-Net baseline + MC-Dropout + both hybrids, one comparison table
 ```
 
 ## Attribution & License

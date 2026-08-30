@@ -37,10 +37,12 @@ def enable_dropout(model):
 # 2. T stochastic passes
 #
 @torch.no_grad()
-def mc_forward(model, data, T):
+def mc_forward(model, data, T, temperature=1.0):
     """T stochastic forward passes -> softmax probabilities stacked as
-    [T, B, C, H, W]. Assumes enable_dropout(model) has already been called."""
-    samples = [F.softmax(model(data), dim=1) for _ in range(T)]
+    [T, B, C, H, W]. Assumes enable_dropout(model) has already been called.
+    Logits are divided by `temperature` before softmax (T>1 softens): post-hoc
+    temperature-scaling recalibration (Guo et al. 2017); temperature=1.0 is a no-op."""
+    samples = [F.softmax(model(data) / temperature, dim=1) for _ in range(T)]
     return torch.stack(samples, dim=0)
 
 
@@ -83,6 +85,28 @@ def uncertainty_maps(probs):
 
 
 #
+# recalibration: fit a single temperature (Guo et al. 2017)
+#
+def fit_temperature(logits, targets, max_iter=200, lr=0.1):
+    """Fit a scalar temperature T>0 minimising the NLL of softmax(logits / T) on
+    the given pixels (pass FOREGROUND pixels only, else background dominates and
+    T stays ~1). logits: [N, C], targets: [N] long. Returns float T.
+    Does not change argmax -> segmentation / Dice are unaffected."""
+    log_t = torch.zeros(1, requires_grad=True)          # optimise log T so T = exp(.) > 0
+    optimizer = torch.optim.LBFGS([log_t], lr=lr, max_iter=max_iter)
+    ce = nn.CrossEntropyLoss()
+
+    def closure():
+        optimizer.zero_grad()
+        loss = ce(logits / log_t.exp(), targets)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return float(log_t.exp().item())
+
+
+#
 # calibration (foreground-focused, for segmentation)
 #
 # Plain pixel-wise ECE is dominated by the easy, high-confidence background, so
@@ -90,9 +114,9 @@ def uncertainty_maps(probs):
 # therefore restrict to the foreground and report, all streamed incrementally:
 #   - foreground ECE : top-label confidence vs correctness, over the foreground
 #                      ROI only (gt>0 OR pred>0)
-#   - class-wise ECE : per foreground class c, how calibrated is p_c as the
-#                      probability of "pixel is c", over that class's ROI
-#                      (gt==c OR pred==c); plus their macro-average
+#   - class-wise ECE : per foreground class c, one-vs-rest -- how calibrated is
+#                      p_c as the probability of "pixel is c", over the SAME
+#                      foreground ROI (gt>0 OR pred>0); plus their macro-average
 #   - global ECE     : all pixels, kept ONLY as a reference baseline
 #
 class _Bins:
@@ -138,12 +162,14 @@ class SegCalibration:
 
         roi = (gt > 0) | (pred > 0)                                   # foreground union
         if roi.any():
+            # foreground: top-label confidence vs correctness
             self.fg.add(conf_top[roi], (pred[roi] == gt[roi]).float())
-
-        for c, bins in self.cls.items():                             # per-class, on its ROI
-            roi_c = (gt == c) | (pred == c)
-            if roi_c.any():
-                bins.add(mean_prob[:, c][roi_c], (gt[roi_c] == c).float())
+            # per-class: one-vs-rest over the SAME foreground ROI. Using this union
+            # region (not a class-specific gt==c|pred==c mask) avoids a selection
+            # bias: with a class-specific mask the low-p_c bins would contain only
+            # missed gt==c pixels (event trivially 1) -> a fake accuracy=1 artifact.
+            for c, bins in self.cls.items():
+                bins.add(mean_prob[:, c][roi], (gt[roi] == c).float())
 
     def curves(self, class_names=None):
         """Ordered [(name, bin_acc, bin_conf, count, ece), ...] for plotting:

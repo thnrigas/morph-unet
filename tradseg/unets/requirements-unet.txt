@@ -1,0 +1,7 @@
+# Extra deps for the U-Net / hybrid part, ON TOP of ../requirements.txt.
+#
+# torch is assumed PRE-INSTALLED (with CUDA) on the GCP Deep Learning VM and is NOT listed
+# here so we do not clobber it. If you run locally/CPU, install a torch build yourself.
+# batchgenerators is only needed for TRAINING (the elastic augmentation); inference
+# (predictor/test/infer) needs only torch + numpy.
+batchgenerators==0.21

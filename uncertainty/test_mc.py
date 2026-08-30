@@ -2,10 +2,8 @@
 # Test the MC-Dropout U-Net -- classic metrics only (deterministic)
 #
 # Loads a trained checkpoint, runs a SINGLE deterministic forward pass with
-# dropout OFF (model.eval()), and writes the same <tag>_f<fold>_scores.json as
-# the baseline. That means the existing aggregation utilities work unchanged:
-#   python train_eval.py --fold-mean mcdropout
-#   python train_eval.py --compare baseline_mean_scores.json mcdropout_mean_scores.json
+# dropout OFF (model.eval()), and writes a <tag>_f<fold>_scores.json (Dice/ASSD
+# per class). The Dice/ECE summary across settings is produced by run_all_hippocampus.sh.
 #
 # The stochastic / uncertainty side lives in uncertainty_mc.py.
 #
@@ -21,8 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from train_eval import pick_device, evaluate_test
-from mc_common import build_plain_loaders
+from mc_common import build_plain_loaders, pick_device, evaluate_test
 from networks.UNET_mc import MCDropoutUNet
 
 
@@ -32,8 +29,8 @@ def main():
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--patch-size", type=int, default=64)
-    p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--dropout-p", type=float, default=0.2)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--dropout-p", type=float, default=0.4)
     p.add_argument("--num-classes", type=int, default=config.NUM_CLASSES)
     p.add_argument("--out-dir", default=os.path.join(config.PROJECT_ROOT, "results"))
     p.add_argument("--ckpt", default=None,

@@ -1,12 +1,21 @@
 #
 # MC-Dropout U-Net
 #
-# Architecturally identical to networks/UNET.py (same depth / filter counts, so
-# its scores are directly comparable to the baseline) with a SINGLE addition:
-# an nn.Dropout2d layer inside the bottleneck ("center"). That dropout is kept
-# ACTIVE at inference time (see utilities/mc_dropout.enable_dropout) so we can
-# draw T stochastic forward passes and estimate predictive uncertainty
-# (Monte-Carlo Dropout, Gal & Ghahramani 2016).
+# Same depth / filter counts as networks/UNET.py (scores stay comparable to the
+# baseline) with added nn.Dropout2d layers, kept ACTIVE at inference so we can
+# draw T stochastic passes for uncertainty (Monte-Carlo Dropout, Gal &
+# Ghahramani 2016; Bayesian SegNet, Kendall et al. 2015).
+#
+# Dropout is placed at the DEEP layers only, at 5 points:
+#   - encoder: after contr_3 and contr_4  (perturbs the deep SKIP features + the
+#              downstream path -- the skips are what bottleneck-only dropout could
+#              not reach, which is why the epistemic signal was ~0 before)
+#   - bottleneck: inside center
+#   - decoder: after expand_4 and expand_3 (the two blocks nearest the bottleneck)
+# The shallow high-res layers (contr_1/2, expand_1/2) are left clean to preserve
+# boundary detail. Dropout has NO learnable parameters -> the weight count is
+# identical to the baseline; only regularisation (train) and stochasticity
+# (inference) change.
 #
 # Derived from the DKFZ basic_unet_example UNet. Apache License 2.0.
 #
@@ -18,9 +27,17 @@ import torch.nn as nn
 class MCDropoutUNet(nn.Module):
 
     def __init__(self, num_classes, in_channels=1, initial_filter_size=64,
-                 kernel_size=3, dropout_p=0.2, do_instancenorm=True):
+                 kernel_size=3, dropout_p=0.4, do_instancenorm=True):
         super().__init__()
         self.dropout_p = dropout_p
+
+        # MC dropout on the deep encoder skips + deep decoder blocks (the bottleneck
+        # one lives inside self.center). These perturb the features that actually
+        # reach the decoder, so the T MC samples differ -> real epistemic signal.
+        self.drop_enc3 = nn.Dropout2d(p=dropout_p)
+        self.drop_enc4 = nn.Dropout2d(p=dropout_p)
+        self.drop_dec4 = nn.Dropout2d(p=dropout_p)
+        self.drop_dec3 = nn.Dropout2d(p=dropout_p)
 
         self.contr_1_1 = self.contract(in_channels, initial_filter_size, kernel_size, instancenorm=do_instancenorm)
         self.contr_1_2 = self.contract(initial_filter_size, initial_filter_size, kernel_size, instancenorm=do_instancenorm)
@@ -98,9 +115,11 @@ class MCDropoutUNet(nn.Module):
         pool = self.pool(contr_2)
 
         contr_3 = self.contr_3_2(self.contr_3_1(pool))
+        contr_3 = self.drop_enc3(contr_3)          # dropout on the deep skip + downstream
         pool = self.pool(contr_3)
 
         contr_4 = self.contr_4_2(self.contr_4_1(pool))
+        contr_4 = self.drop_enc4(contr_4)          # dropout on the deep skip + downstream
         pool = self.pool(contr_4)
 
         center = self.center(pool)
@@ -108,11 +127,13 @@ class MCDropoutUNet(nn.Module):
         crop = self.center_crop(contr_4, center.size()[2], center.size()[3])
         concat = torch.cat([center, crop], 1)
         expand = self.expand_4_2(self.expand_4_1(concat))
+        expand = self.drop_dec4(expand)            # dropout in the deep decoder block
         upscale = self.upscale4(expand)
 
         crop = self.center_crop(contr_3, upscale.size()[2], upscale.size()[3])
         concat = torch.cat([upscale, crop], 1)
         expand = self.expand_3_2(self.expand_3_1(concat))
+        expand = self.drop_dec3(expand)            # dropout in the deep decoder block
         upscale = self.upscale3(expand)
 
         crop = self.center_crop(contr_2, upscale.size()[2], upscale.size()[3])

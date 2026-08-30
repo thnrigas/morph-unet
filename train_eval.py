@@ -689,6 +689,10 @@ def main():
     p.add_argument("--fold", type=int, default=0)
     p.add_argument("--train-cases", type=int, default=0)   # 0 = full split; N>0 = data-efficiency point
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--finetune-from", metavar="CKPT",
+                   help="warm-start the model weights from this checkpoint (a _best.pth state-dict or "
+                        "a _last.pth full-state), then train fresh (new optimizer/scheduler at --lr). "
+                        "Use with --morph-relu to fine-tune a LeakyReLU model into a ReLU one cheaply")
     p.add_argument("--test-only", action="store_true")
     # eval-time robustness stress (reuses trained weights, no retraining): perturb the input image
     # then re-score. scores are written under a perturb-suffixed tag so the clean run isn't clobbered
@@ -832,6 +836,20 @@ def main():
         for n, p in model.named_parameters():
             if n.endswith(".se"):
                 p.requires_grad_(False)
+
+    # warm start from an arbitrary checkpoint, then train fresh (--resume continues a run instead)
+    if args.finetune_from and not args.resume:
+        if not os.path.exists(args.finetune_from):
+            raise SystemExit(f"--finetune-from: no such file {args.finetune_from}")
+        ck = torch.load(args.finetune_from, map_location=device)
+        if isinstance(ck, dict) and "model" in ck:      # a full-state _last.pth
+            ck = ck["model"]
+        missing, unexpected = model.load_state_dict(ck, strict=False)
+        if missing or unexpected:
+            print(f"  [finetune] WARNING partial load: {len(missing)} missing, "
+                  f"{len(unexpected)} unexpected params")
+        print(f"warm-started weights from {args.finetune_from} "
+              f"(fresh optimizer/scheduler @ lr={args.lr:g})")
 
     # <tag>_f<fold>_{best.pth,last.pth,scores.json}; a data-efficiency point trains its own model,
     # so fold N into the tag (run_tag) to keep its checkpoint/scores separate from the full-data run

@@ -7,6 +7,9 @@ data
 docs
 papers
 **__init__.py
+# ...except tradseg's, which are real code (the method REGISTRY), not empty markers
+!tradseg/__init__.py
+!tradseg/methods/__init__.py
 results
 *.log
 **__pycache__
