@@ -70,17 +70,24 @@ class LinearAttention2d(nn.Module):
 
 class LinAttnGate(nn.Module):
     #
-    # Refine an encoder skip `x` with the decoder context `g` via linear cross-attention,
-    # residually with a ReZero gate. Returns a skip of the SAME shape as `x` (so the usual
-    # skip-concat in the decoder is unchanged). gamma init 0 -> starts as the plain skip.
+    # Refine an encoder skip `x` with linear attention, residually with a ReZero gate. Returns a
+    # skip of the SAME shape as `x` (so the usual skip-concat in the decoder is unchanged).
+    # gamma init 0 -> starts as the plain skip.
+    # source : where the QUERY comes from; keys/values always come from the skip `x`.
+    #   "cross" - the decoder context `g` (the upsampled decoder feature): cross-attention
+    #   "self"  - the skip `x` itself: self-attention, `g` is ignored
+    # Same parameters either way (only the input to to_q changes), so the two are matched.
     #
-    def __init__(self, ch, heads=4, gamma_init=0.0):
+    def __init__(self, ch, heads=4, gamma_init=0.0, source="cross"):
         super().__init__()
+        assert source in ("cross", "self"), "source must be 'cross' or 'self'"
+        self.source = source
         self.attn = LinearAttention2d(ch, heads=heads)
         self.gamma = nn.Parameter(torch.full((1,), float(gamma_init)))
 
     def forward(self, g, x):
-        return x + self.gamma * self.attn(g, x)
+        q = x if self.source == "self" else g
+        return x + self.gamma * self.attn(q, x)
 
 
 class LinAttnUNet(nn.Module):
@@ -88,14 +95,15 @@ class LinAttnUNet(nn.Module):
     # Plain-conv U-Net (same channel schedule as MorphUNet) with a LinAttnGate on every skip.
     # conv_stem lifts the raw input to fs before enc1 (matches morph_unet's conv_stem option).
     # heads : number of linear-attention heads per skip gate.
+    # source : "cross" (query = upsampled decoder feature) or "self" (query = the skip), see LinAttnGate.
     #
     def __init__(self, num_classes, in_channels=1, fs=64, conv_stem=True, heads=4, act="leaky",
-                 gamma_init=0.0):
+                 gamma_init=0.0, source="cross"):
         super().__init__()
         def cstage(i, o):
             return Stage(i, o, mode="conv", act=act)
         def gate(ch):
-            return LinAttnGate(ch, heads=heads, gamma_init=gamma_init)
+            return LinAttnGate(ch, heads=heads, gamma_init=gamma_init, source=source)
 
         self.stem = ConvUnit(in_channels, fs, act=act) if conv_stem else nn.Identity()
         enc1_in = fs if conv_stem else in_channels

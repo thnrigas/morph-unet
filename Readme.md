@@ -14,9 +14,41 @@ Splits are a seeded 5-fold cross validation (`datasets/create_splits.py`); the r
 
 Data available in http://medicaldecathlon.com. Place in `./data/` or add path to config.
 
+### Environment
+
+`environment.yml` pins the versions verified on 2026-10-22 (Python 3.12) and installs torch 2.14.1
+built for CUDA 12.6. That build runs on Turing and newer GPUs (RTX 2080 Ti, RTX 3060, ...) with an
+NVIDIA driver >= 525.
+
 ```
-pip install -r requirements.txt
+conda env create -f environment.yml
+conda activate morph-unet
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
+
+`requirements.txt` (unpinned) still works for a plain `pip install -r requirements.txt`. On Linux it
+pulls the default PyPI torch, which is built for CUDA 13 and needs driver >= 580.
+
+On the CVSP GPU cluster (Kalymnos, Halki):
+
+- Check the driver with `nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv`.
+  Kalymnos: 1x RTX 2080 Ti (11 GB) and 3x RTX 3060 (12 GB), driver 550.163.
+- `/home` is limited to about 30 GB, and the CUDA build of torch with its libraries takes several GB.
+  Create the environment with `PIP_NO_CACHE_DIR=1 conda env create -f environment.yml`, or run
+  `pip cache purge` afterwards.
+- Keep the repository, data and results on `/gpu-data2/<username>` (Kalymnos) or
+  `/gpu-data/<username>` (Halki), not in `/home`. Results are written to `results/` next to the code;
+  the data location can be set with `DATA_DIR`.
+- Use one GPU: check which are free, then `export CUDA_VISIBLE_DEVICES=<id>` in every new shell, and
+  `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to limit allocator fragmentation.
+- The Task08 defaults (`config.py`) are `--batch-size 12 --val-batch 4`, sized for these 11-12 GB cards.
+  With the attention gates at k=3, training peaks at roughly 5 GB. Runs before 2026-10-22 used batch 24
+  (12 for the attention arms) and val-batch 12; pass those explicitly to reproduce them. Each epoch line
+  ends with the peak GPU memory, `vram train=<allocated>/<reserved>GB val=...`. Keep gradient
+  checkpointing on (no `--morph-no-checkpoint`).
+- Training uses bf16 autocast on CUDA. The RTX 3060 (Ampere) supports bf16 natively; the RTX 2080 Ti
+  (Turing) does not, so bf16 there is emulated and slower. Prefer the 3060s, and if you use the
+  2080 Ti, check a 1-2 epoch run first.
 
 ```
 python3 run_preprocessing.py
@@ -71,7 +103,12 @@ any other value places morphology at that capacity `config`.
 | `--morph-k K` | structuring-element / kernel size (we used 3) |
 | `--morph-conv-stem` | 3x3 conv stem before any morphology (**off by default**, see note) |
 | `--lin-attn`, `--lin-attn-gamma-init G` | linear cross-attention gates on the skips, ReZero init `G` |
+| `--lin-attn-src {cross,self}` | query of the linear gate: the upsampled decoder feature (`cross`, default) or the skip itself (`self`) |
 | `--morph-attn`, `--morph-attn-warm W` | morphological self-gating on the skips, warm-start strength `W` |
+| `--morph-attn-k K [K K K]` | SE size of the attention top-/bottom-hats (odd; default 3), one for all skips or four for enc1..enc4. Independent of `--morph-k` |
+| `--morph-attn-pad {neutral,zero}` | border handling of the attention morphology (default `neutral`; `zero` reproduces the earlier runs) |
+| `--morph-attn-src {self,cross}` | which feature the attention hats are computed on: the skip (`self`, default) or the upsampled decoder feature (`cross`); the gate always multiplies the skip |
+| `--morph-attn-reflect {on,off}` | dilation with the reflected SE, so the hats come from true openings/closings (default `on`; `off` reproduces the earlier runs) |
 
 > **Note on `--morph-conv-stem`.** The stem is opt-in here. Runs recorded in `results/results.md`
 > predate it and were trained without it, so leaving it off keeps them reproducible. The banner printed
@@ -146,6 +183,14 @@ python3 train_eval.py --tag unet_linattn     --fold 0 --morph-unet none --lin-at
 python3 train_eval.py --tag unet_linattn_g05 --fold 0 --morph-unet none --lin-attn --lin-attn-gamma-init 0.5
 ```
 
+`--lin-attn-src self` turns the gate into linear **self**-attention: the query comes from the skip
+itself instead of the decoder, `y = x + gamma * attn(x, x)`. Keys and values are the skip in both modes,
+and the parameters are identical, so self and cross differ only in where the query comes from.
+
+```
+python3 train_eval.py --tag unet_linself_g05 --fold 0 --morph-unet none --lin-attn --lin-attn-src self --lin-attn-gamma-init 0.5
+```
+
 ### Morphological-attention U-Net (`--morph-attn`)
 
 The morphological analogue: each skip is gated by its own top-hat / bottom-hat saliency.
@@ -159,6 +204,49 @@ python3 train_eval.py --tag unet_morphattn     --fold 0 --morph-unet none --morp
 # warm-started gate (analogue of gamma = 0.5)
 python3 train_eval.py --tag unet_morphattn_g05 --fold 0 --morph-unet none --morph-attn --morph-k 3 --morph-attn-warm 0.5
 ```
+
+`--morph-attn-src cross` is the cross-attention version of the same gate: the top-hat/bottom-hat
+are computed on the upsampled decoder feature instead of the skip, and the resulting gate multiplies
+the skip, `x * 2*sigmoid(W [tophat(g); bothat(g)] + b)`. Same parameters as self. It needs the identity
+init (`--morph-attn-warm 0`, the default): the warm init pairs hat channel c with skip channel c, which
+is meaningless when the hats come from the decoder, so that combination is refused.
+
+```
+python3 train_eval.py --tag unet_morphcross --fold 0 --morph-unet none --morph-attn --morph-attn-src cross
+```
+
+The hats use a 3x3 structuring element by default. `--morph-attn-k` sets it, either one size for every
+skip or one per skip (enc1..enc4). `--morph-k` does not reach the gates; it only sizes the backbone's
+morphological stages, and with `--morph-unet none` there are none.
+
+```
+# 7x7 hats on every skip
+python3 train_eval.py --tag unet_morphattn_k7 --fold 0 --morph-unet none --morph-attn --morph-attn-k 7
+
+# larger SE on the high-resolution skips, 3x3 on the deep ones
+python3 train_eval.py --tag unet_morphattn_k7733 --fold 0 --morph-unet none --morph-attn --morph-attn-k 7 7 3 3
+```
+
+At the patch border the gate morphology pads with each operator's neutral element (-inf for dilation,
++inf for erosion) and normalises the soft max/min by the number of in-image neighbours, so the hats
+have no border rim. The earlier `unet_morphattn*` runs used zero padding, which pulls the erosion
+towards 0 at the border and makes a top-hat ring around every patch. Pass `--morph-attn-pad zero` to
+reproduce or re-evaluate them (padding has no weights, so their checkpoints load either way but only
+`zero` computes what they were trained with).
+
+The gate's dilation and erosion form the adjoint pair of max-plus convolution and min-plus correlation,
+`(f ⊕ g)(x) = max_y f(y) + g(x−y)` and `(f ⊖ g)(x) = min_y f(y) − g(y−x)`, so the dilation reads the
+SE reflected. The earlier runs used the unreflected SE in both, which stops opening/closing from being
+true openings/closings once the learned SE becomes asymmetric. To reproduce or re-evaluate those runs,
+pass both legacy settings:
+
+```
+python3 train_eval.py --tag unet_morphattn --fold 0 --test-only --morph-unet none --morph-attn \
+    --morph-attn-pad zero --morph-attn-reflect off
+```
+
+`utilities/se_asymmetry.py <checkpoint.pth> [...]` reports, per gate, how asymmetric the trained SEs
+are, which bounds how far those earlier hats could be from true top-/bottom-hats.
 
 ## 4. Channel pruning (`prune.py`)
 

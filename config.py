@@ -24,7 +24,9 @@ _HP = {
     "Task05_Prostate": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
     "Task06_Lung": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66, grad_clip=2.0),
     "Task07_Pancreas": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.50, grad_clip=2.0),
-    "Task08_HepaticVessel": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=24, patch_size=128, fg_fraction=0.33, grad_clip=5.0),
+    # batch 12 / val_batch 4 fit the 11-12 GB cards of the CVSP cluster (RTX 2080 Ti / 3060) for every
+    # attention arm at k=3; runs before 2026-10-22 used batch 24 (12 for the attention arms) and val 12
+    "Task08_HepaticVessel": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=12, val_batch=4, patch_size=128, fg_fraction=0.33, grad_clip=5.0),
     "Task09_Spleen": dict(epochs=300, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.33),
     "Task10_Colon": dict(epochs=400, patience=30, iters_per_epoch=250, batch_size=16, patch_size=128, fg_fraction=0.66, grad_clip=2.0),
 }

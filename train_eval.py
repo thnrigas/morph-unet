@@ -229,6 +229,16 @@ def run_epoch(model, loader, device, dice_loss, ce_loss, optimizer=None, morph_l
     return float(np.mean(losses)) if losses else float("nan")
 
 #
+# peak GPU memory since the last reset (CUDA only), as "allocated/reserved" in GB: allocated is what
+# the tensors needed, reserved is what PyTorch's caching allocator held (closer to nvidia-smi, which
+# also adds the ~0.5 GB CUDA context). Lets batch / val-batch choices be checked against the card.
+#
+def _vram(device):
+    gb = 1024 ** 3
+    return (f"{torch.cuda.max_memory_allocated(device) / gb:.2f}/"
+            f"{torch.cuda.max_memory_reserved(device) / gb:.2f}GB")
+
+#
 # validation on full slices with global foreground Dice
 #
 def run_val_dice(model, loader, device, num_classes):
@@ -637,9 +647,27 @@ def main():
     p.add_argument("--morph-attn-warm", type=float, default=0.0,
                    help="warm-start the morph-attention gate: 0 = identity (plain skip), "
                         "0.5 = morphology at half strength from step 0")
-    p.add_argument("--lin-attn", action="store_true")       # plain-conv U-Net, linear-attention skips
+    p.add_argument("--morph-attn-k", type=int, nargs="+", default=[3], metavar="K",
+                   help="SE size of the top-hat/bottom-hat gates (odd): one value for all four skips, "
+                        "or four for att1..att4 (enc1..enc4), e.g. 7 7 3 3. Independent of --morph-k")
+    p.add_argument("--morph-attn-pad", choices=["neutral", "zero"], default="neutral",
+                   help="border handling of the gate morphology: 'neutral' = -inf/+inf (the max/min "
+                        "identity) with a log-mean-exp, no border rim; 'zero' = the original zero "
+                        "padding, needed to reproduce or re-evaluate the earlier unet_morphattn* runs")
+    p.add_argument("--morph-attn-src", choices=["self", "cross"], default="self",
+                   help="feature the gate's top-/bottom-hats are computed on: 'self' = the skip, "
+                        "'cross' = the upsampled decoder feature; the gate always multiplies the skip. "
+                        "'cross' requires --morph-attn-warm 0")
+    p.add_argument("--morph-attn-reflect", choices=["on", "off"], default="on",
+                   help="'on' = dilation uses the reflected SE (the adjoint of the erosion), so the hats "
+                        "come from true openings/closings; 'off' = the original code, needed to "
+                        "reproduce or re-evaluate the earlier unet_morphattn* runs")
+    p.add_argument("--lin-attn", action="store_true")      # plain-conv U-Net, linear-attention skips
     p.add_argument("--lin-attn-heads", type=int, default=4)
     p.add_argument("--lin-attn-gamma-init", type=float, default=0.0)   # ReZero skip gate init
+    p.add_argument("--lin-attn-src", choices=["cross", "self"], default="cross",
+                   help="query of the linear skip attention: 'cross' = the upsampled decoder feature, "
+                        "'self' = the skip itself (keys/values are always the skip)")
     # morph parameters
     p.add_argument("--morph-k", type=int, default=5)
     p.add_argument("--morph-k-max", type=int, default=11)
@@ -714,6 +742,12 @@ def main():
         return
     if not args.tag:
         p.error("--tag is required")
+    if len(args.morph_attn_k) not in (1, 4) or any(k < 1 or k % 2 == 0 for k in args.morph_attn_k):
+        p.error("--morph-attn-k takes one or four odd sizes (e.g. 3, or 7 7 3 3)")
+    if args.morph_attn and args.morph_attn_src == "cross" and args.morph_attn_warm > 0:
+        p.error("--morph-attn-src cross cannot be combined with --morph-attn-warm > 0: the warm init "
+                "pairs hat channel c with skip channel c, which is meaningless when the hats come from "
+                "the decoder. Use the default identity init (--morph-attn-warm 0)")
     # ReLU runs write to a *_relu tag so the LeakyReLU checkpoints/scores are never overwritten
     if args.morph_relu and not args.tag.endswith("_relu"):
         args.tag += "_relu"
@@ -800,7 +834,7 @@ def main():
         # to the morphological attention net. No morphology, so the SE/beta/impl flags don't apply
         model = LinAttnUNet(num_classes=config.NUM_CLASSES, in_channels=in_channels,
                             conv_stem=args.morph_conv_stem, heads=args.lin_attn_heads,
-                            gamma_init=args.lin_attn_gamma_init,
+                            gamma_init=args.lin_attn_gamma_init, source=args.lin_attn_src,
                             act="relu" if args.morph_relu else "leaky").to(device)
     elif args.morph_unet:
         # morphological-separable U-Net, conv stages replaced by depthwise soft morphology
@@ -815,8 +849,13 @@ def main():
                           checkpoint=not args.morph_no_checkpoint, impl=args.morph_impl,
                           act="relu" if args.morph_relu else "leaky",
                           dropout=args.morph_dropout)
-        if args.morph_attn:                                  # attn_warm only exists on the attention net
+        if args.morph_attn:                                  # attn_* only exist on the attention net
             net_kwargs["attn_warm"] = args.morph_attn_warm
+            ak = args.morph_attn_k
+            net_kwargs["attn_k"] = ak[0] if len(ak) == 1 else tuple(ak)
+            net_kwargs["attn_pad"] = args.morph_attn_pad
+            net_kwargs["attn_reflect"] = args.morph_attn_reflect == "on"
+            net_kwargs["attn_src"] = args.morph_attn_src
         model = Net(**net_kwargs).to(device)
     elif args.morph_bank:
         # trainable morph bank spanning the full library (exact / reconstruction / vdome-
@@ -857,7 +896,7 @@ def main():
     stem = f"{run_tag}_f{args.fold}"
     if args.lin_attn:
         mode = (f"lin-attn(heads={args.lin_attn_heads},stem={args.morph_conv_stem},"
-                f"gamma0={args.lin_attn_gamma_init:g})")
+                f"gamma0={args.lin_attn_gamma_init:g},src={args.lin_attn_src})")
     elif args.morph_unet:
         # record every switch that changes the model, two runs sharing a tag but differing in
         # impl/stem are different models and the banner is what tells them apart in the logs
@@ -867,6 +906,10 @@ def main():
                          ("relu", args.morph_relu),
                          (f"drop={args.morph_dropout:g}", args.morph_dropout > 0),
                          (f"warm={args.morph_attn_warm:g}", args.morph_attn and args.morph_attn_warm > 0),
+                         (f"attn_k={'/'.join(map(str, args.morph_attn_k))}", args.morph_attn),
+                         (f"attn_pad={args.morph_attn_pad}", args.morph_attn),
+                         (f"src={args.morph_attn_src}", args.morph_attn),
+                         ("attn_reflect=off", args.morph_attn and args.morph_attn_reflect == "off"),
                          (f"fs={args.fs}", args.fs != 64),
                          (f"impl={args.morph_impl}", args.morph_impl != "fast")] if on)
         mode = f"morph-unet({args.morph_unet},k={args.morph_k},beta={args.morph_beta}{extra})"
@@ -943,17 +986,25 @@ def main():
                 frac = (epoch - 1) / max(args.epochs - 1, 1)
                 cur_beta = args.morph_beta * (args.morph_beta_final / args.morph_beta) ** frac
                 model.set_beta(cur_beta)
+            cuda = device.type == "cuda"
+            if cuda:
+                torch.cuda.reset_peak_memory_stats(device)
             tr = run_epoch(model, train_loader, device, dice_loss, ce_loss, optimizer, morph_loss,
                            grad_clip=args.grad_clip)
+            vram = f"  vram train={_vram(device)}" if cuda else ""
             do_val = (epoch % args.val_every == 0) or (epoch == args.epochs)
             if do_val:
+                if cuda:
+                    torch.cuda.reset_peak_memory_stats(device)
                 vd, per_class = run_val_dice(model, val_loader, device, config.NUM_CLASSES)
+                if cuda:
+                    vram += f" val={_vram(device)}"
                 scheduler.step(-vd)    # scheduler minimises, we maximise Dice, so feed -Dice
                 print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  val_fgDice={vd:.4f}  "
-                      f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]")
+                      f"[per-class {' '.join(f'{d:.3f}' for d in per_class)}]{vram}")
                 val_curve.append([epoch, round(vd, 5)])
             else:
-                print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  (val every {args.val_every})")
+                print(f"epoch {epoch:3d}/{args.epochs}  train={tr:.4f}  (val every {args.val_every}){vram}")
             if se_named:   # to see if the SE is actually learning, |Δ| per block + |SE| magnitude
                 deltas, norms = [], []
                 for n, p in se_named:
