@@ -109,6 +109,7 @@ any other value places morphology at that capacity `config`.
 | `--morph-attn-pad {neutral,zero}` | border handling of the attention morphology (default `neutral`; `zero` reproduces the earlier runs) |
 | `--morph-attn-src {self,cross}` | which feature the attention hats are computed on: the skip (`self`, default) or the upsampled decoder feature (`cross`); the gate always multiplies the skip |
 | `--morph-attn-reflect {on,off}` | dilation with the reflected SE, so the hats come from true openings/closings (default `on`; `off` reproduces the earlier runs) |
+| `--min-free-gb G` | checkpoints are saved atomically (temp file + rename); a save waits while the results disk has less than `G` GB free (default 1) instead of failing |
 
 > **Note on `--morph-conv-stem`.** The stem is opt-in here. Runs recorded in `results/results.md`
 > predate it and were trained without it, so leaving it off keeps them reproducible. The banner printed

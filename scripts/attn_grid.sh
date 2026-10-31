@@ -22,8 +22,21 @@
 # that already has more than 1 GB in use; FORCE=1 overrides that check.
 #
 # The grid is restartable: a run whose _scores.json exists is skipped, an interrupted run continues
-# from its _last.pth (--resume), and a failed run is reported and the grid moves on.
+# from its _last.pth (--resume), and a failed run is retried (up to MAX_TRIES attempts), then
+# reported, and the grid moves on.
 # Logs: logs/attn_grid/<tag>_f<fold>.log (one per run).
+#
+# Settings (environment variables):
+#   PATIENCE=100     early-stopping patience in epochs (default: config.py, 30)
+#   MIN_FREE_GB=5    a run starts only with at least this much free space on the results disk
+#   MAX_TRIES=3      attempts per run; each waits for disk space and a free GPU first
+#   POLL=300         seconds between checks while waiting
+#   MORPH_NO_CKPT=1  morph arms train without gradient checkpointing (identical maths, faster, more
+#                    VRAM); if such an attempt fails (e.g. out of memory), the run's next tries go
+#                    back to checkpointing
+# Before every run the GPU is re-checked (no compute process, < 1 GB in use; FORCE=1 skips this),
+# and the script waits until both the disk and the GPU are free. Inside a run, train_eval.py saves
+# checkpoints atomically and waits while less than 1 GB is free (--min-free-gb).
 #
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -44,9 +57,39 @@ flags() {   # train_eval.py flags of an arm
 
 RESULTS="results/$(python3 -c 'import config; print(config.TASK)')"
 LOGS=logs/attn_grid
-mkdir -p "$LOGS"
+mkdir -p "$LOGS" "$RESULTS"
 
-usage() { sed -n '2,29p' "$0"; exit 1; }
+MIN_FREE_GB=${MIN_FREE_GB:-5}
+MAX_TRIES=${MAX_TRIES:-3}
+POLL=${POLL:-300}
+PATIENCE_FLAG=${PATIENCE:+--patience $PATIENCE}
+
+usage() { sed -n '2,42p' "$0"; exit 1; }
+
+free_gb() {   # whole GB free on the disk that holds the results
+  df -Pk "$RESULTS" | awk 'NR == 2 { printf "%d", $4 / 1048576 }'
+}
+
+gpu_busy() {   # prints why GPU $GPU is taken (memory in use / compute processes); nothing if free
+  [[ "${FORCE:-0}" == "1" ]] && return
+  local used uuid nproc
+  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$GPU")
+  uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader -i "$GPU")
+  nproc=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader | grep -c "$uuid")
+  if [[ "$used" -gt 1000 || "$nproc" -gt 0 ]]; then
+    echo "${used} MiB in use, ${nproc} compute process(es)"
+  fi
+}
+
+wait_ready() {   # block until the disk has MIN_FREE_GB free and GPU $GPU is free
+  local free why
+  while :; do
+    free=$(free_gb); why=$(gpu_busy)
+    [[ "$free" -ge "$MIN_FREE_GB" && -z "$why" ]] && return
+    echo "   waiting: disk ${free} GB free (need ${MIN_FREE_GB})${why:+; GPU $GPU taken: $why}  $(date '+%F %T')"
+    sleep "$POLL"
+  done
+}
 
 check_gpu() {
   [[ -n "$GPU" ]] || { echo "!! give a GPU index: bash scripts/attn_grid.sh $MODE <gpu-id>"; exit 1; }
@@ -103,6 +146,7 @@ case "$MODE" in
   grid)
     check_gpu
     echo "############ GRID: ${#ARMS[@]} arms x ${#FOLDS[@]} folds, fold by fold  $(date '+%F %T') ############"
+    echo "   patience: ${PATIENCE:-config default} | min free disk: ${MIN_FREE_GB} GB | tries per run: ${MAX_TRIES}"
     FAILED=()
     for F in "${FOLDS[@]}"; do
       for ARM in "${ARMS[@]}"; do
@@ -110,12 +154,21 @@ case "$MODE" in
         if [[ -f "$RESULTS/${STEM}_scores.json" ]]; then
           echo "== $STEM done -> skip"; continue
         fi
-        [[ -f "$RESULTS/${STEM}_last.pth" ]] && note=" (resuming from _last.pth)" || note=""
-        echo "############ $STEM$note  $(date '+%F %T')"
-        python3 -u train_eval.py --tag "$ARM" --fold "$F" --resume $(flags "$ARM") 2>&1 | tee -a "$LOG"
-        rc=${PIPESTATUS[0]}
+        nockpt=""
+        [[ "${MORPH_NO_CKPT:-0}" == "1" && "$ARM" == grid_morph_* ]] && nockpt="--morph-no-checkpoint"
+        for (( try = 1; try <= MAX_TRIES; try++ )); do
+          wait_ready
+          [[ -f "$RESULTS/${STEM}_last.pth" ]] && note=" (resuming from _last.pth)" || note=""
+          echo "############ $STEM$note  try $try/$MAX_TRIES${nockpt:+, no checkpointing}  $(date '+%F %T')"
+          python3 -u train_eval.py --tag "$ARM" --fold "$F" --resume $PATIENCE_FLAG $nockpt $(flags "$ARM") \
+            2>&1 | tee -a "$LOG"
+          rc=${PIPESTATUS[0]}
+          [[ $rc -eq 0 ]] && break
+          echo "!!! $STEM failed (exit $rc), see $LOG"
+          [[ -n "$nockpt" ]] && { nockpt=""; echo "   next tries use gradient checkpointing again"; }
+        done
         if [[ $rc -ne 0 ]]; then
-          echo "!!! $STEM FAILED (exit $rc), see $LOG -- continuing"; FAILED+=("$STEM")
+          echo "!!! $STEM FAILED $MAX_TRIES times -- continuing"; FAILED+=("$STEM")
         fi
       done
     done

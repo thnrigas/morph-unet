@@ -10,6 +10,7 @@ import json
 import os
 import pickle
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -237,6 +238,31 @@ def _vram(device):
     gb = 1024 ** 3
     return (f"{torch.cuda.max_memory_allocated(device) / gb:.2f}/"
             f"{torch.cuda.max_memory_reserved(device) / gb:.2f}GB")
+
+#
+# checkpoint save that survives a full (shared) disk: write a temp file and rename it over the old
+# one, so a failed write never leaves a truncated checkpoint behind; while free space is below
+# min_free_gb, or a write fails, wait and retry instead of crashing (the run keeps its GPU)
+#
+def _safe_save(obj, path, min_free_gb=1.0, poll=300):
+    tmp = path + ".tmp"
+    while True:
+        free = shutil.disk_usage(os.path.dirname(path) or ".").free / 1024 ** 3
+        if free >= min_free_gb:
+            try:
+                torch.save(obj, tmp)
+                os.replace(tmp, path)
+                return
+            except (OSError, RuntimeError) as e:
+                print(f"  !! saving {os.path.basename(path)} failed ({str(e).splitlines()[0][:120]})",
+                      flush=True)
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+        else:
+            print(f"  !! only {free:.1f} GB free (< {min_free_gb:g}), not saving "
+                  f"{os.path.basename(path)} yet", flush=True)
+        print(f"  waiting {poll}s for disk space ({time.strftime('%F %T')})", flush=True)
+        time.sleep(poll)
 
 #
 # validation on full slices with global foreground Dice
@@ -697,6 +723,8 @@ def main():
     # training parameters
     p.add_argument("--epochs", type=int, default=config.HP["epochs"])
     p.add_argument("--patience", type=int, default=config.HP["patience"])
+    # checkpoint saves wait (instead of failing) while the results disk has less free space than this
+    p.add_argument("--min-free-gb", type=float, default=1.0)
     p.add_argument("--batch-size", type=int, default=config.HP["batch_size"])
     p.add_argument("--patch-size", type=int, default=config.HP["patch_size"])
     p.add_argument("--num-workers", type=int, default=min(os.cpu_count() or 1, 16))
@@ -1017,15 +1045,15 @@ def main():
             if do_val:
                 if vd > best_dice:
                     best_dice, best_epoch = vd, epoch
-                    torch.save(model.state_dict(), best_path)   # best: weights only (for eval)
+                    _safe_save(model.state_dict(), best_path, args.min_free_gb)   # weights only (for eval)
                 else:
                     patience_str = f"/{args.patience}" if args.patience else ""
                     print(f"  val fg-Dice did not improve from {best_dice:.4f} @ ep {best_epoch} "
                           f"(stale {epoch - best_epoch}{patience_str} epochs)")
             # last: full state so training can resume after an interruption
-            torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+            _safe_save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                         "scheduler": scheduler.state_dict(), "epoch": epoch, "best_val": best_dice,
-                        "best_epoch": best_epoch, "val_curve": val_curve}, last_path)
+                        "best_epoch": best_epoch, "val_curve": val_curve}, last_path, args.min_free_gb)
             # early stop on epochs since last improvement (independent of --val-every)
             if args.patience and (epoch - best_epoch) >= args.patience:
                 print(f"early stop: no val fg-Dice improvement for {epoch - best_epoch} epochs "
