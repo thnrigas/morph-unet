@@ -34,6 +34,14 @@
 #   MORPH_NO_CKPT=1  morph arms train without gradient checkpointing (identical maths, faster, more
 #                    VRAM); if such an attempt fails (e.g. out of memory), the run's next tries go
 #                    back to checkpointing
+#   ARMS="baseline morph_self"   run only these arms (names without "grid_"; default: all five)
+#   SEED=1           passed as --seed; adds "_s1" to the tags (default: no flag, seed 42, no suffix)
+#   VAL_CASES=0      passed as --val-cases (0 = all validation volumes); adds "_fv" (0) or "_v<N>"
+#                    to the tags (default: no flag, config.py's 15, no suffix)
+# SEED and VAL_CASES are part of the tag, so such runs never collide with the seed-42 grid; PATIENCE
+# is not (the patience-100 runs continued the patience-30 ones under the same tags). Example:
+#   ARMS="baseline morph_self" SEED=1 VAL_CASES=0 PATIENCE=50 MORPH_NO_CKPT=1 bash scripts/attn_grid.sh grid 1
+#   -> grid_baseline_s1_fv_f0 ... ; status / fold-means / compare take the same variables.
 # Before every run the GPU is re-checked (no compute process, < 1 GB in use; FORCE=1 skips this),
 # and the script waits until both the disk and the GPU are free. Inside a run, train_eval.py saves
 # checkpoints atomically and waits while less than 1 GB is free (--min-free-gb).
@@ -44,7 +52,23 @@ cd "$(dirname "$0")/.."
 MODE=${1:-}
 GPU=${2:-}
 FOLDS=(0 1 2 3 4)
-ARMS=(grid_baseline grid_lin_cross grid_lin_self grid_morph_self grid_morph_cross)
+ALL_ARMS=(grid_baseline grid_lin_cross grid_lin_self grid_morph_self grid_morph_cross)
+if [[ -n "${ARMS:-}" ]]; then
+  read -r -a _sel <<< "$ARMS"; ARMS=()
+  for a in "${_sel[@]}"; do
+    [[ " ${ALL_ARMS[*]} " == *" grid_${a#grid_} "* ]] || { echo "!! unknown arm '$a' (choose from: ${ALL_ARMS[*]#grid_})"; exit 1; }
+    ARMS+=("grid_${a#grid_}")
+  done
+else
+  ARMS=("${ALL_ARMS[@]}")
+fi
+# tag suffix and extra flags from SEED / VAL_CASES (empty when unset: the seed-42 grid's tags)
+SUFFIX=""; EXTRA=""
+if [[ -n "${SEED:-}" ]]; then SUFFIX+="_s$SEED"; EXTRA+=" --seed $SEED"; fi
+if [[ -n "${VAL_CASES:-}" ]]; then
+  [[ "$VAL_CASES" == "0" ]] && SUFFIX+="_fv" || SUFFIX+="_v$VAL_CASES"
+  EXTRA+=" --val-cases $VAL_CASES"
+fi
 flags() {   # train_eval.py flags of an arm
   case "$1" in
     grid_baseline)    echo "--morph-unet none" ;;
@@ -64,7 +88,7 @@ MAX_TRIES=${MAX_TRIES:-3}
 POLL=${POLL:-300}
 PATIENCE_FLAG=${PATIENCE:+--patience $PATIENCE}
 
-usage() { sed -n '2,42p' "$0"; exit 1; }
+usage() { sed -n '2,48p' "$0"; exit 1; }
 
 free_gb() {   # whole GB free on the disk that holds the results
   df -Pk "$RESULTS" | awk 'NR == 2 { printf "%d", $4 / 1048576 }'
@@ -147,10 +171,11 @@ case "$MODE" in
     check_gpu
     echo "############ GRID: ${#ARMS[@]} arms x ${#FOLDS[@]} folds, fold by fold  $(date '+%F %T') ############"
     echo "   patience: ${PATIENCE:-config default} | min free disk: ${MIN_FREE_GB} GB | tries per run: ${MAX_TRIES}"
+    echo "   arms: ${ARMS[*]} | tag suffix: '${SUFFIX}' | extra flags:${EXTRA:- none}"
     FAILED=()
     for F in "${FOLDS[@]}"; do
       for ARM in "${ARMS[@]}"; do
-        STEM="${ARM}_f${F}"; LOG="$LOGS/${STEM}.log"
+        TAG="${ARM}${SUFFIX}"; STEM="${TAG}_f${F}"; LOG="$LOGS/${STEM}.log"
         if [[ -f "$RESULTS/${STEM}_scores.json" ]]; then
           echo "== $STEM done -> skip"; continue
         fi
@@ -160,7 +185,7 @@ case "$MODE" in
           wait_ready
           [[ -f "$RESULTS/${STEM}_last.pth" ]] && note=" (resuming from _last.pth)" || note=""
           echo "############ $STEM$note  try $try/$MAX_TRIES${nockpt:+, no checkpointing}  $(date '+%F %T')"
-          python3 -u train_eval.py --tag "$ARM" --fold "$F" --resume $PATIENCE_FLAG $nockpt $(flags "$ARM") \
+          python3 -u train_eval.py --tag "$TAG" --fold "$F" --resume $PATIENCE_FLAG $EXTRA $nockpt $(flags "$ARM") \
             2>&1 | tee -a "$LOG"
           rc=${PIPESTATUS[0]}
           [[ $rc -eq 0 ]] && break
@@ -176,17 +201,19 @@ case "$MODE" in
     [[ ${#FAILED[@]} -gt 0 ]] && echo "!!! failed runs: ${FAILED[*]}  (re-run the same command to retry them)"
     MEANS=()
     for ARM in "${ARMS[@]}"; do
-      python3 train_eval.py --fold-mean "$ARM" > "$LOGS/${ARM}_mean.log" 2>&1 && MEANS+=("${ARM}_mean_scores.json")
+      TAG="${ARM}${SUFFIX}"
+      python3 train_eval.py --fold-mean "$TAG" > "$LOGS/${TAG}_mean.log" 2>&1 && MEANS+=("${TAG}_mean_scores.json")
     done
-    [[ ${#MEANS[@]} -gt 0 ]] && python3 train_eval.py --compare "${MEANS[@]}" | tee "$LOGS/compare.log"
+    [[ ${#MEANS[@]} -gt 0 ]] && python3 train_eval.py --compare "${MEANS[@]}" | tee "$LOGS/compare${SUFFIX}.log"
     ;;
 
   status)
-    printf "%-18s" "arm \\ fold"; for F in "${FOLDS[@]}"; do printf " %-8s" "f$F"; done; echo
+    printf "%-26s" "arm \\ fold"; for F in "${FOLDS[@]}"; do printf " %-8s" "f$F"; done; echo
     for ARM in "${ARMS[@]}"; do
-      printf "%-18s" "$ARM"
+      TAG="${ARM}${SUFFIX}"
+      printf "%-26s" "$TAG"
       for F in "${FOLDS[@]}"; do
-        S="$RESULTS/${ARM}_f${F}"
+        S="$RESULTS/${TAG}_f${F}"
         if   [[ -f "${S}_scores.json" ]]; then st="done"
         elif [[ -f "${S}_last.pth"    ]]; then st="partial"
         else st="-"; fi
