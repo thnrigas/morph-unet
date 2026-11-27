@@ -54,7 +54,15 @@ DATA_DIR = resolve_dir(
 
 IMAGES_DIR = DATA_DIR / "imagesTr"
 LABELS_DIR = DATA_DIR / "labelsTr"
-PREPROCESSED_DIR = DATA_DIR / "preprocessed"
+
+# array layout of the preprocessed volumes; the 2D loaders take slices along the first spatial axis:
+#   "xyz"   - medpy's (x, y, z) order, the original pipeline (for Task08: sagittal 512 x Z slices)
+#   "axial" - (z, y, x): axial 512 x 512 slices, in their own folder so the original data stay usable
+# chosen per shell, e.g. `LAYOUT=axial python3 run_preprocessing.py`; train_eval.py then needs "_ax" in the tag
+LAYOUT = os.environ.get("LAYOUT", "xyz")
+if LAYOUT not in ("xyz", "axial"):
+    raise ValueError(f"LAYOUT must be 'xyz' or 'axial', got {LAYOUT!r}")
+PREPROCESSED_DIR = DATA_DIR / ("preprocessed" if LAYOUT == "xyz" else "preprocessed_axial")
 SPLITS_FILE = DATA_DIR / "splits.pkl"
 
 def _load_meta(data_dir: Path):

@@ -26,7 +26,8 @@ import torch
 from utilities.morph_explore import load_any, align_axes, preprocess as modality_preprocess
 
 
-def _process_case(f, image_dir, label_dir, output_dir, mod, channel, n_mod, se_radius, y_shape, z_shape):
+def _process_case(f, image_dir, label_dir, output_dir, mod, channel, n_mod, se_radius, y_shape, z_shape,
+                  layout="xyz"):
     """Preprocess one case -> save 2-channel float16 npy (image, label). Residuals (static
     or trainable) are computed on the fly at train time. Module-level (picklable for Pool)."""
     image = load_any(os.path.join(image_dir, f))
@@ -39,6 +40,18 @@ def _process_case(f, image_dir, label_dir, output_dir, mod, channel, n_mod, se_r
     image = modality_preprocess(image, mod, channel, n_mod)
     image = align_axes(image, label)
 
+    if layout == "axial":
+        # (x, y, z) -> (z, y, x): the loader slices along the first axis, so it gets axial slices
+        # (rows y, columns x). The NIfTI's third axis is the slice axis of the MSD CT volumes (Task08:
+        # 512 x 512 x Z). Not the "largest spacing" rule of the Spleen track: some Task08 volumes have
+        # 0.8 mm slices, as fine as in-plane (0.57-0.98 mm). Nothing is padded along z (the slice count
+        # does not matter) and the in-plane pad below is a no-op for 512 x 512.
+        if image.ndim != 3:
+            raise ValueError(f"{f}: the axial layout expects a 3D volume, got shape {image.shape}")
+        image, label = image.transpose(2, 1, 0), label.transpose(2, 1, 0)
+
+    # pad axes 1 and 2 to at least (y_shape, z_shape), centred: for "xyz" these are y and z (Task08: 70%
+    # of the volumes have fewer than 64 slices), for "axial" the in-plane y and x
     pad = (image.shape[0], y_shape, z_shape)
     image = pad_nd_image(image, pad, "constant", kwargs={'constant_values': image.min()})
     label = pad_nd_image(label, pad, "constant", kwargs={'constant_values': label.min()})
@@ -50,10 +63,14 @@ def _process_case(f, image_dir, label_dir, output_dir, mod, channel, n_mod, se_r
     return f
 
 
-def preprocess_data(root_dir, modality=None, channel=0, y_shape=64, z_shape=64, se_radius=2, num_workers=None):
+def preprocess_data(root_dir, modality=None, channel=0, y_shape=64, z_shape=64, se_radius=2, num_workers=None,
+                    layout="xyz", output_dir=None):
+    # layout / output_dir: see config.LAYOUT and config.PREPROCESSED_DIR (defaults: the original pipeline)
+    if layout not in ("xyz", "axial"):
+        raise ValueError(f"layout must be 'xyz' or 'axial', got {layout!r}")
     image_dir = os.path.join(root_dir, 'imagesTr')
     label_dir = os.path.join(root_dir, 'labelsTr')
-    output_dir = os.path.join(root_dir, 'preprocessed')
+    output_dir = str(output_dir) if output_dir else os.path.join(root_dir, 'preprocessed')
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -70,9 +87,11 @@ def preprocess_data(root_dir, modality=None, channel=0, y_shape=64, z_shape=64, 
     # run cases them across worker processes
     # imap_unordered prints each filename as that case finishes
     worker = partial(_process_case, image_dir=image_dir, label_dir=label_dir, output_dir=output_dir,
-                     mod=mod, channel=channel, n_mod=n_mod, se_radius=se_radius, y_shape=y_shape, z_shape=z_shape)
+                     mod=mod, channel=channel, n_mod=n_mod, se_radius=se_radius, y_shape=y_shape, z_shape=z_shape,
+                     layout=layout)
     if num_workers is None:
         num_workers = min(os.cpu_count() or 1, 16)
+    print(f"preprocessing {len(nii_files)} cases, layout '{layout}' -> {output_dir}", flush=True)
     if num_workers <= 1:
         for f in nii_files:
             print(worker(f), flush=True)

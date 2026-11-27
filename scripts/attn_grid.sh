@@ -3,7 +3,7 @@
 # Skip-attention grid on MSD Task08: baseline + {linear, morph} x {cross, self}, 5 folds.
 # =========================================================================================
 # All arms share the residual U-Net backbone (--morph-unet none) and the config.py defaults
-# (batch 12, val-batch 4, seed 42). Only the skip gate differs:
+# (patch 128, batch 12, val-batch 4, seed 42; see the settings below). Only the skip gate differs:
 #
 #   grid_baseline     no gate
 #   grid_lin_cross    linear attention, query = upsampled decoder feature, gamma0 = 0.5
@@ -38,10 +38,19 @@
 #   SEED=1           passed as --seed; adds "_s1" to the tags (default: no flag, seed 42, no suffix)
 #   VAL_CASES=0      passed as --val-cases (0 = all validation volumes); adds "_fv" (0) or "_v<N>"
 #                    to the tags (default: no flag, config.py's 15, no suffix)
-# SEED and VAL_CASES are part of the tag, so such runs never collide with the seed-42 grid; PATIENCE
-# is not (the patience-100 runs continued the patience-30 ones under the same tags). Example:
+#   LAYOUT=axial     train and test on the axial data (data/<task>/preprocessed_axial, made once by
+#                    `LAYOUT=axial python3 run_preprocessing.py`); adds "_ax" to the tags
+#                    (default: the original x, y, z data, no suffix)
+#   PATCH=512        passed as --patch-size; adds "_p<PATCH>" to the tags (default: config.py, 128)
+#   BATCH=2          passed as --batch-size; adds "_b<BATCH>" to the tags (default: config.py, 12)
+#   VAL_BATCH=2      passed as --val-batch; not in the tags, it changes no result (default: 4)
+# LAYOUT, PATCH, BATCH, SEED and VAL_CASES are part of the tag, so such runs never collide with the
+# seed-42 grid; PATIENCE is not (the patience-100 runs continued the patience-30 ones under the same
+# tags). The smoke mode takes the same variables (tags smoke_<arm><suffix>). Examples:
 #   ARMS="baseline morph_self" SEED=1 VAL_CASES=0 PATIENCE=50 MORPH_NO_CKPT=1 bash scripts/attn_grid.sh grid 1
 #   -> grid_baseline_s1_fv_f0 ... ; status / fold-means / compare take the same variables.
+#   LAYOUT=axial PATCH=512 BATCH=2 VAL_BATCH=2 ARMS="baseline morph_self" VAL_CASES=2 bash scripts/attn_grid.sh smoke 1
+#   -> smoke_baseline_ax_p512_b2_v2_f0, smoke_morph_self_ax_p512_b2_v2_f0 (VRAM and s/epoch at full slices)
 # Before every run the GPU is re-checked (no compute process, < 1 GB in use; FORCE=1 skips this),
 # and the script waits until both the disk and the GPU are free. Inside a run, train_eval.py saves
 # checkpoints atomically and waits while less than 1 GB is free (--min-free-gb).
@@ -62,8 +71,18 @@ if [[ -n "${ARMS:-}" ]]; then
 else
   ARMS=("${ALL_ARMS[@]}")
 fi
-# tag suffix and extra flags from SEED / VAL_CASES (empty when unset: the seed-42 grid's tags)
+# tag suffix and extra flags from LAYOUT / PATCH / BATCH / VAL_BATCH / SEED / VAL_CASES (empty when
+# unset: the seed-42 grid's tags). config.py reads LAYOUT from the environment itself, and
+# train_eval.py refuses an axial run whose tag lacks "_ax" (and the reverse)
 SUFFIX=""; EXTRA=""
+case "${LAYOUT:-xyz}" in
+  xyz)   ;;
+  axial) SUFFIX+="_ax" ;;
+  *)     echo "!! LAYOUT must be xyz or axial, not '$LAYOUT'"; exit 1 ;;
+esac
+if [[ -n "${PATCH:-}" ]]; then SUFFIX+="_p$PATCH"; EXTRA+=" --patch-size $PATCH"; fi
+if [[ -n "${BATCH:-}" ]]; then SUFFIX+="_b$BATCH"; EXTRA+=" --batch-size $BATCH"; fi
+if [[ -n "${VAL_BATCH:-}" ]]; then EXTRA+=" --val-batch $VAL_BATCH"; fi
 if [[ -n "${SEED:-}" ]]; then SUFFIX+="_s$SEED"; EXTRA+=" --seed $SEED"; fi
 if [[ -n "${VAL_CASES:-}" ]]; then
   [[ "$VAL_CASES" == "0" ]] && SUFFIX+="_fv" || SUFFIX+="_v$VAL_CASES"
@@ -88,7 +107,7 @@ MAX_TRIES=${MAX_TRIES:-3}
 POLL=${POLL:-300}
 PATIENCE_FLAG=${PATIENCE:+--patience $PATIENCE}
 
-usage() { sed -n '2,48p' "$0"; exit 1; }
+usage() { awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 1; }   # the header comment
 
 free_gb() {   # whole GB free on the disk that holds the results
   df -Pk "$RESULTS" | awk 'NR == 2 { printf "%d", $4 / 1048576 }'
@@ -136,12 +155,13 @@ case "$MODE" in
   smoke)
     check_gpu
     echo "############ SMOKE: 3 epochs, fold 0, ${#ARMS[@]} arms  $(date '+%F %T') ############"
+    echo "   tag suffix: '${SUFFIX}' | extra flags:${EXTRA:- none}"
     SUMMARY=()          # one line per arm, same order as ARMS
     total=0             # sum of seconds/epoch over the arms that ran
     for ARM in "${ARMS[@]}"; do
-      TAG="smoke_${ARM#grid_}"; LOG="$LOGS/${TAG}_f0.log"
+      TAG="smoke_${ARM#grid_}${SUFFIX}"; LOG="$LOGS/${TAG}_f0.log"
       echo "== $TAG ($(date '+%T'))"
-      python3 -u train_eval.py --tag "$TAG" --fold 0 $(flags "$ARM") \
+      python3 -u train_eval.py --tag "$TAG" --fold 0 $EXTRA $(flags "$ARM") \
           --epochs 3 --val-every 3 --fast-eval > "$LOG" 2>&1
       rc=$?
       if [[ $rc -ne 0 ]]; then
@@ -208,10 +228,10 @@ case "$MODE" in
     ;;
 
   status)
-    printf "%-26s" "arm \\ fold"; for F in "${FOLDS[@]}"; do printf " %-8s" "f$F"; done; echo
+    printf "%-36s" "arm \\ fold"; for F in "${FOLDS[@]}"; do printf " %-8s" "f$F"; done; echo
     for ARM in "${ARMS[@]}"; do
       TAG="${ARM}${SUFFIX}"
-      printf "%-26s" "$TAG"
+      printf "%-36s" "$TAG"
       for F in "${FOLDS[@]}"; do
         S="$RESULTS/${TAG}_f${F}"
         if   [[ -f "${S}_scores.json" ]]; then st="done"

@@ -21,7 +21,7 @@ import random
 
 from utilities.file_and_folder_operations import subfiles
 
-def create_splits(output_dir, image_dir, seed=42, k=5):
+def create_splits(output_dir, image_dir, seed=42, k=5, write=True):
     """
     True seeded k-fold cross-validation splits.
     Every case appears in the test set of exactly one fold.
@@ -51,5 +51,8 @@ def create_splits(output_dir, image_dir, seed=42, k=5):
     assert sorted(all_test) == sorted(samples), "k-fold test coverage broken"
     assert len(all_test) == len(set(all_test)), "a case is in >1 test fold"
 
-    with open(os.path.join(output_dir, 'splits.pkl'), 'wb') as f:
-        pickle.dump(splits, f)
+    # write=False only returns the folds (run_preprocessing.py checks them against an existing splits.pkl)
+    if write:
+        with open(os.path.join(output_dir, 'splits.pkl'), 'wb') as f:
+            pickle.dump(splits, f)
+    return splits
