@@ -73,8 +73,14 @@ class NumpyDataSet(object):
     def __len__(self):
         return len(self.data_loader)
 
+    def set_worker_seed(self, seed):
+        """Seed the loader workers from `seed`, e.g. (--seed, start epoch), before the first epoch."""
+        self.augmenter.set_seed(seed)
+
     def __iter__(self):
-        if self.do_reshuffle:
+        # training batches draw their slices inside the workers (NumpyDataLoader.__getitem__); a
+        # main-process reshuffle never reached the persistent workers, so training skips it
+        if self.do_reshuffle and self.data_loader.mode != "train":
             self.data_loader.reshuffle()
         self.augmenter.renew()
         return self.augmenter
@@ -154,6 +160,15 @@ class NumpyDataLoader(SlimDataLoaderBase):
         return n_items
 
     def __getitem__(self, item):
+        if self.mode == "train":
+            if item >= len(self):
+                raise StopIteration()
+            # each training batch draws its B uniform slices afresh, in the worker that builds it
+            # (independent batches, as in nnU-Net). Indexing the main-process permutation instead
+            # (below) gave every epoch the first epoch's slices: the persistent workers kept their copy
+            idxs = random.sample(range(self.data_len), min(self.batch_size, self.data_len))
+            return self.get_data_from_array(self.np_data[idxs])
+
         slice_idxs = self.slice_idxs
         data_len = len(self.slices)
         np_data = self.np_data

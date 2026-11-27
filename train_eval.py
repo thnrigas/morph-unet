@@ -10,6 +10,7 @@ import json
 import os
 import pickle
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -332,6 +333,24 @@ def _perturb_image(data, kind, s, gen):
     return x
 
 #
+# voxel spacing (mm) and size of a case from the header of its raw NIfTI image (no voxel data read), in
+# the axis order of the preprocessed array: medpy's (x, y, z) for LAYOUT=xyz, (z, y, x) for LAYOUT=axial.
+# Neither layout resamples, and padding does not change the spacing. (None, None) if the image is missing.
+#
+def case_geometry(case):
+    import SimpleITK as sitk
+    for ext in (".nii.gz", ".nii"):
+        path = config.IMAGES_DIR / f"{case}{ext}"
+        if path.exists():
+            reader = sitk.ImageFileReader()
+            reader.SetFileName(str(path))
+            reader.ReadImageInformation()
+            spacing = tuple(float(s) for s in reader.GetSpacing()[:3])
+            size = tuple(int(s) for s in reader.GetSize()[:3])
+            return (spacing[::-1], size[::-1]) if config.LAYOUT == "axial" else (spacing, size)
+    return None, None
+
+#
 # test phase
 #
 def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none", strength=0.0,
@@ -350,12 +369,26 @@ def evaluate_test(model, loader, device, json_path, num_workers=1, perturb="none
             for i, fname in enumerate(batch["fnames"]):
                 pred_dict[fname[0]].append(pred[i])
                 gt_dict[fname[0]].append(target[i])
-    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in pred_dict]   # each [Z, H, W]
-    # advanced=False drops the surface-distance metrics (HD95/ASSD) — the slow, scipy-bound part —
-    # leaving Dice/precision/recall, which is all the robustness/data-efficiency curves need
+    keys = list(pred_dict)
+    pairs = [(np.stack(pred_dict[k]), np.stack(gt_dict[k])) for k in keys]   # each [Z, H, W]
+    cases = [os.path.basename(k)[:-len(".npy")] for k in keys]
+    # per-case voxel spacing for NSD 3mm and HD95 / ASSD in mm. The first array axis is never padded,
+    # so its length must equal the header's; if any case has no matching header, none get mm metrics
+    case_kwargs = []
+    for case, (pred, _) in zip(cases, pairs):
+        spacing, size = case_geometry(case)
+        if spacing is None or size[0] != pred.shape[0]:
+            print(f"  !! {case}: no matching raw NIfTI header (array {pred.shape}, header size {size}), "
+                  f"so NSD and the mm distances are skipped", flush=True)
+            case_kwargs = None
+            break
+        case_kwargs.append({"spacing_mm": spacing})
+    # advanced=False drops the surface-distance metrics (HD95/ASSD, NSD and the mm ones) — the slow,
+    # scipy-bound part — leaving Dice/precision/recall, all the robustness/data-efficiency curves need
     scores = aggregate_scores(pairs, evaluator=Evaluator, labels=LABELS,
         json_output_file=json_path, json_author="cv-project",
         json_task=config.TASK, num_workers=num_workers, advanced=advanced,
+        case_names=cases, case_kwargs=case_kwargs,
     )
     return scores
 
@@ -390,9 +423,12 @@ def read_results_dir():
 # Dice + ASSD are the MSD primaries, HD95 is a robust boundary metric
 # Precision/Recall explain why Dice moves, Jaccard (monotone with Dice)
 # and the background dominated rates (Accuracy/FPR/TNR/NPV) are omitted
+# NSD 3mm and the "... mm" distances need each case's voxel spacing: runs tested before 2026-11-27 have
+# only the voxel-unit ASSD / HD95, and the missing metrics are skipped
 #
 SCORE_METRICS = ("Dice", "Avg. Symmetric Surface Distance", "Hausdorff Distance 95",
-                 "Precision", "Recall")
+                 "Precision", "Recall", "NSD 3mm", "Avg. Symmetric Surface Distance mm",
+                 "Hausdorff Distance 95 mm")
 #
 # per run training-cost, convergence stats across folds
 #
@@ -430,7 +466,7 @@ def fold_mean(tag):
             if ms is None:
                 continue
             agg[label][metric] = ms
-            print(f"  label {label:>10} | {metric:<32} "
+            print(f"  label {label:>10} | {metric:<34} "
                   f"{ms['mean']:.4f} +/- {ms['std']:.4f}  (n={ms['n']})")
     # training cost, convergence summary, averaged over the same folds
     train_per_fold = []
@@ -641,7 +677,7 @@ def compare_runs(paths):
                 bv, ov = base[label].get(metric), o[label].get(metric)
                 if bv is None or ov is None:
                     continue
-                print(f"  label {label:>10} | {metric:<32} "
+                print(f"  label {label:>10} | {metric:<34} "
                       f"{bv:.4f} -> {ov:.4f}   delta={ov - bv:+.4f}")
         # training cost, convergence deltas (needs a train summary on both sides)
         o_train = load_train(other)
@@ -770,6 +806,11 @@ def main():
         return
     if not args.tag:
         p.error("--tag is required")
+    # the data layout (env LAYOUT, config.py) must show in the tag, so a run on axial slices can never
+    # resume from, overwrite or be tested with a checkpoint of the original (x, y, z) pipeline, or back
+    if (config.LAYOUT == "axial") != bool(re.search(r"_ax(?![a-z])", args.tag)):
+        p.error(f"LAYOUT={config.LAYOUT} with --tag {args.tag!r}: runs on the axial data (LAYOUT=axial) "
+                f"need '_ax' in the tag, runs on the original layout must not have it")
     if len(args.morph_attn_k) not in (1, 4) or any(k < 1 or k % 2 == 0 for k in args.morph_attn_k):
         p.error("--morph-attn-k takes one or four odd sizes (e.g. 3, or 7 7 3 3)")
     if args.morph_attn and args.morph_attn_src == "cross" and args.morph_attn_warm > 0:
@@ -950,7 +991,8 @@ def main():
     epoch_len = args.iters_per_epoch if args.iters_per_epoch > 0 else len(train_loader)
     static_info = f" static_ch={args.static_channels} static_dir={args.static_dir}" if args.static_channels else ""
     print(f"[{stem}] device={device} mode={mode} loss={loss_desc} seed={args.seed} "
-          f"fold={args.fold} loader_in_ch={in_channels} patch={args.patch_size} "
+          f"fold={args.fold} layout={config.LAYOUT} loader_in_ch={in_channels} patch={args.patch_size} "
+          f"batch={args.batch_size} val_batch={args.val_batch} "
           f"iters/epoch={epoch_len} max-epochs={args.epochs} (<= {epoch_len * args.epochs} updates) "
           f"fg={args.fg_fraction} grad_clip={args.grad_clip:g}{static_info}")
 
@@ -998,6 +1040,10 @@ def main():
                 val_curve = ck.get("val_curve", [])   # restore learning curve
                 print(f"resumed from epoch {ck['epoch']} (best fg-Dice={best_dice:.4f} @ ep {best_epoch}, "
                       f"{start_epoch - 1 - best_epoch}/{args.patience} epochs stale)")
+        # loader workers seeded from the run seed and the start epoch: arms with the same seed get the
+        # same batches, and a resumed run draws new batches instead of replaying its first epochs
+        train_loader.set_worker_seed((args.seed, start_epoch))
+        print(f"  loader workers seeded from (seed {args.seed}, start epoch {start_epoch})")
         se_prev = {n: p.detach().clone() for n, p in se_named}   # to log how much the SEs move
         # geometric beta anneal (soft -> sharper morphology), on by default (--morph-beta-final),
         # only for models exposing set_beta (bank and residual, baseline and conv control have none),
@@ -1096,8 +1142,9 @@ def main():
                            advanced=not args.fast_eval)
     print(f"[{stem}] mean scores written to {json_path}")
     for label, md in scores["mean"].items():
-        print(f"  label {label}: Dice={md.get('Dice')} "
-              f"ASSD={md.get('Avg. Symmetric Surface Distance')}")
+        print(f"  label {label}: Dice={md.get('Dice')} NSD3mm={md.get('NSD 3mm')} "
+              f"ASSD={md.get('Avg. Symmetric Surface Distance')} "
+              f"ASSDmm={md.get('Avg. Symmetric Surface Distance mm')}")
     # incremental robustness plot: after each perturbed run, refresh this point's across-fold mean
     # and redraw <kind>_robustness.png from every model/strength scored so far. the curve fills in
     # as runs complete; failures here never fail the eval.

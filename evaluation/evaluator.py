@@ -42,13 +42,22 @@ class Evaluator:
         "Avg. Symmetric Surface Distance"
     ]
 
+    # metrics in mm: computed with the advanced ones only when evaluate() gets the voxel spacing
+    # (spacing_mm=...). The voxel-unit distances above stay unchanged, comparable with earlier runs
+    default_spacing_metrics = [
+        "NSD 3mm",
+        "Hausdorff Distance 95 mm",
+        "Avg. Symmetric Surface Distance mm"
+    ]
+
     def __init__(self,
                  test=None,
                  reference=None,
                  labels=None,
                  metrics=None,
                  advanced_metrics=None,
-                 nan_for_nonexisting=True):
+                 nan_for_nonexisting=True,
+                 spacing_metrics=None):
 
         self.test = None
         self.reference = None
@@ -72,6 +81,9 @@ class Evaluator:
         else:
             for m in advanced_metrics:
                 self.advanced_metrics.append(m)
+
+        self.spacing_metrics = list(self.default_spacing_metrics if spacing_metrics is None
+                                    else spacing_metrics)
 
         self.set_reference(reference)
         self.set_test(test)
@@ -153,7 +165,7 @@ class Evaluator:
         # get functions for evaluation
         # somewhat convoluted, but allows users to define additonal metrics
         # on the fly, e.g. inside an IPython console
-        _funcs = {m: ALL_METRICS[m] for m in self.metrics + self.advanced_metrics}
+        _funcs = {m: ALL_METRICS[m] for m in self.metrics + self.advanced_metrics + self.spacing_metrics}
         frames = inspect.getouterframes(inspect.currentframe())
         for metric in self.metrics:
             for f in frames:
@@ -170,9 +182,11 @@ class Evaluator:
         # get results
         self.result = {}
 
-        eval_metrics = self.metrics
+        eval_metrics = list(self.metrics)
         if advanced:
             eval_metrics += self.advanced_metrics
+            if metric_kwargs.get("spacing_mm") is not None:
+                eval_metrics += self.spacing_metrics
 
         if isinstance(self.labels, dict):
 
@@ -314,6 +328,8 @@ def aggregate_scores(test_ref_pairs,
                      json_author="Fabian",
                      json_task="",
                      num_workers=1,
+                     case_names=None,
+                     case_kwargs=None,
                      **metric_kwargs):
     """
     test = predicted image
@@ -326,6 +342,9 @@ def aggregate_scores(test_ref_pairs,
     :param json_description:
     :param json_author:
     :param json_task:
+    :param case_names: optional, one name per pair, stored as "case" in its entry of results["all"]
+    :param case_kwargs: optional, one dict per pair, added to metric_kwargs for that pair only, e.g.
+                        {"spacing_mm": (s0, s1, s2)} for the metrics in mm (stored in the entry too)
     :param metric_kwargs:
     :return:
     """
@@ -336,9 +355,15 @@ def aggregate_scores(test_ref_pairs,
     all_scores["all"] = []
     all_scores["mean"] = {}
 
+    test_ref_pairs = list(test_ref_pairs)
+    for name, per_case in (("case_names", case_names), ("case_kwargs", case_kwargs)):
+        if per_case is not None and len(per_case) != len(test_ref_pairs):
+            raise ValueError(f"{name} has {len(per_case)} entries for {len(test_ref_pairs)} cases")
+
     # evaluate all cases (parallel when num_workers > 1)
-    tasks = [(test, ref, evaluator_cls, labels, metric_kwargs)
-             for test, ref in test_ref_pairs]
+    tasks = [(test, ref, evaluator_cls, labels,
+              {**metric_kwargs, **(case_kwargs[i] if case_kwargs is not None else {})})
+             for i, (test, ref) in enumerate(test_ref_pairs)]
     if num_workers > 1 and len(tasks) > 1:
         from multiprocessing import Pool
         with Pool(min(num_workers, len(tasks))) as pool:
@@ -346,12 +371,18 @@ def aggregate_scores(test_ref_pairs,
     else:
         case_scores = [_eval_one(t) for t in tasks]
 
-    for current_scores in case_scores:
+    for i, current_scores in enumerate(case_scores):
+        meta = {}
+        if case_names is not None:
+            meta["case"] = case_names[i]
+        if case_kwargs is not None and case_kwargs[i].get("spacing_mm") is not None:
+            meta["spacing_mm"] = [float(s) for s in case_kwargs[i]["spacing_mm"]]
+        current_scores = {**meta, **current_scores}
         all_scores["all"].append(current_scores)
 
-        # append score list for mean
+        # append score list for mean (labels only: skip "case", "spacing_mm", "test", "reference")
         for label, score_dict in current_scores.items():
-            if label in ("test", "reference"):
+            if not isinstance(score_dict, dict):
                 continue
             if label not in all_scores["mean"]:
                 all_scores["mean"][label] = {}

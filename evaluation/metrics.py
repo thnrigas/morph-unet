@@ -1,5 +1,10 @@
 import numpy as np
 from medpy import metric
+from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
+
+# tolerance of the normalised surface Dice: the MSD value for Task08 Hepatic Vessel, both labels
+# (Antonelli et al. 2022); the metric key "NSD 3mm" names it
+NSD_TOLERANCE_MM = 3.0
 
 
 def assert_shape(test, reference):
@@ -45,6 +50,7 @@ class ConfusionMatrix:
         self.test_full = None
         self.reference_empty = None
         self.reference_full = None
+        self.surface_cache = {}     # spacing -> border distances, shared by the mm metrics
 
     def compute(self):
 
@@ -369,6 +375,99 @@ def avg_surface_distance_symmetric(test=None, reference=None, confusion_matrix=N
     return metric.assd(test, reference, voxel_spacing, connectivity)
 
 
+def _surface_distances_mm(confusion_matrix, spacing_mm):
+    """Distances (mm) from every border voxel of test to the border of reference, and back.
+
+    Same definitions as medpy's hd95 / assd with voxelspacing (border = voxels with a 6-connected
+    background neighbour; Euclidean distance transform with the voxel spacing), but computed once per
+    label and case for all the mm metrics (cached on the confusion matrix), and only inside the bounding
+    box of test | reference plus one voxel. That box holds every border voxel, so the distances are
+    exact. Both masks must be non-empty."""
+    key = tuple(float(s) for s in spacing_mm)
+    if key not in confusion_matrix.surface_cache:
+        test = np.asarray(confusion_matrix.test, dtype=bool)
+        reference = np.asarray(confusion_matrix.reference, dtype=bool)
+        coords = np.nonzero(test | reference)
+        box = tuple(slice(max(int(c.min()) - 1, 0), int(c.max()) + 2) for c in coords)
+        test, reference = test[box], reference[box]
+        footprint = generate_binary_structure(test.ndim, 1)
+        test_border = test ^ binary_erosion(test, structure=footprint, iterations=1)
+        reference_border = reference ^ binary_erosion(reference, structure=footprint, iterations=1)
+        confusion_matrix.surface_cache[key] = (
+            distance_transform_edt(~reference_border, sampling=key)[test_border],
+            distance_transform_edt(~test_border, sampling=key)[reference_border])
+    return confusion_matrix.surface_cache[key]
+
+
+def normalized_surface_dice(test=None, reference=None, confusion_matrix=None, nan_for_nonexisting=True,
+                            spacing_mm=None, tolerance_mm=NSD_TOLERANCE_MM, **kwargs):
+    """Normalised surface Dice (Nikolov et al. 2021): the share of both borders that lies within
+    tolerance_mm of the other border, (#test border within tol + #reference border within tol) /
+    (#test border + #reference border), border voxels as in medpy. Needs the voxel spacing (mm).
+    NaN when both masks are empty, 0 when only one is (as Dice)."""
+
+    if spacing_mm is None:
+        return float("NaN")
+    if confusion_matrix is None:
+        confusion_matrix = ConfusionMatrix(test, reference)
+
+    test_empty, test_full, reference_empty, reference_full = confusion_matrix.get_existence()
+
+    if test_empty and reference_empty:
+        if nan_for_nonexisting:
+            return float("NaN")
+        else:
+            return 0.
+    if test_empty or reference_empty:
+        return 0.
+
+    d_test, d_ref = _surface_distances_mm(confusion_matrix, spacing_mm)
+    within = np.count_nonzero(d_test <= tolerance_mm) + np.count_nonzero(d_ref <= tolerance_mm)
+    return float(within / (d_test.size + d_ref.size))
+
+
+def hausdorff_distance_95_mm(test=None, reference=None, confusion_matrix=None, nan_for_nonexisting=True,
+                             spacing_mm=None, **kwargs):
+    """medpy's hd95 (95th percentile of the border distances of both directions, pooled), in mm."""
+
+    if spacing_mm is None:
+        return float("NaN")
+    if confusion_matrix is None:
+        confusion_matrix = ConfusionMatrix(test, reference)
+
+    test_empty, test_full, reference_empty, reference_full = confusion_matrix.get_existence()
+
+    if test_empty or test_full or reference_empty or reference_full:
+        if nan_for_nonexisting:
+            return float("NaN")
+        else:
+            return 0
+
+    d_test, d_ref = _surface_distances_mm(confusion_matrix, spacing_mm)
+    return float(np.percentile(np.hstack((d_test, d_ref)), 95))
+
+
+def avg_surface_distance_symmetric_mm(test=None, reference=None, confusion_matrix=None,
+                                      nan_for_nonexisting=True, spacing_mm=None, **kwargs):
+    """medpy's assd (mean of the two directed mean border distances), in mm."""
+
+    if spacing_mm is None:
+        return float("NaN")
+    if confusion_matrix is None:
+        confusion_matrix = ConfusionMatrix(test, reference)
+
+    test_empty, test_full, reference_empty, reference_full = confusion_matrix.get_existence()
+
+    if test_empty or test_full or reference_empty or reference_full:
+        if nan_for_nonexisting:
+            return float("NaN")
+        else:
+            return 0
+
+    d_test, d_ref = _surface_distances_mm(confusion_matrix, spacing_mm)
+    return float(np.mean((d_test.mean(), d_ref.mean())))
+
+
 ALL_METRICS = {
     "False Positive Rate": false_positive_rate,
     "Dice": dice,
@@ -379,6 +478,9 @@ ALL_METRICS = {
     "Recall": recall,
     "Avg. Symmetric Surface Distance": avg_surface_distance_symmetric,
     "Avg. Surface Distance": avg_surface_distance,
+    "NSD 3mm": normalized_surface_dice,
+    "Hausdorff Distance 95 mm": hausdorff_distance_95_mm,
+    "Avg. Symmetric Surface Distance mm": avg_surface_distance_symmetric_mm,
     "Accuracy": accuracy,
     "False Omission Rate": false_omission_rate,
     "Negative Predictive Value": negative_predictive_value,

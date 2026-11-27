@@ -30,8 +30,16 @@ def set_seed(seed):
 
 
 def _worker_init(worker_id, base_seed):
-    """Top-level worker initialiser."""
+    """Top-level worker initialiser (default: worker_id + base_seed, the same in every run)."""
     set_seed(worker_id + base_seed)
+
+
+def _seeded_worker_init(worker_id, entropy):
+    """Worker initialiser for a run-specific seed: `entropy` (e.g. (--seed, start epoch)) and the worker
+    id are mixed by numpy's SeedSequence into one 32-bit seed, so each (run seed, start epoch, worker)
+    gets its own reproducible random stream."""
+    ints = [int(e) % 2 ** 32 for e in entropy] + [int(worker_id)]
+    set_seed(int(np.random.SeedSequence(ints).generate_state(1)[0]))
 
 
 class WrappedDataset(Dataset):
@@ -57,9 +65,10 @@ class WrappedDataset(Dataset):
 
 
 class MultiThreadedDataLoader(object):
-    def __init__(self, data_loader, transform, num_processes, **kwargs):
+    def __init__(self, data_loader, transform, num_processes, seed=None, **kwargs):
 
         self.cntr = 1
+        self.seed = seed        # None: default worker seeds (worker_id + 1); see set_seed()
         self.ds_wrapper = WrappedDataset(data_loader, transform)
 
         self.generator = DataLoader(self.ds_wrapper, batch_size=1, shuffle=False, sampler=None, batch_sampler=None,
@@ -71,7 +80,18 @@ class MultiThreadedDataLoader(object):
         self.iter = None
 
     def get_worker_init_fn(self):
-        return partial(_worker_init, base_seed=self.cntr)
+        if self.seed is None:
+            return partial(_worker_init, base_seed=self.cntr)
+        return partial(_seeded_worker_init, entropy=tuple(self.seed))
+
+    def set_seed(self, seed):
+        """Seed the workers from `seed`, a tuple of ints such as (--seed, start epoch), instead of the
+        default worker_id + 1. Only before the first iteration: persistent workers are seeded once, when
+        they start."""
+        if self.iter is not None:
+            raise RuntimeError("the loader workers have already started; set the seed before the first epoch")
+        self.seed = tuple(seed)
+        self.generator.worker_init_fn = self.get_worker_init_fn()
 
     def __iter__(self):
         self.iter = iter(self.generator)

@@ -85,3 +85,24 @@ json = {
 ```
 
 `labels` is passed to the evaluator and `**metric_kwargs` is passed to all `.evaluate()` calls.
+
+### Metrics in mm and NSD (added 2026-11-27)
+
+The advanced distances above (`Hausdorff Distance 95`, `Avg. Symmetric Surface Distance`, ...) get no
+spacing from the array evaluator, so they are in voxels. Three more metrics use the voxel spacing in mm:
+
+| key | meaning |
+|---|---|
+| `NSD 3mm` | normalised surface Dice at τ = 3 mm (`metrics.NSD_TOLERANCE_MM`): share of both borders within 3 mm of the other border; NaN if both masks are empty, 0 if only one is |
+| `Hausdorff Distance 95 mm` | medpy's `hd95` with the spacing: 95th percentile of the pooled border distances of both directions |
+| `Avg. Symmetric Surface Distance mm` | medpy's `assd` with the spacing: mean of the two directed mean border distances |
+
+- They are computed with the advanced metrics, only when `.evaluate()` gets `spacing_mm=(s0, s1, s2)` in
+  the axis order of the arrays. Without it they are left out of the result.
+- All three come from one pair of distance transforms per label (cached on the `ConfusionMatrix`), taken
+  inside the bounding box of test ∪ reference. The border is the voxels with a 6-connected background
+  neighbour, as in medpy.
+- `aggregate_scores(..., case_names=[...], case_kwargs=[{"spacing_mm": ...}, ...])` passes per-case
+  arguments. It stores `"case"` and `"spacing_mm"` at the top of each entry of `results["all"]`, and
+  averages only the label entries.
+- `train_eval.py` reads each case's spacing from the header of its raw NIfTI image (`case_geometry`).
